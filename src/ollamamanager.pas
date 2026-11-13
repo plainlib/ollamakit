@@ -1,3 +1,9 @@
+//-----------------------------------------------------------------------------------
+//  OllamaKit Package © 2026 by Alexander Tverskoy
+//  Licensed under the MIT License
+//  You may obtain a copy of the License at https://opensource.org/licenses/MIT
+//-----------------------------------------------------------------------------------
+
 unit OllamaManager;
 
 {$mode objfpc}{$H+}
@@ -21,6 +27,10 @@ type
     oekNotFound,      // resource (model) not found (HTTP 404)
     oekCancelled      // operation cancelled
     );
+
+  { Toggleable sections of the popup menu }
+  TOllamaMenuSection = (msPull, msServer, msModels, msConnect);
+  TOllamaMenuSections = set of TOllamaMenuSection;
 
   { Event fired when the model list is refreshed }
   TModelsRefreshedEvent = procedure(Sender: TObject; const Models: TStringList) of object;
@@ -67,6 +77,7 @@ type
     FConnectionTimeout: integer;
     FRequestTimeout: integer;
     FPullTimeout: integer;
+    FMenuSections: TOllamaMenuSections;
 
     FOnModelsRefreshed: TModelsRefreshedEvent;
     FOnError: TOllamaErrorEvent;
@@ -115,6 +126,7 @@ type
 
     // Menu actions
     procedure MenuPullClick(Sender: TObject);
+    procedure MenuServerClick(Sender: TObject);
     procedure MenuStartClick(Sender: TObject);
     procedure MenuStopClick(Sender: TObject);
     procedure MenuDeleteClick(Sender: TObject);
@@ -130,6 +142,7 @@ type
     procedure SetBaseURL(const Value: string);
     procedure SetPopupMenu(Value: TPopupMenu);
     procedure SetActive(const Value: boolean);
+    procedure SetMenuSections(const Value: TOllamaMenuSections);
 
   protected
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -168,6 +181,7 @@ type
     property ConnectionTimeout: integer read FConnectionTimeout write FConnectionTimeout default 5000;
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 30000;
     property PullTimeout: integer read FPullTimeout write FPullTimeout default 0;
+    property MenuSections: TOllamaMenuSections read FMenuSections write SetMenuSections default [msPull, msServer, msModels, msConnect];
 
     property OnModelsRefreshed: TModelsRefreshedEvent read FOnModelsRefreshed write FOnModelsRefreshed;
     property OnError: TOllamaErrorEvent read FOnError write FOnError;
@@ -196,6 +210,8 @@ type
     property RequestTimeout;
     // Reserved timeout in milliseconds for pull operations; 0 means no limit
     property PullTimeout;
+    // Sections of the popup menu shown to the user; clear a flag to hide it
+    property MenuSections;
 
     // Fired after the installed model list has been refreshed
     property OnModelsRefreshed;
@@ -213,6 +229,7 @@ implementation
 
 resourcestring
   rsPullModelMenu = 'Pull model...';
+  rsServerMenu = 'Server...';
   rsStartMenu = 'Start';
   rsStopMenu = 'Stop';
   rsDeleteMenu = 'Delete';
@@ -222,6 +239,8 @@ resourcestring
   rsDeleteConfirm = 'Delete model "%s"?';
   rsPullCaption = 'Pull Ollama model';
   rsPullPrompt = 'Model name (e.g. llama3.2):';
+  rsServerCaption = 'Ollama server';
+  rsServerPrompt = 'Server URL (e.g. http://localhost:11434):';
   rsInfoMetadataError = 'Error fetching metadata: %s';
   rsInfoRunningHeader = '--- Running ---';
   rsInfoStatusLoaded = 'loaded';
@@ -250,6 +269,7 @@ const
   TAG_LOADING = 3;
   TAG_SEPARATOR = 4;
   TAG_CONNECTION = 5;
+  TAG_SERVER = 6;
 
 function BytesToHuman(const B: int64): string;
 begin
@@ -367,6 +387,7 @@ begin
   FConnectionTimeout := 5000;
   FRequestTimeout := 30000;
   FPullTimeout := 0;
+  FMenuSections := [msPull, msServer, msModels, msConnect];
   FConnecting := False;
   FConnected := False;
   FActive := True;
@@ -581,6 +602,12 @@ begin
     Exit;
   FBaseURL := NewURL;
   FConnected := False;
+
+  // Invalidate any in-flight connection to the previous address so that
+  // its result is ignored and the next attempt targets the new address
+  Inc(FConnectGen);
+  FConnecting := False;
+
   if Assigned(FPopupMenu) and FAutoRefresh then
     BeginConnect;
 end;
@@ -632,6 +659,15 @@ begin
   end;
 end;
 
+procedure TCustomOllamaManager.SetMenuSections(const Value: TOllamaMenuSections);
+begin
+  if FMenuSections = Value then
+    Exit;
+  FMenuSections := Value;
+  if Assigned(FPopupMenu) then
+    BuildPopupMenu;
+end;
+
 procedure TCustomOllamaManager.Connect;
 begin
   SetActive(True);
@@ -662,8 +698,8 @@ begin
   for I := FPopupMenu.Items.Count - 1 downto 0 do
   begin
     Item := FPopupMenu.Items[I];
-    if (Item.Tag = TAG_PULL) or (Item.Tag = TAG_MODEL) or (Item.Tag = TAG_LOADING) or (Item.Tag = TAG_SEPARATOR) or
-      (Item.Tag = TAG_CONNECTION) then
+    if (Item.Tag = TAG_PULL) or (Item.Tag = TAG_SERVER) or (Item.Tag = TAG_MODEL) or (Item.Tag = TAG_LOADING) or
+      (Item.Tag = TAG_SEPARATOR) or (Item.Tag = TAG_CONNECTION) then
       FPopupMenu.Items.Delete(I);
   end;
 end;
@@ -675,6 +711,7 @@ var
   ModelName: string;
   IsRunning, IsStarting: boolean;
   HasContentAbove: boolean;
+  HasModels: boolean;
 begin
   if not Assigned(FPopupMenu) then
     Exit;
@@ -687,127 +724,152 @@ begin
   // Content block is shown only while the manager is active
   if FActive then
   begin
-    if FConnected then
+    // Pull item is available only after a successful connection
+    if FConnected and (msPull in FMenuSections) then
     begin
-      // Pull item is available only after a successful connection
       ModelItem := TMenuItem.Create(FPopupMenu);
       ModelItem.Caption := rsPullModelMenu;
       ModelItem.Tag := TAG_PULL;
       ModelItem.OnClick := @MenuPullClick;
       FPopupMenu.Items.Insert(InsertPos, ModelItem);
       Inc(InsertPos);
+      HasContentAbove := True;
+    end;
 
-      // Tagged separator so it is removed on the next rebuild
+    // Server item is always available while the manager is active
+    if msServer in FMenuSections then
+    begin
       ModelItem := TMenuItem.Create(FPopupMenu);
-      ModelItem.Caption := '-';
-      ModelItem.Tag := TAG_SEPARATOR;
+      ModelItem.Caption := rsServerMenu;
+      ModelItem.Tag := TAG_SERVER;
+      ModelItem.OnClick := @MenuServerClick;
       FPopupMenu.Items.Insert(InsertPos, ModelItem);
       Inc(InsertPos);
+      HasContentAbove := True;
+    end;
 
-      // Installed models
-      for I := 0 to FInstalledModels.Count - 1 do
+    if FConnected then
+    begin
+      if msModels in FMenuSections then
       begin
-        ModelName := FInstalledModels[I];
+        HasModels := (FInstalledModels.Count > 0) or (FLoadingModels.Count > 0);
 
-        if FLoadingModels.IndexOf(ModelName) >= 0 then
-          Continue;
-
-        IsRunning := FRunningModels.IndexOf(ModelName) >= 0;
-        IsStarting := FStartingModels.IndexOf(ModelName) >= 0;
-
-        ModelItem := TMenuItem.Create(FPopupMenu);
-        ModelItem.Caption := ModelName;
-        ModelItem.Tag := TAG_MODEL;
-        ModelItem.Hint := ModelName;
-
-        if IsRunning or IsStarting then
-          ModelItem.Default := True;
-
-        if IsStarting then
+        // Separator between the Pull/Server items and the model list
+        if HasContentAbove and HasModels then
         begin
-          Pct := StrToIntDef(FStartingProgress.Values[ModelName], 0);
+          ModelItem := TMenuItem.Create(FPopupMenu);
+          ModelItem.Caption := '-';
+          ModelItem.Tag := TAG_SEPARATOR;
+          FPopupMenu.Items.Insert(InsertPos, ModelItem);
+          Inc(InsertPos);
+        end;
 
-          SubItem := TMenuItem.Create(ModelItem);
-          SubItem.Caption := Format(rsStartingPercent, [Pct]);
-          SubItem.Hint := ModelName;
-          SubItem.Enabled := False;
-          ModelItem.Add(SubItem);
-          FStartSubItems.AddObject(ModelName, SubItem);
-
-          SubItem := TMenuItem.Create(ModelItem);
-          SubItem.Caption := rsStopMenu;
-          SubItem.Hint := ModelName;
-          SubItem.Enabled := False;
-          ModelItem.Add(SubItem);
-
-          SubItem := TMenuItem.Create(ModelItem);
-          SubItem.Caption := rsDeleteMenu;
-          SubItem.Hint := ModelName;
-          SubItem.Enabled := False;
-          ModelItem.Add(SubItem);
-
-          SubItem := TMenuItem.Create(ModelItem);
-          SubItem.Caption := rsInfoMenu;
-          SubItem.Hint := ModelName;
-          SubItem.OnClick := @MenuInfoClick;
-          ModelItem.Add(SubItem);
-        end
-        else
+        // Installed models
+        for I := 0 to FInstalledModels.Count - 1 do
         begin
-          // Cloud models are not loaded locally, so Start/Stop make no sense for them
-          if not IsCloudModel(ModelName) then
+          ModelName := FInstalledModels[I];
+
+          if FLoadingModels.IndexOf(ModelName) >= 0 then
+            Continue;
+
+          IsRunning := FRunningModels.IndexOf(ModelName) >= 0;
+          IsStarting := FStartingModels.IndexOf(ModelName) >= 0;
+
+          ModelItem := TMenuItem.Create(FPopupMenu);
+          ModelItem.Caption := ModelName;
+          ModelItem.Tag := TAG_MODEL;
+          ModelItem.Hint := ModelName;
+
+          if IsRunning or IsStarting then
+            ModelItem.Default := True;
+
+          if IsStarting then
           begin
+            Pct := StrToIntDef(FStartingProgress.Values[ModelName], 0);
+
             SubItem := TMenuItem.Create(ModelItem);
-            SubItem.Caption := rsStartMenu;
+            SubItem.Caption := Format(rsStartingPercent, [Pct]);
             SubItem.Hint := ModelName;
-            SubItem.Enabled := not IsRunning;
-            SubItem.OnClick := @MenuStartClick;
+            SubItem.Enabled := False;
             ModelItem.Add(SubItem);
+            FStartSubItems.AddObject(ModelName, SubItem);
 
             SubItem := TMenuItem.Create(ModelItem);
             SubItem.Caption := rsStopMenu;
             SubItem.Hint := ModelName;
-            SubItem.Enabled := IsRunning;
-            SubItem.OnClick := @MenuStopClick;
+            SubItem.Enabled := False;
+            ModelItem.Add(SubItem);
+
+            SubItem := TMenuItem.Create(ModelItem);
+            SubItem.Caption := rsDeleteMenu;
+            SubItem.Hint := ModelName;
+            SubItem.Enabled := False;
+            ModelItem.Add(SubItem);
+
+            SubItem := TMenuItem.Create(ModelItem);
+            SubItem.Caption := rsInfoMenu;
+            SubItem.Hint := ModelName;
+            SubItem.OnClick := @MenuInfoClick;
+            ModelItem.Add(SubItem);
+          end
+          else
+          begin
+            // Cloud models are not loaded locally, so Start/Stop make no sense for them
+            if not IsCloudModel(ModelName) then
+            begin
+              SubItem := TMenuItem.Create(ModelItem);
+              SubItem.Caption := rsStartMenu;
+              SubItem.Hint := ModelName;
+              SubItem.Enabled := not IsRunning;
+              SubItem.OnClick := @MenuStartClick;
+              ModelItem.Add(SubItem);
+
+              SubItem := TMenuItem.Create(ModelItem);
+              SubItem.Caption := rsStopMenu;
+              SubItem.Hint := ModelName;
+              SubItem.Enabled := IsRunning;
+              SubItem.OnClick := @MenuStopClick;
+              ModelItem.Add(SubItem);
+            end;
+
+            SubItem := TMenuItem.Create(ModelItem);
+            SubItem.Caption := rsDeleteMenu;
+            SubItem.Hint := ModelName;
+            SubItem.OnClick := @MenuDeleteClick;
+            ModelItem.Add(SubItem);
+
+            SubItem := TMenuItem.Create(ModelItem);
+            SubItem.Caption := rsInfoMenu;
+            SubItem.Hint := ModelName;
+            SubItem.OnClick := @MenuInfoClick;
             ModelItem.Add(SubItem);
           end;
 
-          SubItem := TMenuItem.Create(ModelItem);
-          SubItem.Caption := rsDeleteMenu;
-          SubItem.Hint := ModelName;
-          SubItem.OnClick := @MenuDeleteClick;
-          ModelItem.Add(SubItem);
-
-          SubItem := TMenuItem.Create(ModelItem);
-          SubItem.Caption := rsInfoMenu;
-          SubItem.Hint := ModelName;
-          SubItem.OnClick := @MenuInfoClick;
-          ModelItem.Add(SubItem);
+          FPopupMenu.Items.Insert(InsertPos, ModelItem);
+          Inc(InsertPos);
         end;
 
-        FPopupMenu.Items.Insert(InsertPos, ModelItem);
-        Inc(InsertPos);
-      end;
+        // Loading models (pulling) grayed out
+        for I := 0 to FLoadingModels.Count - 1 do
+        begin
+          ModelItem := TMenuItem.Create(FPopupMenu);
+          ModelItem.Caption := Format(rsLoadingModel, [FLoadingModels[I]]);
+          ModelItem.Tag := TAG_LOADING;
+          ModelItem.Enabled := False;
+          FPopupMenu.Items.Insert(InsertPos, ModelItem);
+          Inc(InsertPos);
+        end;
 
-      // Loading models (pulling) grayed out
-      for I := 0 to FLoadingModels.Count - 1 do
-      begin
-        ModelItem := TMenuItem.Create(FPopupMenu);
-        ModelItem.Caption := Format(rsLoadingModel, [FLoadingModels[I]]);
-        ModelItem.Tag := TAG_LOADING;
-        ModelItem.Enabled := False;
-        FPopupMenu.Items.Insert(InsertPos, ModelItem);
-        Inc(InsertPos);
+        if HasModels then
+          HasContentAbove := True;
       end;
-
-      HasContentAbove := True;
     end
     else
     begin
       // Not connected yet: show a retry hint only when no attempt is running.
       // While connecting, the Connect item itself becomes the "Connecting..."
       // indicator, so there is nothing to add here.
-      if not FConnecting then
+      if (not FConnecting) and (msConnect in FMenuSections) then
       begin
         ModelItem := TMenuItem.Create(FPopupMenu);
         ModelItem.Tag := TAG_LOADING;
@@ -833,30 +895,33 @@ begin
 
   // Connect item: turns into a disabled "Connecting..." label while a
   // connection attempt is in progress
-  ModelItem := TMenuItem.Create(FPopupMenu);
-  ModelItem.Tag := TAG_CONNECTION;
-  if FConnecting then
+  if msConnect in FMenuSections then
   begin
-    ModelItem.Caption := rsConnectingStatus;
-    ModelItem.Enabled := False;
-  end
-  else
-  begin
-    ModelItem.Caption := rsConnectMenu;
-    ModelItem.Enabled := (not FActive) or (not FConnected);
-    ModelItem.OnClick := @MenuConnectClick;
-  end;
-  FPopupMenu.Items.Insert(InsertPos, ModelItem);
-  Inc(InsertPos);
+    ModelItem := TMenuItem.Create(FPopupMenu);
+    ModelItem.Tag := TAG_CONNECTION;
+    if FConnecting then
+    begin
+      ModelItem.Caption := rsConnectingStatus;
+      ModelItem.Enabled := False;
+    end
+    else
+    begin
+      ModelItem.Caption := rsConnectMenu;
+      ModelItem.Enabled := (not FActive) or (not FConnected);
+      ModelItem.OnClick := @MenuConnectClick;
+    end;
+    FPopupMenu.Items.Insert(InsertPos, ModelItem);
+    Inc(InsertPos);
 
-  // Disconnect is enabled only while the manager is active
-  ModelItem := TMenuItem.Create(FPopupMenu);
-  ModelItem.Caption := rsDisconnectMenu;
-  ModelItem.Tag := TAG_CONNECTION;
-  ModelItem.Enabled := FActive;
-  ModelItem.OnClick := @MenuDisconnectClick;
-  FPopupMenu.Items.Insert(InsertPos, ModelItem);
-  Inc(InsertPos);
+    // Disconnect is enabled only while the manager is active
+    ModelItem := TMenuItem.Create(FPopupMenu);
+    ModelItem.Caption := rsDisconnectMenu;
+    ModelItem.Tag := TAG_CONNECTION;
+    ModelItem.Enabled := FActive;
+    ModelItem.OnClick := @MenuDisconnectClick;
+    FPopupMenu.Items.Insert(InsertPos, ModelItem);
+    Inc(InsertPos);
+  end;
 
   // Separator between our block and user-owned items at the bottom
   ModelItem := TMenuItem.Create(FPopupMenu);
@@ -1258,6 +1323,19 @@ begin
     ModelName := Trim(ModelName);
     if ModelName <> '' then
       PullModel(ModelName);
+  end;
+end;
+
+procedure TCustomOllamaManager.MenuServerClick(Sender: TObject);
+var
+  ServerURL: string;
+begin
+  ServerURL := FBaseURL;
+  if InputQueryLite(rsServerCaption, rsServerPrompt, ServerURL) then
+  begin
+    ServerURL := Trim(ServerURL);
+    if ServerURL <> '' then
+      BaseURL := ServerURL;
   end;
 end;
 
