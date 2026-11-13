@@ -1154,6 +1154,7 @@ var
   ResponseHeaders: TStringList;
   Cookies: TStringList;
   Err: boolean;
+  SockErr: boolean;
   Tm: TTimeout;
   HTTP: THTTPSend;
   ContentType: string;
@@ -1191,7 +1192,12 @@ begin
 
       if Err then
       begin
-        if (HTTP <> nil) and (HTTP.ResultCode <> 0) then
+        // Socket-level errors take priority: a failed connect can leave a
+        // synthetic non-zero ResultCode (e.g. 5xx) that would be misclassified
+        SockErr := (HTTP <> nil) and (HTTP.Sock <> nil) and (HTTP.Sock.LastError <> 0);
+        if SockErr then
+          Kind := oekConnection
+        else if (HTTP <> nil) and (HTTP.ResultCode <> 0) then
           Kind := ClassifyHttp(HTTP.ResultCode)
         else
           Kind := oekConnection;
@@ -1226,9 +1232,13 @@ begin
 
         if ErrorMsg = '' then
         begin
-          if (HTTP <> nil) and (HTTP.ResultCode <> 0) then
+          if SockErr then
+            ErrorMsg := HTTP.Sock.LastErrorDesc
+          else if (HTTP <> nil) and (HTTP.ResultCode <> 0) then
             ErrorMsg := Format(rsHttpError, [HTTP.ResultCode, HTTP.ResultString])
           else
+            ErrorMsg := rsConnectionError;
+          if ErrorMsg = '' then
             ErrorMsg := rsConnectionError;
         end;
         Result := '';
