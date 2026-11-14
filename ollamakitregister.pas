@@ -50,7 +50,7 @@ begin
     TTermWelcomePropertyEditor);
 
   // Agent multiline properties use the shared multiline editor
-  RegisterPropertyEditor(TypeInfo(TCaption), TOllamaAgent, 'SystemPrompt',
+  RegisterPropertyEditor(TypeInfo(TCaption), TCustomOllamaAgent, 'SystemPrompt',
     TAgentMultilinePropertyEditor);
   RegisterPropertyEditor(TypeInfo(TCaption), TAgentTool, 'Description',
     TAgentMultilinePropertyEditor);

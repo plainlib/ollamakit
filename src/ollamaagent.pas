@@ -15,7 +15,20 @@ uses
 
 type
   // Feature toggles controlled by the Features set property
-  TAgentFeature = (afStreaming, afFileTools, afExecCommand);
+  TAgentFeature = (
+    // Stream content and thinking chunks to OnChunk and OnThinking in real time
+    afStreaming,
+    // Enable built-in file tools: read, write, edit, delete, move, copy, list, find, grep
+    afFileTools,
+    // Enable exec_command tool, host runs the shell command via OnExecCommand
+    afExecCommand,
+    // Enable git tools: status, diff, log, commit, all executed through OnExecCommand
+    afGit,
+    // Enable ask_user tool, host shows the question and returns the answer via OnAskUser
+    afInteractive,
+    // Enable finish tool, model can declare the task complete and return a final message
+    afFinish
+    );
   TAgentFeatures = set of TAgentFeature;
 
   // Operation kind passed to OnRoute before each action
@@ -32,9 +45,10 @@ type
   TAgentExecCommandEvent = procedure(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean) of object;
   TAgentFinishEvent = procedure(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string) of object;
   TAgentToolExecuteEvent = procedure(Sender: TObject; const AArgsJson: string; var AResult: string) of object;
+  TAgentAskUserEvent = procedure(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean) of object;
 
 type
-  TOllamaAgent = class;
+  TCustomOllamaAgent = class;
 
   // User-defined tool registered in the Tools collection
   TAgentTool = class(TCollectionItem)
@@ -57,19 +71,19 @@ type
   // Collection of user-defined tools
   TAgentTools = class(TCollection)
   private
-    FOwner: TOllamaAgent;
+    FOwner: TCustomOllamaAgent;
     function GetItem(AIndex: integer): TAgentTool;
     procedure SetItem(AIndex: integer; const AValue: TAgentTool);
   protected
     function GetOwner: TPersistent; override;
   public
-    constructor Create(AOwner: TOllamaAgent);
+    constructor Create(AOwner: TCustomOllamaAgent);
     function Add: TAgentTool;
     property Items[AIndex: integer]: TAgentTool read GetItem write SetItem; default;
   end;
 
   // LLM agent with tool-calling loop, independent of any terminal component
-  TOllamaAgent = class(TComponent)
+  TCustomOllamaAgent = class(TComponent)
   private
     FOllamaManager: TOllamaManager;
     FModelName: string;
@@ -95,6 +109,7 @@ type
     FOnToolCall: TAgentToolCallEvent;
     FOnToolResult: TAgentToolResultEvent;
     FOnExecCommand: TAgentExecCommandEvent;
+    FOnAskUser: TAgentAskUserEvent;
     FOnFinish: TAgentFinishEvent;
     procedure SetOllamaManager(const AValue: TOllamaManager);
     procedure SetTools(const AValue: TAgentTools);
@@ -116,6 +131,23 @@ type
     function DoWriteFile(AArgs: TJSONObject): string; virtual;
     function DoListFiles(AArgs: TJSONObject): string; virtual;
     function DoSearchText(AArgs: TJSONObject): string; virtual;
+    function DoReadFileLines(AArgs: TJSONObject): string; virtual;
+    function DoEditFile(AArgs: TJSONObject): string; virtual;
+    function DoDeleteFile(AArgs: TJSONObject): string; virtual;
+    function DoMoveFile(AArgs: TJSONObject): string; virtual;
+    function DoCopyFile(AArgs: TJSONObject): string; virtual;
+    function DoFileInfo(AArgs: TJSONObject): string; virtual;
+    function DoCreateDirectory(AArgs: TJSONObject): string; virtual;
+    function DoFindFiles(AArgs: TJSONObject): string; virtual;
+    function DoGrep(AArgs: TJSONObject): string; virtual;
+    // Git tools delegate to OnExecCommand, host runs git in its own shell
+    function DoGitCommand(const AFullCommand: string): string; virtual;
+    function DoGitStatus(AArgs: TJSONObject): string; virtual;
+    function DoGitDiff(AArgs: TJSONObject): string; virtual;
+    function DoGitLog(AArgs: TJSONObject): string; virtual;
+    function DoGitCommit(AArgs: TJSONObject): string; virtual;
+    // Ask user delegates to OnAskUser, host shows the question
+    function DoAskUser(AArgs: TJSONObject): string; virtual;
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -139,63 +171,80 @@ type
     function BuildSystemPrompt: string; virtual;
     // Resets usage counters in the manager and this agent
     procedure ResetUsage;
-    // True while an agent run is in progress
+
     property Done: boolean read FDone;
-    // Text returned by the last run
     property FinalAnswer: string read FFinalAnswer;
-    // JSON array of accumulated messages when KeepHistory is enabled
     property History: string read GetHistory write SetHistory;
-    // Prompt plus generated tokens reported by the last step
     property ContextUsed: integer read FContextUsed;
-    // Configured context window in tokens, 0 when unknown
     property ContextTotal: integer read FContextTotal;
-    // Usage as a percentage of ContextTotal, 0 when total is unknown
     property ContextPercent: integer read GetContextPercent;
-    // ContextUsed converted to kilobytes using ContextBytesPerToken
     property ContextUsedKb: integer read GetContextUsedKb;
-    // ContextTotal converted to kilobytes using ContextBytesPerToken
     property ContextTotalKb: integer read GetContextTotalKb;
+    property OllamaManager: TOllamaManager read FOllamaManager write SetOllamaManager;
+    property ModelName: string read FModelName write FModelName;
+    property SystemPrompt: TCaption read FSystemPrompt write FSystemPrompt;
+    property MaxSteps: integer read FMaxSteps write FMaxSteps default 20;
+    property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 0;
+    property Features: TAgentFeatures read FFeatures write FFeatures default [afStreaming, afFileTools];
+    property RootPath: string read GetRootPath write SetRootPath;
+    property Tools: TAgentTools read FTools write SetTools;
+    property KeepHistory: boolean read FKeepHistory write FKeepHistory default False;
+    property Log: boolean read FLog write FLog default False;
+    property OnRoute: TAgentRouteEvent read FOnRoute write FOnRoute;
+    property OnChunk: TAgentChunkEvent read FOnChunk write FOnChunk;
+    property OnThinking: TAgentThinkingEvent read FOnThinking write FOnThinking;
+    property OnToolCall: TAgentToolCallEvent read FOnToolCall write FOnToolCall;
+    property OnToolResult: TAgentToolResultEvent read FOnToolResult write FOnToolResult;
+    property OnExecCommand: TAgentExecCommandEvent read FOnExecCommand write FOnExecCommand;
+    property OnAskUser: TAgentAskUserEvent read FOnAskUser write FOnAskUser;
+    property OnFinish: TAgentFinishEvent read FOnFinish write FOnFinish;
+  end;
+
+  // Published version of the agent that exposes all properties in the IDE
+  TOllamaAgent = class(TCustomOllamaAgent)
   published
     // Ollama API client used for chat requests
-    property OllamaManager: TOllamaManager read FOllamaManager write SetOllamaManager;
+    property OllamaManager;
     // Model name passed to Ollama, e.g. qwen2.5-coder:7b
-    property ModelName: string read FModelName write FModelName;
+    property ModelName;
     // System message sent before the conversation
-    property SystemPrompt: TCaption read FSystemPrompt write FSystemPrompt;
-    // Maximum number of agent iterations before giving up
-    property MaxSteps: integer read FMaxSteps write FMaxSteps default 20;
+    property SystemPrompt;
+    // Maximum number of agent iterations, zero means unlimited
+    property MaxSteps;
     // Per-request timeout in ms, 0 means use OllamaManager default
-    property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 0;
+    property RequestTimeout;
     // Feature toggles for streaming, file tools and shell execution
-    property Features: TAgentFeatures read FFeatures write FFeatures default [afStreaming, afFileTools];
+    property Features;
     // Sandbox directory for file tools, empty means process cwd
-    property RootPath: string read GetRootPath write SetRootPath;
+    property RootPath;
     // Collection of user-defined tools
-    property Tools: TAgentTools read FTools write SetTools;
+    property Tools;
     // When True, messages persist between RunAsync calls
-    property KeepHistory: boolean read FKeepHistory write FKeepHistory default False;
+    property KeepHistory;
     // When True, the agent logs every step and event to stderr
-    property Log: boolean read FLog write FLog default False;
+    property Log;
     // Fired before chat step and each tool call, host may reject
-    property OnRoute: TAgentRouteEvent read FOnRoute write FOnRoute;
+    property OnRoute;
     // Fired for every streamed text chunk from the model
-    property OnChunk: TAgentChunkEvent read FOnChunk write FOnChunk;
+    property OnChunk;
     // Fired for every thinking chunk from the model
-    property OnThinking: TAgentThinkingEvent read FOnThinking write FOnThinking;
+    property OnThinking;
     // Fired when the LLM requests a tool, after host approval
-    property OnToolCall: TAgentToolCallEvent read FOnToolCall write FOnToolCall;
+    property OnToolCall;
     // Fired with the tool result before it is sent back to the model
-    property OnToolResult: TAgentToolResultEvent read FOnToolResult write FOnToolResult;
+    property OnToolResult;
     // Fired for exec_command tool, host executes and returns the output
-    property OnExecCommand: TAgentExecCommandEvent read FOnExecCommand write FOnExecCommand;
+    property OnExecCommand;
+    // Fired for ask_user tool, host shows the question and returns the answer
+    property OnAskUser;
     // Fired once when the run terminates for any reason
-    property OnFinish: TAgentFinishEvent read FOnFinish write FOnFinish;
+    property OnFinish;
   end;
 
 implementation
 
 uses
-  FileUtil, Math;
+  FileUtil, Math, RegExpr;
 
 // Returns display name for an agent operation kind
 function AgentOpName(AOp: TAgentOperation): string;
@@ -222,11 +271,79 @@ begin
   end;
 end;
 
+// Returns path relative to ARoot for display, or full path when outside root
+function RelativeToRoot(const ARoot, APath: string): string;
+begin
+  if Pos(LowerCase(IncludeTrailingPathDelimiter(ARoot)), LowerCase(APath)) = 1 then
+    Result := Copy(APath, Length(ARoot) + 2, MaxInt)
+  else
+    Result := APath;
+end;
+
+// Reads file as UTF-8 text, returns False on failure
+function ReadTextFileSafe(const APath: string; out AContent: string): boolean;
+var
+  Stream: TFileStream;
+  Buf: TBytes = ();
+  ReadCount: int64;
+begin
+  Result := False;
+  AContent := '';
+  if not FileExists(APath) then
+    Exit;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Buf, Stream.Size);
+    if Length(Buf) > 0 then
+      ReadCount := Stream.Read(Buf[0], Length(Buf))
+    else
+      ReadCount := 0;
+    SetLength(Buf, ReadCount);
+    AContent := string(Buf);
+    Result := True;
+  finally
+    Stream.Free;
+  end;
+end;
+
+// Writes UTF-8 text to file, creates parent directories
+function WriteTextFileSafe(const APath, AContent: string): boolean;
+var
+  Stream: TFileStream;
+  Bytes: TBytes;
+begin
+  Result := False;
+  ForceDirectories(ExtractFileDir(APath));
+  try
+    Stream := TFileStream.Create(APath, fmCreate);
+    try
+      Bytes := TBytes(AContent);
+      if Length(Bytes) > 0 then
+        Stream.Write(Bytes[0], Length(Bytes));
+      Result := True;
+    finally
+      Stream.Free;
+    end;
+  except
+    Result := False;
+  end;
+end;
+
+// Returns True for drive-absolute (D:...) or root-absolute (\... or /...) paths
+function IsPathAbsolute(const APath: string): boolean;
+begin
+  {$IFDEF WINDOWS}
+  if (Length(APath) >= 2) and (APath[2] = ':') then
+    Exit(True);
+  {$ENDIF}
+  Result := (Length(APath) >= 1) and (APath[1] in [PathDelim, '/']);
+end;
+
 type
   // Holder for async event delivery through TThread.Queue
   TAgentCallBase = class
   public
-    Agent: TOllamaAgent;
+    Agent: TCustomOllamaAgent;
     procedure Invoke; virtual; abstract;
   end;
 
@@ -274,6 +391,14 @@ type
     Command: string;
     Allow: boolean;
     Result: string;
+    procedure Invoke; override;
+  end;
+
+  TAskUserCall = class(TAgentCallBase)
+  public
+    Question: string;
+    Answer: string;
+    Allow: boolean;
     procedure Invoke; override;
   end;
 
@@ -355,6 +480,15 @@ begin
     Agent.FOnExecCommand(Agent, Command, Result, Allow);
 end;
 
+procedure TAskUserCall.Invoke;
+begin
+  // Caller frees the object after Synchronize returns
+  Allow := True;
+  Answer := '';
+  if Assigned(Agent.FOnAskUser) then
+    Agent.FOnAskUser(Agent, Question, Answer, Allow);
+end;
+
 procedure TLogCall.Invoke;
 begin
   try
@@ -369,7 +503,7 @@ type
   // Worker thread executing one agent run
   TOllamaAgentThread = class(TThread)
   private
-    FAgent: TOllamaAgent;
+    FAgent: TCustomOllamaAgent;
     FUserText: string;
     FCurrentContent: string;
     procedure HandleStreamChunk(const AContent: string; var ACancel: boolean);
@@ -384,12 +518,12 @@ type
   protected
     procedure Execute; override;
   public
-    constructor Create(AAgent: TOllamaAgent; const AUserText: string);
+    constructor Create(AAgent: TCustomOllamaAgent; const AUserText: string);
   end;
 
   { TOllamaAgentThread }
 
-constructor TOllamaAgentThread.Create(AAgent: TOllamaAgent; const AUserText: string);
+constructor TOllamaAgentThread.Create(AAgent: TCustomOllamaAgent; const AUserText: string);
 begin
   inherited Create(True);
   FreeOnTerminate := True;
@@ -523,13 +657,13 @@ end;
 
 procedure TOllamaAgentThread.Execute;
 var
-  Step, I, SavedTimeout: integer;
+  Step, I, SavedTimeout, EffectiveMaxSteps: integer;
   MessagesArr: TJSONArray;
   MessagesJson, ToolsJson, FinalJson, ErrMsg: string;
   Kind: TOllamaErrorKind;
   Allow: boolean;
   Reason: TAgentFinishReason;
-  Data, MessageData, ToolCallsData, FuncData, ArgsData: TJSONData;
+  Data, MessageData, ToolCallsData, FuncData, ArgsData, FinishData: TJSONData;
   ToolCallsArr: TJSONArray;
   ToolCallObj, FuncObj, MsgObj: TJSONObject;
   ToolName, ToolArgs, ToolResult, FinalContent: string;
@@ -588,12 +722,19 @@ begin
       MessagesArr.Add(MsgObj);
 
       ToolsJson := FAgent.BuildToolsSchemaJson;
-      FAgent.LogLine(Format('Features: streaming=%s fileTools=%s exec=%s',
+      FAgent.LogLine(Format('Features: streaming=%s fileTools=%s exec=%s git=%s interactive=%s finish=%s',
         [BoolToStr(afStreaming in FAgent.FFeatures, 'on', 'off'), BoolToStr(afFileTools in FAgent.FFeatures, 'on', 'off'),
-        BoolToStr(afExecCommand in FAgent.FFeatures, 'on', 'off')]));
+        BoolToStr(afExecCommand in FAgent.FFeatures, 'on', 'off'), BoolToStr(afGit in FAgent.FFeatures, 'on', 'off'),
+        BoolToStr(afInteractive in FAgent.FFeatures, 'on', 'off'), BoolToStr(afFinish in FAgent.FFeatures, 'on', 'off')]));
       FAgent.LogLine(Format('Tools schema len=%d names=[%s]', [Length(ToolsJson), FAgent.BuildToolsNames]));
 
-      for Step := 1 to FAgent.MaxSteps do
+      // MaxSteps = 0 means unlimited
+      if FAgent.MaxSteps > 0 then
+        EffectiveMaxSteps := FAgent.MaxSteps
+      else
+        EffectiveMaxSteps := MaxInt;
+
+      for Step := 1 to EffectiveMaxSteps do
       begin
         if FAgent.FCancelled then
         begin
@@ -734,7 +875,30 @@ begin
 
             QueueRoute(aoToolCall, ToolName + ' ' + ToolArgs, Allow);
             if Allow then
-              ToolResult := FAgent.DispatchTool(ToolName, ToolArgs)
+            begin
+              // finish tool terminates the run immediately with the given message
+              if (ToolName = 'finish') and (afFinish in FAgent.FFeatures) then
+              begin
+                FinishData := nil;
+                try
+                  try
+                    FinishData := GetJSON(ToolArgs);
+                    if (FinishData <> nil) and (FinishData.JSONType = jtObject) then
+                      FinalContent := TJSONObject(FinishData).Get('message', '');
+                  except
+                    FinalContent := '';
+                  end;
+                finally
+                  FinishData.Free;
+                end;
+                if FinalContent = '' then
+                  FinalContent := FCurrentContent;
+                FAgent.LogLine('Finished: explicit finish tool called');
+                Reason := afrSuccess;
+                Exit;
+              end;
+              ToolResult := FAgent.DispatchTool(ToolName, ToolArgs);
+            end
             else
               ToolResult := '{"error": "denied by host"}';
 
@@ -782,7 +946,7 @@ end;
 
 { TAgentTools }
 
-constructor TAgentTools.Create(AOwner: TOllamaAgent);
+constructor TAgentTools.Create(AOwner: TCustomOllamaAgent);
 begin
   inherited Create(TAgentTool);
   FOwner := AOwner;
@@ -808,9 +972,9 @@ begin
   Result := TAgentTool(inherited Add);
 end;
 
-{ TOllamaAgent }
+{ TCustomOllamaAgent }
 
-constructor TOllamaAgent.Create(AOwner: TComponent);
+constructor TCustomOllamaAgent.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
   FModelName := '';
@@ -827,10 +991,11 @@ begin
   FLog := False;
   FContextUsed := 0;
   FContextTotal := 0;
+  FOnAskUser := nil;
   FTools := TAgentTools.Create(Self);
 end;
 
-destructor TOllamaAgent.Destroy;
+destructor TCustomOllamaAgent.Destroy;
 begin
   // Wait for any running thread to finish
   while not FDone do
@@ -841,7 +1006,7 @@ begin
   inherited Destroy;
 end;
 
-procedure TOllamaAgent.SetOllamaManager(const AValue: TOllamaManager);
+procedure TCustomOllamaAgent.SetOllamaManager(const AValue: TOllamaManager);
 begin
   if FOllamaManager = AValue then
     Exit;
@@ -852,41 +1017,41 @@ begin
     FOllamaManager.FreeNotification(Self);
 end;
 
-procedure TOllamaAgent.SetTools(const AValue: TAgentTools);
+procedure TCustomOllamaAgent.SetTools(const AValue: TAgentTools);
 begin
   FTools.Assign(AValue);
 end;
 
-procedure TOllamaAgent.Notification(AComponent: TComponent; Operation: TOperation);
+procedure TCustomOllamaAgent.Notification(AComponent: TComponent; Operation: TOperation);
 begin
   inherited Notification(AComponent, Operation);
   if (Operation = opRemove) and (AComponent = FOllamaManager) then
     FOllamaManager := nil;
 end;
 
-function TOllamaAgent.GetRootPath: string;
+function TCustomOllamaAgent.GetRootPath: string;
 begin
   Result := FRootPath;
 end;
 
-procedure TOllamaAgent.SetRootPath(const AValue: string);
+procedure TCustomOllamaAgent.SetRootPath(const AValue: string);
 begin
   if FRootPath = AValue then
     Exit;
   FRootPath := AValue;
 end;
 
-function TOllamaAgent.GetHistory: string;
+function TCustomOllamaAgent.GetHistory: string;
 begin
   Result := FHistory;
 end;
 
-procedure TOllamaAgent.SetHistory(const AValue: string);
+procedure TCustomOllamaAgent.SetHistory(const AValue: string);
 begin
   FHistory := AValue;
 end;
 
-procedure TOllamaAgent.RunAsync(const AText: string);
+procedure TCustomOllamaAgent.RunAsync(const AText: string);
 begin
   if not FDone then
     Exit;
@@ -907,7 +1072,7 @@ begin
   TOllamaAgentThread.Create(Self, AText);
 end;
 
-function TOllamaAgent.Run(const AText: string): string;
+function TCustomOllamaAgent.Run(const AText: string): string;
 begin
   RunAsync(AText);
   while not FDone do
@@ -916,36 +1081,32 @@ begin
   Result := FFinalAnswer;
 end;
 
-procedure TOllamaAgent.Cancel;
+procedure TCustomOllamaAgent.Cancel;
 begin
   FCancelled := True;
 end;
 
-procedure TOllamaAgent.ClearHistory;
+procedure TCustomOllamaAgent.ClearHistory;
 begin
   FHistory := '';
 end;
 
-function TOllamaAgent.BuildSystemPrompt: string;
+function TCustomOllamaAgent.BuildSystemPrompt: string;
 begin
   Result := string(FSystemPrompt);
   Result := StringReplace(Result, '{path}', GetEffectiveRootPath, [rfReplaceAll]);
   Result := StringReplace(Result, '{model}', FModelName, [rfReplaceAll]);
 end;
 
-procedure TOllamaAgent.ResetUsage;
+procedure TCustomOllamaAgent.ResetUsage;
 begin
+  // Only usage is reset, context total comes from model and stays unchanged
   FContextUsed := 0;
   if Assigned(FOllamaManager) then
-  begin
     FOllamaManager.ResetUsage;
-    FContextTotal := FOllamaManager.NumCtx;
-  end
-  else
-    FContextTotal := 0;
 end;
 
-function TOllamaAgent.GetContextPercent: integer;
+function TCustomOllamaAgent.GetContextPercent: integer;
 begin
   if (FContextTotal > 0) and (FContextUsed > 0) then
   begin
@@ -957,19 +1118,19 @@ begin
     Result := 0;
 end;
 
-function TOllamaAgent.GetContextUsedKb: integer;
+function TCustomOllamaAgent.GetContextUsedKb: integer;
 begin
   // Shown as KB in prompt, means thousands of tokens
   Result := FContextUsed div 1024;
 end;
 
-function TOllamaAgent.GetContextTotalKb: integer;
+function TCustomOllamaAgent.GetContextTotalKb: integer;
 begin
   // Shown as KB in prompt, means thousands of tokens
   Result := FContextTotal div 1024;
 end;
 
-procedure TOllamaAgent.LogLine(const AText: string);
+procedure TCustomOllamaAgent.LogLine(const AText: string);
 var
   Call: TLogCall;
 begin
@@ -987,7 +1148,7 @@ begin
   TThread.Queue(nil, @Call.Invoke);
 end;
 
-function TOllamaAgent.GetEffectiveRootPath: string;
+function TCustomOllamaAgent.GetEffectiveRootPath: string;
 begin
   if FRootPath <> '' then
     Result := ExpandFileName(FRootPath)
@@ -995,21 +1156,27 @@ begin
     Result := GetCurrentDir;
 end;
 
-function TOllamaAgent.SafePath(const ARelPath: string): string;
+function TCustomOllamaAgent.SafePath(const ARelPath: string): string;
 var
-  Root, Full: string;
+  Root, Full, Normalized: string;
 begin
   Result := '';
   Root := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
-  if Trim(ARelPath) = '' then
+  // Normalize forward slashes so absolute detection works on Windows
+  Normalized := StringReplace(Trim(ARelPath), '/', PathDelim, [rfReplaceAll]);
+  if Normalized = '' then
     Exit(Root);
-  Full := ExpandFileName(Root + ARelPath);
+  // Absolute paths are resolved as-is, not prefixed with Root
+  if IsPathAbsolute(Normalized) then
+    Full := ExpandFileName(Normalized)
+  else
+    Full := ExpandFileName(Root + Normalized);
   // Compare with trailing delimiter so '.' resolves to root itself
   if Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(Full))) = 1 then
     Result := Full;
 end;
 
-function TOllamaAgent.BuildToolsSchemaJson: string;
+function TCustomOllamaAgent.BuildToolsSchemaJson: string;
 
   procedure AddTool(AArr: TJSONArray; const AName, ADesc, AParamsJson: string);
   var
@@ -1083,17 +1250,56 @@ begin
     begin
       AddTool(Arr, 'read_file', 'Read contents of a file inside the workspace',
         '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}');
-      AddTool(Arr, 'write_file', 'Write contents to a file inside the workspace',
+      AddTool(Arr, 'write_file', 'Write contents to a file inside the workspace, creates parent directories',
         '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
-      AddTool(Arr, 'list_files', 'List files in a directory inside the workspace',
+      AddTool(Arr, 'list_files', 'List files in a directory inside the workspace, non-recursive',
         '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative directory"}}}');
-      AddTool(Arr, 'search_text', 'Search for a text pattern in files',
+      AddTool(Arr, 'search_text', 'Search for a literal text pattern in files, returns file and line',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
+      AddTool(Arr, 'read_file_lines', 'Read a line range from a file, capped at 5000 lines per call',
+        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}');
+      AddTool(Arr, 'edit_file',
+        'Replace an exact string in a file. By default the old string must occur exactly once, set replace_all=true to replace all occurrences',
+        '{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}');
+      AddTool(Arr, 'delete_file', 'Delete a file inside the workspace',
+        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
+      AddTool(Arr, 'move_file', 'Move or rename a file inside the workspace',
+        '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
+      AddTool(Arr, 'copy_file', 'Copy a file inside the workspace',
+        '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
+      AddTool(Arr, 'file_info', 'Get size, modification time and type of a file or directory',
+        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
+      AddTool(Arr, 'create_directory', 'Create a directory and all parent directories',
+        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
+      AddTool(Arr, 'find_files', 'Find files by glob pattern, recursive by default, capped at 2000 results',
+        '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
+      AddTool(Arr, 'grep', 'Search files by regex or literal pattern, capped at 500 matches',
+        '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"},"literal":{"type":"boolean"}},"required":["pattern"]}');
     end;
 
     if afExecCommand in FFeatures then
-      AddTool(Arr, 'exec_command', 'Execute a shell command and return output',
+      AddTool(Arr, 'exec_command', 'Execute a shell command and return combined stdout and stderr',
         '{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}');
+
+    if afGit in FFeatures then
+    begin
+      AddTool(Arr, 'git_status', 'Show working tree status as porcelain output',
+        '{"type":"object","properties":{}}');
+      AddTool(Arr, 'git_diff', 'Show diff of working tree, optionally limited to one path',
+        '{"type":"object","properties":{"path":{"type":"string"}}}');
+      AddTool(Arr, 'git_log', 'Show recent commit history as one-line log',
+        '{"type":"object","properties":{"limit":{"type":"integer","description":"Number of commits, default 20"}}}');
+      AddTool(Arr, 'git_commit', 'Stage all changes and create a commit with the given message',
+        '{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}');
+    end;
+
+    if afInteractive in FFeatures then
+      AddTool(Arr, 'ask_user', 'Ask the user a question and wait for the answer before continuing',
+        '{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}');
+
+    if afFinish in FFeatures then
+      AddTool(Arr, 'finish', 'Declare the task complete and return a final message to the user',
+        '{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}');
 
     if Arr.Count > 0 then
       Result := Arr.AsJSON;
@@ -1102,7 +1308,7 @@ begin
   end;
 end;
 
-function TOllamaAgent.BuildToolsNames: string;
+function TCustomOllamaAgent.BuildToolsNames: string;
 var
   Names: TStringList;
   I: integer;
@@ -1117,16 +1323,36 @@ begin
       Names.Add('write_file');
       Names.Add('list_files');
       Names.Add('search_text');
+      Names.Add('read_file_lines');
+      Names.Add('edit_file');
+      Names.Add('delete_file');
+      Names.Add('move_file');
+      Names.Add('copy_file');
+      Names.Add('file_info');
+      Names.Add('create_directory');
+      Names.Add('find_files');
+      Names.Add('grep');
     end;
     if afExecCommand in FFeatures then
       Names.Add('exec_command');
+    if afGit in FFeatures then
+    begin
+      Names.Add('git_status');
+      Names.Add('git_diff');
+      Names.Add('git_log');
+      Names.Add('git_commit');
+    end;
+    if afInteractive in FFeatures then
+      Names.Add('ask_user');
+    if afFinish in FFeatures then
+      Names.Add('finish');
     Result := Names.CommaText;
   finally
     Names.Free;
   end;
 end;
 
-function TOllamaAgent.DoReadFile(AArgs: TJSONObject): string;
+function TCustomOllamaAgent.DoReadFile(AArgs: TJSONObject): string;
 var
   RelPath, FullPath: string;
   Stream: TFileStream;
@@ -1140,7 +1366,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace"}';
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
     Exit;
   end;
   if not FileExists(FullPath) then
@@ -1162,7 +1388,7 @@ begin
   end;
 end;
 
-function TOllamaAgent.DoWriteFile(AArgs: TJSONObject): string;
+function TCustomOllamaAgent.DoWriteFile(AArgs: TJSONObject): string;
 var
   RelPath, FullPath, Content: string;
   Stream: TFileStream;
@@ -1176,7 +1402,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace"}';
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
     Exit;
   end;
   ForceDirectories(ExtractFileDir(FullPath));
@@ -1191,7 +1417,7 @@ begin
   Result := '{"ok": true, "bytes": ' + IntToStr(Length(Content)) + '}';
 end;
 
-function TOllamaAgent.DoListFiles(AArgs: TJSONObject): string;
+function TCustomOllamaAgent.DoListFiles(AArgs: TJSONObject): string;
 var
   RelPath, FullPath: string;
   Items: TStringList;
@@ -1206,7 +1432,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace"}';
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
     Exit;
   end;
   if not DirectoryExists(FullPath) then
@@ -1245,7 +1471,7 @@ begin
   end;
 end;
 
-function TOllamaAgent.DoSearchText(AArgs: TJSONObject): string;
+function TCustomOllamaAgent.DoSearchText(AArgs: TJSONObject): string;
 var
   RelPath, FullPath, Pattern: string;
   Recursive: boolean;
@@ -1271,7 +1497,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace"}';
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
     Exit;
   end;
   if not DirectoryExists(FullPath) then
@@ -1317,7 +1543,596 @@ begin
   end;
 end;
 
-function TOllamaAgent.DispatchTool(const AName, AArgsJson: string): string;
+function TCustomOllamaAgent.DoReadFileLines(AArgs: TJSONObject): string;
+var
+  RelPath, FullPath: string;
+  Lines: TStringList;
+  StartLine, EndLine, I: integer;
+  Buf: TStringBuilder;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not FileExists(FullPath) then
+  begin
+    Result := '{"error": "file not found"}';
+    Exit;
+  end;
+  StartLine := AArgs.Get('start_line', 1);
+  EndLine := AArgs.Get('end_line', -1);
+  if StartLine < 1 then
+    StartLine := 1;
+  Lines := TStringList.Create;
+  try
+    try
+      Lines.LoadFromFile(FullPath);
+    except
+      Result := '{"error": "cannot read file"}';
+      Exit;
+    end;
+    if EndLine < 0 then
+      EndLine := Lines.Count
+    else if EndLine > Lines.Count then
+      EndLine := Lines.Count;
+    // Cap at 5000 lines per call
+    if EndLine - StartLine + 1 > 5000 then
+      EndLine := StartLine + 4999;
+    Buf := TStringBuilder.Create;
+    try
+      for I := StartLine - 1 to EndLine - 1 do
+      begin
+        Buf.Append(Lines[I]);
+        if I < EndLine - 1 then
+          Buf.Append(LineEnding);
+      end;
+      Result := '{"content": ' + TJSONString.Create(Buf.ToString).AsJSON + ', "total_lines": ' +
+        IntToStr(Lines.Count) + ', "shown_from": ' + IntToStr(StartLine) + ', "shown_to": ' + IntToStr(EndLine) + '}';
+    finally
+      Buf.Free;
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.DoEditFile(AArgs: TJSONObject): string;
+var
+  RelPath, FullPath, Content, OldStr, NewStr: string;
+  ReplaceAll: boolean;
+  P, SecondPos: integer;
+  Count: integer;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  OldStr := AArgs.Get('old_string', '');
+  NewStr := AArgs.Get('new_string', '');
+  ReplaceAll := AArgs.Get('replace_all', False);
+  if OldStr = '' then
+  begin
+    Result := '{"error": "old_string is required"}';
+    Exit;
+  end;
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not FileExists(FullPath) then
+  begin
+    Result := '{"error": "file not found"}';
+    Exit;
+  end;
+  if not ReadTextFileSafe(FullPath, Content) then
+  begin
+    Result := '{"error": "cannot read file"}';
+    Exit;
+  end;
+  Count := 0;
+  if ReplaceAll then
+  begin
+    P := Pos(OldStr, Content);
+    if P = 0 then
+    begin
+      Result := '{"error": "old_string not found"}';
+      Exit;
+    end;
+    while P > 0 do
+    begin
+      Inc(Count);
+      P := Pos(OldStr, Content, P + Length(OldStr));
+    end;
+    Content := StringReplace(Content, OldStr, NewStr, [rfReplaceAll]);
+  end
+  else
+  begin
+    P := Pos(OldStr, Content);
+    if P = 0 then
+    begin
+      Result := '{"error": "old_string not found"}';
+      Exit;
+    end;
+    SecondPos := Pos(OldStr, Copy(Content, P + 1, MaxInt));
+    if SecondPos > 0 then
+    begin
+      Result := '{"error": "old_string is ambiguous, occurs multiple times, provide more context or set replace_all=true"}';
+      Exit;
+    end;
+    Delete(Content, P, Length(OldStr));
+    Insert(NewStr, Content, P);
+    Count := 1;
+  end;
+  if not WriteTextFileSafe(FullPath, Content) then
+  begin
+    Result := '{"error": "cannot write file"}';
+    Exit;
+  end;
+  Result := '{"ok": true, "replaced": ' + IntToStr(Count) + '}';
+end;
+
+function TCustomOllamaAgent.DoDeleteFile(AArgs: TJSONObject): string;
+var
+  RelPath, FullPath: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not FileExists(FullPath) then
+  begin
+    Result := '{"error": "file not found"}';
+    Exit;
+  end;
+  try
+    if DeleteFile(FullPath) then
+      Result := '{"ok": true}'
+    else
+      Result := '{"error": "delete failed, file may be locked"}';
+  except
+    on E: Exception do
+      Result := '{"error": "' + StringReplace(E.Message, '"', '\"', [rfReplaceAll]) + '"}';
+  end;
+end;
+
+function TCustomOllamaAgent.DoMoveFile(AArgs: TJSONObject): string;
+var
+  SrcRel, DstRel, SrcFull, DstFull: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  SrcRel := AArgs.Get('source', '');
+  DstRel := AArgs.Get('destination', '');
+  SrcFull := SafePath(SrcRel);
+  DstFull := SafePath(DstRel);
+  if (SrcFull = '') or (DstFull = '') then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not FileExists(SrcFull) then
+  begin
+    Result := '{"error": "source not found"}';
+    Exit;
+  end;
+  if FileExists(DstFull) then
+  begin
+    Result := '{"error": "destination already exists, delete it first or choose another name"}';
+    Exit;
+  end;
+  ForceDirectories(ExtractFileDir(DstFull));
+  try
+    if RenameFile(SrcFull, DstFull) then
+      Result := '{"ok": true}'
+    else
+      Result := '{"error": "move failed"}';
+  except
+    on E: Exception do
+      Result := '{"error": "' + StringReplace(E.Message, '"', '\"', [rfReplaceAll]) + '"}';
+  end;
+end;
+
+function TCustomOllamaAgent.DoCopyFile(AArgs: TJSONObject): string;
+var
+  SrcRel, DstRel, SrcFull, DstFull: string;
+  Stream: TFileStream;
+  Size: int64;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  SrcRel := AArgs.Get('source', '');
+  DstRel := AArgs.Get('destination', '');
+  SrcFull := SafePath(SrcRel);
+  DstFull := SafePath(DstRel);
+  if (SrcFull = '') or (DstFull = '') then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not FileExists(SrcFull) then
+  begin
+    Result := '{"error": "source not found"}';
+    Exit;
+  end;
+  ForceDirectories(ExtractFileDir(DstFull));
+  try
+    Stream := TFileStream.Create(SrcFull, fmOpenRead or fmShareDenyNone);
+    try
+      Size := Stream.Size;
+    finally
+      Stream.Free;
+    end;
+    if CopyFile(SrcFull, DstFull, False) then
+      Result := '{"ok": true, "bytes": ' + IntToStr(Size) + '}'
+    else
+      Result := '{"error": "copy failed"}';
+  except
+    on E: Exception do
+      Result := '{"error": "' + StringReplace(E.Message, '"', '\"', [rfReplaceAll]) + '"}';
+  end;
+end;
+
+function TCustomOllamaAgent.DoFileInfo(AArgs: TJSONObject): string;
+var
+  RelPath, FullPath: string;
+  IsDir: boolean;
+  Size: int64;
+  MTime: TDateTime;
+  Info: TSearchRec;
+  Res: integer;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  Res := FindFirst(FullPath, faAnyFile, Info);
+  if Res <> 0 then
+  begin
+    Result := '{"exists": false}';
+    Exit;
+  end;
+  try
+    IsDir := (Info.Attr and faDirectory) <> 0;
+    Size := Info.Size;
+    MTime := FileDateToDateTime(Info.Time);
+  finally
+    FindClose(Info);
+  end;
+  Result := '{"exists": true, "is_directory": ' + BoolToStr(IsDir, 'true', 'false') + ', "size": ' +
+    IntToStr(Size) + ', "modified": "' + FormatDateTime('yyyy-mm-dd hh:nn:ss', MTime) + '"}';
+end;
+
+function TCustomOllamaAgent.DoCreateDirectory(AArgs: TJSONObject): string;
+var
+  RelPath, FullPath: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if DirectoryExists(FullPath) then
+  begin
+    Result := '{"ok": true, "already_existed": true}';
+    Exit;
+  end;
+  try
+    ForceDirectories(FullPath);
+    Result := '{"ok": true}';
+  except
+    on E: Exception do
+      Result := '{"error": "' + StringReplace(E.Message, '"', '\"', [rfReplaceAll]) + '"}';
+  end;
+end;
+
+function TCustomOllamaAgent.DoFindFiles(AArgs: TJSONObject): string;
+const
+  MAX_RESULTS = 2000;
+var
+  RelPath, FullPath, Pattern: string;
+  Recursive: boolean;
+  Files: TStringList;
+  Arr: TJSONArray;
+  I: integer;
+  BaseRoot: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  Pattern := AArgs.Get('pattern', '*');
+  Recursive := AArgs.Get('recursive', True);
+  if Pattern = '' then
+    Pattern := '*';
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not DirectoryExists(FullPath) then
+  begin
+    Result := '{"error": "directory not found"}';
+    Exit;
+  end;
+  BaseRoot := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
+  Files := TStringList.Create;
+  Arr := TJSONArray.Create;
+  try
+    FindAllFiles(Files, FullPath, Pattern, Recursive);
+    Files.Sort;
+    for I := 0 to Files.Count - 1 do
+    begin
+      if Arr.Count >= MAX_RESULTS then
+        Break;
+      Arr.Add(RelativeToRoot(BaseRoot, Files[I]));
+    end;
+    Result := '{"count": ' + IntToStr(Arr.Count) + ', "truncated": ' + BoolToStr(Files.Count > MAX_RESULTS, 'true', 'false') +
+      ', "files": ' + Arr.AsJSON + '}';
+  finally
+    Arr.Free;
+    Files.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.DoGrep(AArgs: TJSONObject): string;
+const
+  MAX_MATCHES = 500;
+  MAX_FILE_SIZE = 5 * 1024 * 1024;
+var
+  RelPath, FullPath, Pattern: string;
+  Recursive, Literal, HasMatch: boolean;
+  Files: TStringList;
+  Matches: TJSONArray;
+  FileLines: TStringList;
+  I, J: integer;
+  Line: string;
+  MatchObj: TJSONObject;
+  BaseRoot: string;
+  Regex: TRegExpr;
+  FileInfoRec: TSearchRec;
+
+// Tests a line against the current pattern, literal or regex
+  function LineMatches(const ALine: string): boolean;
+  begin
+    if Literal then
+      Result := Pos(Pattern, ALine) > 0
+    else
+    begin
+      Regex.Expression := Pattern;
+      Result := Regex.Exec(ALine);
+    end;
+  end;
+
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  Pattern := AArgs.Get('pattern', '');
+  if Pattern = '' then
+  begin
+    Result := '{"error": "pattern required"}';
+    Exit;
+  end;
+  RelPath := AArgs.Get('path', '');
+  Recursive := AArgs.Get('recursive', True);
+  Literal := AArgs.Get('literal', True);
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not DirectoryExists(FullPath) then
+  begin
+    Result := '{"error": "directory not found"}';
+    Exit;
+  end;
+  BaseRoot := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
+  Regex := nil;
+  if not Literal then
+    Regex := TRegExpr.Create;
+  Files := TStringList.Create;
+  Matches := TJSONArray.Create;
+  try
+    FindAllFiles(Files, FullPath, '*.*', Recursive);
+    for I := 0 to Files.Count - 1 do
+    begin
+      if Matches.Count >= MAX_MATCHES then
+        Break;
+      if FindFirst(Files[I], faAnyFile, FileInfoRec) = 0 then
+      try
+        if FileInfoRec.Size > MAX_FILE_SIZE then
+          Continue;
+      finally
+        FindClose(FileInfoRec);
+      end;
+      FileLines := TStringList.Create;
+      try
+        try
+          FileLines.LoadFromFile(Files[I]);
+        except
+          Continue;
+        end;
+        for J := 0 to FileLines.Count - 1 do
+        begin
+          if Matches.Count >= MAX_MATCHES then
+            Break;
+          Line := FileLines[J];
+          try
+            HasMatch := LineMatches(Line);
+          except
+            HasMatch := False;
+          end;
+          if HasMatch then
+          begin
+            MatchObj := TJSONObject.Create;
+            MatchObj.Add('file', RelativeToRoot(BaseRoot, Files[I]));
+            MatchObj.Add('line', J + 1);
+            MatchObj.Add('text', Line);
+            Matches.Add(MatchObj);
+          end;
+        end;
+      finally
+        FileLines.Free;
+      end;
+    end;
+    Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >= MAX_MATCHES, 'true', 'false') +
+      ', "matches": ' + Matches.AsJSON + '}';
+  finally
+    Matches.Free;
+    Files.Free;
+    if Regex <> nil then
+      Regex.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.DoGitCommand(const AFullCommand: string): string;
+var
+  Call: TExecCommandCall;
+  Res: string;
+  Allow: boolean;
+begin
+  Result := '{"error": "no OnExecCommand handler, cannot run git"}';
+  if not Assigned(FOnExecCommand) then
+    Exit;
+  LogLine(Format('GitCommand cmd="%s"', [AFullCommand]));
+  Call := TExecCommandCall.Create;
+  try
+    Call.Agent := Self;
+    Call.Command := AFullCommand;
+    Call.Allow := True;
+    Call.Result := '';
+    TThread.Synchronize(nil, @Call.Invoke);
+    Allow := Call.Allow;
+    Res := Call.Result;
+  finally
+    Call.Free;
+  end;
+  if Allow then
+    Result := Res
+  else
+    Result := '{"error": "git command denied by host"}';
+end;
+
+function TCustomOllamaAgent.DoGitStatus(AArgs: TJSONObject): string;
+begin
+  Result := DoGitCommand('git status --porcelain');
+end;
+
+function TCustomOllamaAgent.DoGitDiff(AArgs: TJSONObject): string;
+var
+  RelPath, Cmd: string;
+begin
+  RelPath := '';
+  if AArgs <> nil then
+    RelPath := AArgs.Get('path', '');
+  if RelPath = '' then
+    Cmd := 'git diff'
+  else
+    Cmd := 'git diff -- "' + StringReplace(RelPath, '"', '\"', [rfReplaceAll]) + '"';
+  Result := DoGitCommand(Cmd);
+end;
+
+function TCustomOllamaAgent.DoGitLog(AArgs: TJSONObject): string;
+var
+  Limit: integer;
+  Cmd: string;
+begin
+  Limit := 20;
+  if AArgs <> nil then
+    Limit := AArgs.Get('limit', 20);
+  if Limit < 1 then
+    Limit := 1;
+  if Limit > 200 then
+    Limit := 200;
+  Cmd := Format('git log --oneline -n %d', [Limit]);
+  Result := DoGitCommand(Cmd);
+end;
+
+function TCustomOllamaAgent.DoGitCommit(AArgs: TJSONObject): string;
+var
+  CommitMsg, Cmd, EscapedMsg: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  CommitMsg := AArgs.Get('message', '');
+  if CommitMsg = '' then
+  begin
+    Result := '{"error": "message required"}';
+    Exit;
+  end;
+  // Escape double quotes for cmd.exe: wrap in double quotes, replace " with ""
+  EscapedMsg := StringReplace(CommitMsg, '"', '""', [rfReplaceAll]);
+  Cmd := 'git add -A && git commit -m "' + EscapedMsg + '"';
+  Result := DoGitCommand(Cmd);
+end;
+
+function TCustomOllamaAgent.DoAskUser(AArgs: TJSONObject): string;
+var
+  Call: TAskUserCall;
+  Question, Answer: string;
+  Allow: boolean;
+begin
+  Result := '{"error": "no OnAskUser handler"}';
+  if not Assigned(FOnAskUser) then
+    Exit;
+  Question := '';
+  if AArgs <> nil then
+    Question := AArgs.Get('question', '');
+  if Question = '' then
+  begin
+    Result := '{"error": "question required"}';
+    Exit;
+  end;
+  LogLine(Format('AskUser question="%s"', [Copy(Question, 1, 200)]));
+  Call := TAskUserCall.Create;
+  try
+    Call.Agent := Self;
+    Call.Question := Question;
+    Call.Answer := '';
+    Call.Allow := True;
+    TThread.Synchronize(nil, @Call.Invoke);
+    Allow := Call.Allow;
+    Answer := Call.Answer;
+  finally
+    Call.Free;
+  end;
+  if Allow then
+    Result := '{"answer": ' + TJSONString.Create(Answer).AsJSON + '}'
+  else
+    Result := '{"error": "user cancelled the question"}';
+end;
+
+function TCustomOllamaAgent.DispatchTool(const AName, AArgsJson: string): string;
 var
   I: integer;
   Args: TJSONObject;
@@ -1347,15 +2162,37 @@ begin
       end;
     end;
 
-    if (AName = 'read_file') and (afFileTools in FFeatures) then
-      Exit(DoReadFile(Args))
-    else if (AName = 'write_file') and (afFileTools in FFeatures) then
-      Exit(DoWriteFile(Args))
-    else if (AName = 'list_files') and (afFileTools in FFeatures) then
-      Exit(DoListFiles(Args))
-    else if (AName = 'search_text') and (afFileTools in FFeatures) then
-      Exit(DoSearchText(Args))
-    else if (AName = 'exec_command') and (afExecCommand in FFeatures) then
+    if afFileTools in FFeatures then
+    begin
+      if AName = 'read_file' then
+        Exit(DoReadFile(Args))
+      else if AName = 'write_file' then
+        Exit(DoWriteFile(Args))
+      else if AName = 'list_files' then
+        Exit(DoListFiles(Args))
+      else if AName = 'search_text' then
+        Exit(DoSearchText(Args))
+      else if AName = 'read_file_lines' then
+        Exit(DoReadFileLines(Args))
+      else if AName = 'edit_file' then
+        Exit(DoEditFile(Args))
+      else if AName = 'delete_file' then
+        Exit(DoDeleteFile(Args))
+      else if AName = 'move_file' then
+        Exit(DoMoveFile(Args))
+      else if AName = 'copy_file' then
+        Exit(DoCopyFile(Args))
+      else if AName = 'file_info' then
+        Exit(DoFileInfo(Args))
+      else if AName = 'create_directory' then
+        Exit(DoCreateDirectory(Args))
+      else if AName = 'find_files' then
+        Exit(DoFindFiles(Args))
+      else if AName = 'grep' then
+        Exit(DoGrep(Args));
+    end;
+
+    if (AName = 'exec_command') and (afExecCommand in FFeatures) then
     begin
       Result := '{"error": "no OnExecCommand handler"}';
       if not Assigned(FOnExecCommand) then
@@ -1382,6 +2219,22 @@ begin
       Exit;
     end;
 
+    if afGit in FFeatures then
+    begin
+      if AName = 'git_status' then
+        Exit(DoGitStatus(Args))
+      else if AName = 'git_diff' then
+        Exit(DoGitDiff(Args))
+      else if AName = 'git_log' then
+        Exit(DoGitLog(Args))
+      else if AName = 'git_commit' then
+        Exit(DoGitCommit(Args));
+    end;
+
+    if (AName = 'ask_user') and (afInteractive in FFeatures) then
+      Exit(DoAskUser(Args));
+
+    // finish is handled in Execute before DispatchTool is called
     Result := '{"error": "unknown tool: ' + AName + '"}';
   finally
     Args.Free;

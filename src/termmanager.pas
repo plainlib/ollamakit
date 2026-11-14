@@ -52,7 +52,7 @@ type
     FRunning: boolean;
     FLastExitCode: integer;
     // Attached agent used to answer agent-classified input
-    FAgent: TOllamaAgent;
+    FAgent: TCustomOllamaAgent;
     // Previous agent handlers, restored when agent is detached
     FPrevAgentOnChunk: TAgentChunkEvent;
     FPrevAgentOnThinking: TAgentThinkingEvent;
@@ -60,6 +60,7 @@ type
     FPrevAgentOnToolResult: TAgentToolResultEvent;
     FPrevAgentOnFinish: TAgentFinishEvent;
     FPrevAgentOnExecCommand: TAgentExecCommandEvent;
+    FPrevAgentOnAskUser: TAgentAskUserEvent;
     // True while writing agent thinking before the first content chunk
     FInThinking: boolean;
     FOnRoute: TTermRouteEvent;
@@ -67,7 +68,7 @@ type
     FOnAgentExecute: TTermAgentEvent;
     FOnExit: TTermExitEvent;
     procedure SetPath(const AValue: string);
-    procedure SetAgent(const AValue: TOllamaAgent);
+    procedure SetAgent(const AValue: TCustomOllamaAgent);
   protected
     // Clears agent reference when it is removed at runtime
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -111,6 +112,8 @@ type
     procedure HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
     // Executes agent shell command through configured shell and returns output
     procedure HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
+    // Prompts the user with a question and returns the typed answer
+    procedure HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -146,7 +149,7 @@ type
     property OnOutput: TTermOutputEvent read FOnOutput write FOnOutput;
     property OnAgentExecute: TTermAgentEvent read FOnAgentExecute write FOnAgentExecute;
     property OnExit: TTermExitEvent read FOnExit write FOnExit;
-    property Agent: TOllamaAgent read FAgent write SetAgent;
+    property Agent: TCustomOllamaAgent read FAgent write SetAgent;
   end;
 
   TTermManager = class(TCustomTermManager)
@@ -316,6 +319,7 @@ begin
   FPrevAgentOnToolResult := nil;
   FPrevAgentOnFinish := nil;
   FPrevAgentOnExecCommand := nil;
+  FPrevAgentOnAskUser := nil;
   FInThinking := False;
   FBuiltinCommands := TStringList.Create;
   FBuiltinCommands.Add('cd');
@@ -380,7 +384,7 @@ begin
     SetAgent(nil);
 end;
 
-procedure TCustomTermManager.SetAgent(const AValue: TOllamaAgent);
+procedure TCustomTermManager.SetAgent(const AValue: TCustomOllamaAgent);
 begin
   if FAgent = AValue then
     Exit;
@@ -393,6 +397,7 @@ begin
   FPrevAgentOnToolResult := nil;
   FPrevAgentOnFinish := nil;
   FPrevAgentOnExecCommand := nil;
+  FPrevAgentOnAskUser := nil;
   FInThinking := False;
   if Assigned(FAgent) then
   begin
@@ -550,6 +555,26 @@ begin
   AAllow := True;
   ExitCode := 0;
   AResult := ExecuteCommandCapture(ACommand, ExitCode, FAgentCommandTimeout);
+end;
+
+procedure TCustomTermManager.HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);
+begin
+  // When host provided own handler, let it run and skip interactive prompt
+  if Assigned(FPrevAgentOnAskUser) then
+  begin
+    FPrevAgentOnAskUser(Sender, AQuestion, AAnswer, AAllow);
+    Exit;
+  end;
+  AAllow := True;
+  AAnswer := '';
+  // Close any open thinking or content lines before prompting
+  CloseThinking;
+  if not FLastCharWasNewLine then
+    WriteLine('', False);
+  // Show the question on its own line, then read the answer
+  WriteLine('[agent asks] ' + AQuestion, True);
+  WriteText(GetPromptText, False);
+  AAnswer := ReadLine;
 end;
 
 procedure TCustomTermManager.WriteText(const AText: string; AIsStderr: boolean);
@@ -815,9 +840,12 @@ begin
     DoOutput(GetEffectivePath + LineEnding, False)
   else if (Cmd = 'cls') or (Cmd = 'clear') then
   begin
-    // Clear agent conversation history together with the screen
+    // Clear agent conversation history and usage counters together with the screen
     if Assigned(FAgent) then
+    begin
       FAgent.ClearHistory;
+      FAgent.ResetUsage;
+    end;
     ClearScreen;
   end
   else if Cmd = 'history' then
@@ -1150,12 +1178,14 @@ begin
             FPrevAgentOnToolResult := FAgent.OnToolResult;
             FPrevAgentOnFinish := FAgent.OnFinish;
             FPrevAgentOnExecCommand := FAgent.OnExecCommand;
+            FPrevAgentOnAskUser := FAgent.OnAskUser;
             FAgent.OnChunk := @HandleAgentChunk;
             FAgent.OnThinking := @HandleAgentThinking;
             FAgent.OnToolCall := @HandleAgentToolCall;
             FAgent.OnToolResult := @HandleAgentToolResult;
             FAgent.OnFinish := @HandleAgentFinish;
             FAgent.OnExecCommand := @HandleAgentExecCommand;
+            FAgent.OnAskUser := @HandleAgentAskUser;
             try
               FAgent.RunAsync(Payload);
               // Pump events and watch for Esc so user can cancel
@@ -1182,12 +1212,14 @@ begin
               FAgent.OnToolResult := FPrevAgentOnToolResult;
               FAgent.OnFinish := FPrevAgentOnFinish;
               FAgent.OnExecCommand := FPrevAgentOnExecCommand;
+              FAgent.OnAskUser := FPrevAgentOnAskUser;
               FPrevAgentOnChunk := nil;
               FPrevAgentOnThinking := nil;
               FPrevAgentOnToolCall := nil;
               FPrevAgentOnToolResult := nil;
               FPrevAgentOnFinish := nil;
               FPrevAgentOnExecCommand := nil;
+              FPrevAgentOnAskUser := nil;
               FInThinking := False;
             end;
           end
