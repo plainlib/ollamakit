@@ -51,7 +51,11 @@ SOFTWARE.
     <Files>
       <Item>
         <Filename Value="src\ollamamanager.pas"/>
-        <UnitName Value="ollamamanager"/>
+        <UnitName Value="OllamaManager"/>
+      </Item>
+      <Item>
+        <Filename Value="src\termmanager.pas"/>
+        <UnitName Value="TermManager"/>
       </Item>
       <Item>
         <Filename Value="ollamakitregister.pas"/>
@@ -61,6 +65,9 @@ SOFTWARE.
     </Files>
     <RequiredPkgs>
       <Item>
+        <PackageName Value="LCLBase"/>
+      </Item>
+      <Item>
         <PackageName Value="translator"/>
       </Item>
       <Item>
@@ -68,9 +75,6 @@ SOFTWARE.
       </Item>
       <Item>
         <PackageName Value="helpers"/>
-      </Item>
-      <Item>
-        <PackageName Value="LCLBase"/>
       </Item>
     </RequiredPkgs>
     <UsageOptions>
