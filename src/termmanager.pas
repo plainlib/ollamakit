@@ -43,6 +43,10 @@ type
     FHistoryMax: integer;
     FShellExec: string;
     FCommandTimeout: integer;
+    // Maximum captured bytes from agent exec_command, truncated with notice
+    FMaxCaptureBytes: integer;
+    // Timeout in milliseconds for agent exec_command, zero means no limit
+    FAgentCommandTimeout: integer;
     FUsePrefixes: boolean;
     FSearchPath: boolean;
     FRunning: boolean;
@@ -115,7 +119,7 @@ type
     // Requests the loop to stop after current iteration
     procedure Stop; virtual;
     // Runs shell command capturing output as UTF-8, returns combined stdout and stderr
-    function ExecuteCommandCapture(const ACommand: string; out AExitCode: integer): string; virtual;
+    function ExecuteCommandCapture(const ACommand: string; out AExitCode: integer; ATimeoutMs: integer = -1): string; virtual;
     // Writes raw text without line ending, flushes for streaming output
     procedure WriteText(const AText: string; AIsStderr: boolean = False); virtual;
     // Writes text followed by a line ending, flushes immediately
@@ -142,6 +146,10 @@ type
     property ShellExec: string read FShellExec write FShellExec;
     // Command timeout in milliseconds, zero means no limit
     property CommandTimeout: integer read FCommandTimeout write FCommandTimeout default 0;
+    // Maximum captured bytes from agent exec_command, truncated with notice
+    property MaxCaptureBytes: integer read FMaxCaptureBytes write FMaxCaptureBytes default 65536;
+    // Timeout in milliseconds for agent exec_command, zero means no limit
+    property AgentCommandTimeout: integer read FAgentCommandTimeout write FAgentCommandTimeout default 30000;
     // Enable ! and ? prefixes to force routing
     property UsePrefixes: boolean read FUsePrefixes write FUsePrefixes default True;
     // Search PATH and known shell builtins during classification
@@ -186,6 +194,10 @@ type
     property ShellExec;
     // Command timeout in milliseconds, zero means no limit
     property CommandTimeout;
+    // Maximum captured bytes from agent exec_command, truncated with notice
+    property MaxCaptureBytes;
+    // Timeout in milliseconds for agent exec_command, zero means no limit
+    property AgentCommandTimeout;
     // Enable ! and ? prefixes to force command or agent routing
     property UsePrefixes;
     // Also search PATH and known shell builtins when routing
@@ -210,8 +222,7 @@ type
 
 // Forward declarations for helpers used before their definition
 procedure ClearScreen; forward;
-function CheckAndConsumeInterrupt: boolean; forward;
-function CheckAndConsumeEsc: boolean; forward;
+function CheckAndConsumeCancel: boolean; forward;
 {$IFDEF WINDOWS}
 procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString); forward;
 {$ENDIF}
@@ -232,8 +243,6 @@ begin
   Result := APos - 1;
   while (Result > 0) and ((byte(S[Result]) and $C0) = $80) do
     Dec(Result);
-  // Result points to the start byte of the previous character
-  // For multi-byte starts still need to step back once to be before it
   if (Result > 0) and (byte(S[Result]) >= $C0) then
     Dec(Result);
 end;
@@ -288,17 +297,14 @@ begin
   for I := 1 to Length(Wide) do
   begin
     Code := Ord(Wide[I]);
-    // Non-BMP surrogate pairs, all emoji live above U+FFFF
     if (Code >= $D800) and (Code <= $DFFF) then
       Continue;
-    // Technical symbols, misc symbols and dingbats, arrows
     if (Code >= $2300) and (Code <= $23FF) then
       Continue;
     if (Code >= $2600) and (Code <= $27BF) then
       Continue;
     if (Code >= $2B00) and (Code <= $2BFF) then
       Continue;
-    // Zero-width joiner and variation selectors
     if Code = $200D then
       Continue;
     if (Code >= $FE00) and (Code <= $FE0F) then
@@ -327,6 +333,8 @@ begin
   FAgent := nil;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
+  FPrevAgentOnToolCall := nil;
+  FPrevAgentOnToolResult := nil;
   FPrevAgentOnFinish := nil;
   FPrevAgentOnExecCommand := nil;
   FInThinking := False;
@@ -343,6 +351,8 @@ begin
   FHistoryMax := 200;
   FShellExec := 'cmd.exe';
   FCommandTimeout := 0;
+  FMaxCaptureBytes := 65536;
+  FAgentCommandTimeout := 30000;
   FUsePrefixes := True;
   FSearchPath := True;
   FRunning := False;
@@ -361,22 +371,26 @@ procedure TCustomTermManager.SetPath(const AValue: string);
 var
   NewPath: string;
 begin
-  // Empty value means "use process current directory"
   if AValue = '' then
   begin
     FPath := '';
+    // Keep agent workspace in sync with terminal directory
+    if Assigned(FAgent) and not (csDesigning in ComponentState) then
+      FAgent.RootPath := GetEffectivePath;
     Exit;
   end;
   NewPath := ExpandFileName(AValue);
   if DirectoryExists(NewPath) then
   begin
     NewPath := ExcludeTrailingPathDelimiter(NewPath);
-    // Keep drive root as C:\ instead of C: like cmd.exe
     {$IFDEF WINDOWS}
     if (Length(NewPath) = 2) and (NewPath[2] = ':') then
       NewPath := NewPath + PathDelim;
     {$ENDIF}
     FPath := NewPath;
+    // Keep agent workspace in sync with terminal directory
+    if Assigned(FAgent) and not (csDesigning in ComponentState) then
+      FAgent.RootPath := GetEffectivePath;
   end;
 end;
 
@@ -554,7 +568,7 @@ begin
   end;
   AAllow := True;
   ExitCode := 0;
-  AResult := ExecuteCommandCapture(ACommand, ExitCode);
+  AResult := ExecuteCommandCapture(ACommand, ExitCode, FAgentCommandTimeout);
 end;
 
 procedure TCustomTermManager.WriteText(const AText: string; AIsStderr: boolean);
@@ -787,7 +801,6 @@ end;
 function TCustomTermManager.ExecuteCommand(const ACommand: string): integer;
 var
   Process: TProcess;
-  // Explicit init silences the "not initialized" hint
   Buffer: TTermBuffer;
   BytesRead: longint;
   RawData: rawbytestring;
@@ -822,7 +835,7 @@ begin
         Break;
       end;
       {$IFDEF WINDOWS}
-      if CheckAndConsumeInterrupt then
+      if CheckAndConsumeCancel then
       begin
         Process.Terminate(1);
         DoOutput(LineEnding + '^C (interrupted)' + LineEnding, True);
@@ -895,14 +908,49 @@ begin
   end;
 end;
 
-function TCustomTermManager.ExecuteCommandCapture(const ACommand: string; out AExitCode: integer): string;
+function TCustomTermManager.ExecuteCommandCapture(const ACommand: string; out AExitCode: integer; ATimeoutMs: integer): string;
 var
   Process: TProcess;
   Buffer: TTermBuffer;
-  BytesRead: longint;
   RawData, Captured, Tmp: rawbytestring;
   StartTime: TDateTime;
-  N: integer;
+  EffectiveTimeout: integer;
+  HitLimit: boolean;
+
+// Appends bytes to Captured and enforces MaxCaptureBytes limit
+  procedure AppendAndCheck(const AData: rawbytestring);
+  begin
+    if HitLimit or (Length(AData) = 0) then
+      Exit;
+    Captured := Captured + AData;
+    if Length(Captured) > FMaxCaptureBytes then
+    begin
+      SetLength(Captured, FMaxCaptureBytes);
+      Captured := Captured + #13#10 + '[output truncated at ' + IntToStr(FMaxCaptureBytes) + ' bytes]' + #13#10;
+      HitLimit := True;
+    end;
+  end;
+
+  // Reads up to AAvailable bytes from stream into Captured
+  function ReadAvailable(AStream: TStream; AAvailable: longint): longint;
+  var
+    M: integer;
+  begin
+    Result := 0;
+    if HitLimit or (AAvailable <= 0) then
+      Exit;
+    M := AAvailable;
+    if M > SizeOf(Buffer) then
+      M := SizeOf(Buffer);
+    Result := AStream.Read(Buffer[0], M);
+    if Result > 0 then
+    begin
+      SetLength(RawData, Result);
+      Move(Buffer[0], RawData[1], Result);
+      AppendAndCheck(RawData);
+    end;
+  end;
+
 begin
   Result := '';
   RawData := '';
@@ -910,7 +958,12 @@ begin
   Buffer := Default(TTermBuffer);
   if ACommand = '' then
     Exit;
+  if ATimeoutMs < 0 then
+    EffectiveTimeout := FCommandTimeout
+  else
+    EffectiveTimeout := ATimeoutMs;
   Captured := '';
+  HitLimit := False;
   Process := TProcess.Create(nil);
   try
     Process.Executable := FShellExec;
@@ -925,72 +978,24 @@ begin
     Process.Execute;
     StartTime := Now;
 
-    while Process.Running do
+    while Process.Running and not HitLimit do
     begin
-      if (FCommandTimeout > 0) and (MilliSecondsBetween(Now, StartTime) >= FCommandTimeout) then
+      if (EffectiveTimeout > 0) and (MilliSecondsBetween(Now, StartTime) >= EffectiveTimeout) then
       begin
         Process.Terminate(1);
+        AppendAndCheck(#13#10 + '[timeout after ' + IntToStr(EffectiveTimeout) + ' ms]' + #13#10);
         Break;
       end;
-
-      if Process.Output.NumBytesAvailable > 0 then
-      begin
-        N := Process.Output.NumBytesAvailable;
-        if N > SizeOf(Buffer) then
-          N := SizeOf(Buffer);
-        BytesRead := Process.Output.Read(Buffer[0], N);
-        if BytesRead > 0 then
-        begin
-          SetLength(RawData, BytesRead);
-          Move(Buffer[0], RawData[1], BytesRead);
-          Captured := Captured + RawData;
-        end;
-      end;
-
-      if Process.Stderr.NumBytesAvailable > 0 then
-      begin
-        N := Process.Stderr.NumBytesAvailable;
-        if N > SizeOf(Buffer) then
-          N := SizeOf(Buffer);
-        BytesRead := Process.Stderr.Read(Buffer[0], N);
-        if BytesRead > 0 then
-        begin
-          SetLength(RawData, BytesRead);
-          Move(Buffer[0], RawData[1], BytesRead);
-          Captured := Captured + RawData;
-        end;
-      end;
-
+      ReadAvailable(Process.Output, Process.Output.NumBytesAvailable);
+      ReadAvailable(Process.Stderr, Process.Stderr.NumBytesAvailable);
       Sleep(10);
     end;
 
     // Drain remaining output after termination
-    while Process.Output.NumBytesAvailable > 0 do
-    begin
-      N := Process.Output.NumBytesAvailable;
-      if N > SizeOf(Buffer) then
-        N := SizeOf(Buffer);
-      BytesRead := Process.Output.Read(Buffer[0], N);
-      if BytesRead > 0 then
-      begin
-        SetLength(RawData, BytesRead);
-        Move(Buffer[0], RawData[1], BytesRead);
-        Captured := Captured + RawData;
-      end;
-    end;
-    while Process.Stderr.NumBytesAvailable > 0 do
-    begin
-      N := Process.Stderr.NumBytesAvailable;
-      if N > SizeOf(Buffer) then
-        N := SizeOf(Buffer);
-      BytesRead := Process.Stderr.Read(Buffer[0], N);
-      if BytesRead > 0 then
-      begin
-        SetLength(RawData, BytesRead);
-        Move(Buffer[0], RawData[1], BytesRead);
-        Captured := Captured + RawData;
-      end;
-    end;
+    while (not HitLimit) and (Process.Output.NumBytesAvailable > 0) do
+      ReadAvailable(Process.Output, Process.Output.NumBytesAvailable);
+    while (not HitLimit) and (Process.Stderr.NumBytesAvailable > 0) do
+      ReadAvailable(Process.Stderr, Process.Stderr.NumBytesAvailable);
 
     AExitCode := Process.ExitStatus;
 
@@ -1085,12 +1090,12 @@ begin
             FAgent.OnExecCommand := @HandleAgentExecCommand;
             try
               FAgent.RunAsync(Payload);
-              // Pump events and watch for ESC so user can cancel
+              // Pump events and watch for Esc so user can cancel
               CancelledShown := False;
               while not FAgent.Done do
               begin
                 CheckSynchronize(50);
-                if not CancelledShown and CheckAndConsumeEsc then
+                if not CancelledShown and CheckAndConsumeCancel then
                 begin
                   FAgent.Cancel;
                   WriteLine('^C (cancelling...)', True);
@@ -1179,7 +1184,6 @@ end;
 
 function ConWhereY: Integer;
 var
-  // Explicit init silences the "not initialized" hint
   Info: TConsoleScreenBufferInfo;
 begin
   Result := 1;
@@ -1190,7 +1194,6 @@ end;
 
 procedure ConClearLineFromCursor;
 var
-  // Explicit init silences the "not initialized" hint
   Info: TConsoleScreenBufferInfo;
   Count: DWORD;
   Written: DWORD;
@@ -1208,7 +1211,6 @@ end;
 
 procedure ClearScreen;
 var
-  // Explicit init silences the "not initialized" hint
   Info: TConsoleScreenBufferInfo;
   Coord: TCoord;
   Size: DWORD;
@@ -1229,36 +1231,56 @@ begin
   end;
 end;
 
-function CheckAndConsumeInterrupt: Boolean;
+// Consumes Esc or Ctrl+C from any position in the input queue
+function CheckAndConsumeCancel: boolean;
 var
   Handle: THandle;
-  // Explicit init silences the "not initialized" hint
-  Rec: INPUT_RECORD;
-  N: DWORD = 0;
+  Events: array of INPUT_RECORD = nil;
+  NumEvents: DWORD = 0;
+  NumRead: DWORD = 0;
+  I, CancelIdx: integer;
+
+  // Returns True when event is Esc or Ctrl+C keydown
+  function IsCancelEvent(const AR: INPUT_RECORD): boolean;
+  begin
+    Result := False;
+    if AR.EventType <> KEY_EVENT then
+      Exit;
+    if not AR.Event.KeyEvent.bKeyDown then
+      Exit;
+    if AR.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE then
+      Exit(True);
+    if (AR.Event.KeyEvent.wVirtualKeyCode = VK_C) and
+       ((AR.Event.KeyEvent.dwControlKeyState and
+         (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0) then
+      Exit(True);
+  end;
+
 begin
   Result := False;
-  Rec := Default(INPUT_RECORD);
   Handle := GetStdHandle(STD_INPUT_HANDLE);
-  if not PeekConsoleInput(Handle, Rec, 1, N) then
+  if not GetNumberOfConsoleInputEvents(Handle, NumEvents) then
     Exit;
-  if N = 0 then
+  if NumEvents = 0 then
     Exit;
-  if Rec.EventType <> KEY_EVENT then
+  SetLength(Events, NumEvents);
+  NumRead := 0;
+  // Peek all pending events without consuming them
+  if not PeekConsoleInput(Handle, Events[0], NumEvents, NumRead) then
     Exit;
-  if not Rec.Event.KeyEvent.bKeyDown then
+  // Search for a cancel key anywhere in the queue
+  CancelIdx := -1;
+  for I := 0 to NumRead - 1 do
+    if IsCancelEvent(Events[I]) then
+    begin
+      CancelIdx := I;
+      Break;
+    end;
+  if CancelIdx < 0 then
     Exit;
-  if Rec.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE then
-  begin
-    ReadConsoleInput(Handle, Rec, 1, N);
-    Result := True;
-  end
-  else if (Rec.Event.KeyEvent.wVirtualKeyCode = VK_C) and
-    ((Rec.Event.KeyEvent.dwControlKeyState and
-      (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0) then
-  begin
-    ReadConsoleInput(Handle, Rec, 1, N);
-    Result := True;
-  end;
+  // Consume all events up to and including the cancel key
+  ReadConsoleInput(Handle, Events[0], CancelIdx + 1, NumRead);
+  Result := True;
 end;
 
 // Hides console cursor, used to suppress flicker during redraw
@@ -1287,35 +1309,9 @@ begin
   end;
 end;
 
-function CheckAndConsumeEsc: boolean;
-var
-  Handle: THandle;
-  Rec: INPUT_RECORD;
-  N: DWORD;
-begin
-  Result := False;
-  Rec := Default(INPUT_RECORD);
-  N := 0;
-  Handle := GetStdHandle(STD_INPUT_HANDLE);
-  if not PeekConsoleInput(Handle, Rec, 1, N) then
-    Exit;
-  if N = 0 then
-    Exit;
-  if Rec.EventType <> KEY_EVENT then
-    Exit;
-  if not Rec.Event.KeyEvent.bKeyDown then
-    Exit;
-  if Rec.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE then
-  begin
-    ReadConsoleInput(Handle, Rec, 1, N);
-    Result := True;
-  end;
-end;
-
 function TCustomTermManager.ReadLine: string;
 var
   Handle: THandle;
-  // Explicit init silences the "not initialized" hint
   Rec, NextRec: INPUT_RECORD;
   N: DWORD = 0;
   Line, PromptText: RawByteString;
@@ -1369,7 +1365,6 @@ var
         B := Ord(NextRec.Event.KeyEvent.UnicodeChar) and $FF;
         if (B < $80) or (B > $BF) then
         begin
-          // Next event is not a continuation byte, sequence is broken
           Skip := True;
           Break;
         end;
@@ -1492,7 +1487,6 @@ begin
         begin
           Dec(HistIndex);
           Line := FHistory[HistIndex];
-          // History strings come from AddToHistory, retag as UTF-8
           SetCodePage(Line, CP_UTF8, False);
           CursorPos := Length(Line);
         end;
@@ -1582,12 +1576,7 @@ begin
   Write(#27'[2J'#27'[H');
 end;
 
-function CheckAndConsumeInterrupt: boolean;
-begin
-  Result := False;
-end;
-
-function CheckAndConsumeEsc: boolean;
+function CheckAndConsumeCancel: boolean;
 begin
   Result := False;
 end;
