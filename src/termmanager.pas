@@ -742,6 +742,14 @@ begin
     Exit(tikBuiltin);
   end;
 
+  // Drive switch like "d:", "d:\", "d:\path" is a builtin, not an executable
+  if (Length(First) >= 2) and (First[2] = ':') and (First[1] in ['a'..'z']) and ((Length(First) = 2) or
+    (First[3] in [PathDelim, '/'])) then
+  begin
+    APayload := S;
+    Exit(tikBuiltin);
+  end;
+
   if FBuiltinCommands.IndexOf(First) >= 0 then
     Exit(tikBuiltin);
 
@@ -770,8 +778,24 @@ begin
 
   if (Cmd = 'exit') or (Cmd = 'quit') then
     FRunning := False
+  else if (Length(Cmd) >= 2) and (Cmd[2] = ':') and (Cmd[1] in ['a'..'z']) and ((Length(Cmd) = 2) or (Cmd[3] in [PathDelim, '/'])) then
+  begin
+    // Drive switch "d:", "d:\", "d:\path" — go to the drive or subfolder
+    if Length(Cmd) = 2 then
+      TargetPath := UpCase(Cmd[1]) + ':\'
+    else
+      TargetPath := IncludeTrailingPathDelimiter(UpCase(Cmd[1]) + ':') + Copy(ALine, 4, MaxInt);
+    TargetPath := ExpandFileName(TargetPath);
+    if DirectoryExists(TargetPath) then
+      SetPath(TargetPath)
+    else
+      DoOutput('Directory not found: ' + ALine + LineEnding, True);
+  end
   else if Cmd = 'cd' then
   begin
+    // Strip /d flag that cmd.exe uses to also switch the drive
+    if (Length(Arg) >= 3) and (LowerCase(Copy(Arg, 1, 3)) = '/d ') then
+      Arg := Trim(Copy(Arg, 4, MaxInt));
     if Arg = '' then
       DoOutput(GetEffectivePath + LineEnding, False)
     else
@@ -828,11 +852,33 @@ var
   RawData: rawbytestring;
   StartTime: TDateTime;
   N: integer;
+  DrivePath: string;
 begin
   Result := -1;
   Buffer := Default(TTermBuffer);
   if ACommand = '' then
     Exit;
+  // Drive switch "d:", "d:\", "d:\path" must run in-process
+  if (Length(ACommand) >= 2) and (ACommand[2] = ':') and (ACommand[1] in ['a'..'z', 'A'..'Z']) and
+    ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) then
+  begin
+    if Length(ACommand) = 2 then
+      DrivePath := UpCase(ACommand[1]) + ':\'
+    else
+      DrivePath := IncludeTrailingPathDelimiter(UpCase(ACommand[1]) + ':') + Copy(ACommand, 4, MaxInt);
+    DrivePath := ExpandFileName(DrivePath);
+    if DirectoryExists(DrivePath) then
+    begin
+      SetPath(DrivePath);
+      Result := 0;
+    end
+    else
+    begin
+      DoOutput('Directory not found: ' + ACommand + LineEnding, True);
+      Result := 1;
+    end;
+    Exit;
+  end;
   RawData := '';
   Process := TProcess.Create(nil);
   try
