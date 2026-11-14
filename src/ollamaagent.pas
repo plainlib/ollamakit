@@ -85,6 +85,10 @@ type
     FCancelled: boolean;
     FFinalAnswer: string;
     FLog: boolean;
+    // Prompt plus generated tokens reported by the last step
+    FContextUsed: integer;
+    // Configured context window size in tokens, 0 when unknown
+    FContextTotal: integer;
     FOnRoute: TAgentRouteEvent;
     FOnChunk: TAgentChunkEvent;
     FOnThinking: TAgentThinkingEvent;
@@ -98,6 +102,9 @@ type
     procedure SetRootPath(const AValue: string);
     function GetHistory: string;
     procedure SetHistory(const AValue: string);
+    function GetContextPercent: integer;
+    function GetContextUsedKb: integer;
+    function GetContextTotalKb: integer;
   protected
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
     // Returns absolute root path for sandboxed file tools
@@ -128,12 +135,26 @@ type
     function BuildToolsNames: string; virtual;
     // Writes a diagnostic line to stderr when Log is enabled
     procedure LogLine(const AText: string); virtual;
+    // Resolves placeholders in SystemPrompt using current values
+    function BuildSystemPrompt: string; virtual;
+    // Resets usage counters in the manager and this agent
+    procedure ResetUsage;
     // True while an agent run is in progress
     property Done: boolean read FDone;
     // Text returned by the last run
     property FinalAnswer: string read FFinalAnswer;
     // JSON array of accumulated messages when KeepHistory is enabled
     property History: string read GetHistory write SetHistory;
+    // Prompt plus generated tokens reported by the last step
+    property ContextUsed: integer read FContextUsed;
+    // Configured context window in tokens, 0 when unknown
+    property ContextTotal: integer read FContextTotal;
+    // Usage as a percentage of ContextTotal, 0 when total is unknown
+    property ContextPercent: integer read GetContextPercent;
+    // ContextUsed converted to kilobytes using ContextBytesPerToken
+    property ContextUsedKb: integer read GetContextUsedKb;
+    // ContextTotal converted to kilobytes using ContextBytesPerToken
+    property ContextTotalKb: integer read GetContextTotalKb;
   published
     // Ollama API client used for chat requests
     property OllamaManager: TOllamaManager read FOllamaManager write SetOllamaManager;
@@ -539,7 +560,8 @@ begin
       begin
         MsgObj := TJSONObject.Create;
         MsgObj.Add('role', 'system');
-        MsgObj.Add('content', string(FAgent.SystemPrompt));
+        // Resolve {path} and {model} against current values
+        MsgObj.Add('content', FAgent.BuildSystemPrompt);
         MessagesArr.Add(MsgObj);
       end;
 
@@ -553,7 +575,7 @@ begin
               for I := 0 to TJSONArray(Data).Count - 1 do
                 MessagesArr.Add(TJSONArray(Data).Items[I].Clone);
           except
-            // Ignore invalid history
+            ; // Ignore invalid history
           end;
         finally
           Data.Free;
@@ -623,7 +645,21 @@ begin
           Exit;
         end;
 
-        FAgent.LogLine(Format('Chat done raw_len=%d', [Length(FinalJson)]));
+        // Update usage counters from the manager after each step
+        FAgent.FContextUsed := FAgent.OllamaManager.LastUsageTotal;
+        // Resolve context total from NumCtx or from loaded model info
+        if FAgent.OllamaManager.NumCtx > 0 then
+          FAgent.FContextTotal := FAgent.OllamaManager.NumCtx
+        else if FAgent.FContextTotal = 0 then
+        begin
+          FAgent.FContextTotal := FAgent.OllamaManager.GetModelContextLength(FAgent.ModelName);
+          // Model may have just been loaded, trigger a refresh for next step
+          if (FAgent.FContextTotal = 0) and (Step = 1) then
+            FAgent.OllamaManager.RefreshModels;
+        end;
+
+        FAgent.LogLine(Format('Chat done raw_len=%d usage=%d/%d', [Length(FinalJson), FAgent.FContextUsed,
+          FAgent.FContextTotal]));
 
         Data := nil;
         try
@@ -735,7 +771,7 @@ begin
           MessagesArr.Delete(0);
         FAgent.FHistory := MessagesArr.AsJSON;
       except
-        // Ignore history save errors
+        ; // Ignore history save errors
       end;
     end;
     MessagesArr.Free;
@@ -789,6 +825,8 @@ begin
   FCancelled := False;
   FFinalAnswer := '';
   FLog := False;
+  FContextUsed := 0;
+  FContextTotal := 0;
   FTools := TAgentTools.Create(Self);
 end;
 
@@ -855,6 +893,17 @@ begin
   FDone := False;
   FCancelled := False;
   FFinalAnswer := '';
+  FContextUsed := 0;
+  if Assigned(FOllamaManager) then
+  begin
+    // Explicit NumCtx wins, otherwise use loaded model context from /api/ps
+    if FOllamaManager.NumCtx > 0 then
+      FContextTotal := FOllamaManager.NumCtx
+    else
+      FContextTotal := FOllamaManager.GetModelContextLength(FModelName);
+  end
+  else
+    FContextTotal := 0;
   TOllamaAgentThread.Create(Self, AText);
 end;
 
@@ -875,6 +924,49 @@ end;
 procedure TOllamaAgent.ClearHistory;
 begin
   FHistory := '';
+end;
+
+function TOllamaAgent.BuildSystemPrompt: string;
+begin
+  Result := string(FSystemPrompt);
+  Result := StringReplace(Result, '{path}', GetEffectiveRootPath, [rfReplaceAll]);
+  Result := StringReplace(Result, '{model}', FModelName, [rfReplaceAll]);
+end;
+
+procedure TOllamaAgent.ResetUsage;
+begin
+  FContextUsed := 0;
+  if Assigned(FOllamaManager) then
+  begin
+    FOllamaManager.ResetUsage;
+    FContextTotal := FOllamaManager.NumCtx;
+  end
+  else
+    FContextTotal := 0;
+end;
+
+function TOllamaAgent.GetContextPercent: integer;
+begin
+  if (FContextTotal > 0) and (FContextUsed > 0) then
+  begin
+    Result := Round(FContextUsed * 100.0 / FContextTotal);
+    if Result > 100 then
+      Result := 100;
+  end
+  else
+    Result := 0;
+end;
+
+function TOllamaAgent.GetContextUsedKb: integer;
+begin
+  // Shown as KB in prompt, means thousands of tokens
+  Result := FContextUsed div 1024;
+end;
+
+function TOllamaAgent.GetContextTotalKb: integer;
+begin
+  // Shown as KB in prompt, means thousands of tokens
+  Result := FContextTotal div 1024;
 end;
 
 procedure TOllamaAgent.LogLine(const AText: string);

@@ -124,93 +124,72 @@ type
     procedure WriteText(const AText: string; AIsStderr: boolean = False); virtual;
     // Writes text followed by a line ending, flushes immediately
     procedure WriteLine(const AText: string; AIsStderr: boolean = False); virtual;
-    // Working directory shared by shell and agent, empty means process cwd
+
     property Path: string read FPath write SetPath;
-    // Prompt template with {path} placeholder
     property Prompt: string read FPrompt write FPrompt;
-    // Banner printed once before the first prompt
     property Welcome: TCaption read FWelcome write FWelcome;
-    // Label printed on its own line before agent thinking text
     property ThinkingLabel: TCaption read FThinkingLabel write FThinkingLabel;
-    // When False, only the label is printed, thinking text is hidden
     property ShowThinking: boolean read FShowThinking write FShowThinking default True;
-    // Label printed on its own line before a tool call, {name} and {args} placeholders
     property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
-    // Replace emoji and unsupported symbols with nothing on output
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
-    // Commands handled internally without invoking the shell
     property BuiltinCommands: TStringList read FBuiltinCommands;
-    // Maximum number of lines kept in history buffer
     property HistoryMax: integer read FHistoryMax write FHistoryMax default 200;
-    // Shell executable used for external commands
     property ShellExec: string read FShellExec write FShellExec;
-    // Command timeout in milliseconds, zero means no limit
     property CommandTimeout: integer read FCommandTimeout write FCommandTimeout default 0;
-    // Maximum captured bytes from agent exec_command, truncated with notice
     property MaxCaptureBytes: integer read FMaxCaptureBytes write FMaxCaptureBytes default 65536;
-    // Timeout in milliseconds for agent exec_command, zero means no limit
     property AgentCommandTimeout: integer read FAgentCommandTimeout write FAgentCommandTimeout default 30000;
-    // Enable ! and ? prefixes to force routing
     property UsePrefixes: boolean read FUsePrefixes write FUsePrefixes default True;
-    // Search PATH and known shell builtins during classification
     property SearchPath: boolean read FSearchPath write FSearchPath default True;
-    // Exit code of the last executed external command
     property LastExitCode: integer read FLastExitCode;
-    // True while the input loop is active
     property Running: boolean read FRunning;
-    // Fires before action; host may approve or change kind
     property OnRoute: TTermRouteEvent read FOnRoute write FOnRoute;
-    // Fires for every chunk of command output
     property OnOutput: TTermOutputEvent read FOnOutput write FOnOutput;
-    // Fires when input is classified as agent text
     property OnAgentExecute: TTermAgentEvent read FOnAgentExecute write FOnAgentExecute;
-    // Fires when the input loop finishes
     property OnExit: TTermExitEvent read FOnExit write FOnExit;
-    // Optional agent that answers agent-classified input
     property Agent: TOllamaAgent read FAgent write SetAgent;
   end;
 
   TTermManager = class(TCustomTermManager)
   published
-    // Working directory shared by shell and agent, empty means process cwd
+    // Working directory for shell commands and agent file tools, empty uses process cwd
     property Path;
-    // Prompt template, {path} is replaced with Path
+    // Prompt template, supports {path}, {model}, {context}, {context_kb}, {context_percent} and other usage placeholders
     property Prompt;
-    // Banner printed once before the first prompt
+    // Multi-line banner printed once before the first prompt
     property Welcome;
-    // Label printed on its own line before agent thinking text
+    // Line printed before agent reasoning block, for example [Thinking]
     property ThinkingLabel;
-    // When False, only the label is printed, thinking text is hidden
+    // Show agent reasoning text; when False only ThinkingLabel is printed
     property ShowThinking;
-    // Label printed on its own line before a tool call, {name} and {args} placeholders
+    // Line printed before each tool call, supports {name}, {args} and JSON field placeholders like {command}
     property ToolCallLabel;
-    // Remove emoji and unsupported symbols before writing to console
+    // Strip emoji and unsupported symbol ranges that plain console fonts cannot render
     property StripEmoji;
-    // List of commands handled internally without shell
+    // Commands executed internally without invoking the shell, extend to add your own
     property BuiltinCommands;
-    // Maximum number of lines kept in history buffer
+    // Maximum number of input lines kept in history, oldest are dropped first
     property HistoryMax;
-    // Shell executable used for external commands
+    // Shell executable used to run external commands and agent exec_command, defaults to cmd.exe
     property ShellExec;
-    // Command timeout in milliseconds, zero means no limit
+    // Timeout in milliseconds for user-typed external commands, zero means no limit
     property CommandTimeout;
-    // Maximum captured bytes from agent exec_command, truncated with notice
+    // Cap on bytes captured from agent exec_command, excess is truncated with a notice
     property MaxCaptureBytes;
-    // Timeout in milliseconds for agent exec_command, zero means no limit
+    // Timeout in milliseconds for agent exec_command, zero means no limit, default 30 seconds
     property AgentCommandTimeout;
-    // Enable ! and ? prefixes to force command or agent routing
+    // Enable ! and ? prefixes to force command or agent routing respectively
     property UsePrefixes;
-    // Also search PATH and known shell builtins when routing
+    // Also detect PATH executables and known shell builtins when classifying input
     property SearchPath;
-    // Fires before action, host can approve or change kind
+    // Fires before routing each input, host can approve, reject or reclassify it
     property OnRoute;
-    // Fires for every chunk of command output
+    // Fires for every chunk of command output, useful for logging or filtering
     property OnOutput;
-    // Fires when input is classified as agent text
+    // Fires when input is classified as agent text and no Agent is attached
     property OnAgentExecute;
-    // Fires when the input loop finishes
+    // Fires when the interactive loop terminates, receives last command exit code
     property OnExit;
-    // Optional agent used to answer agent-classified input
+    // Agent component that handles agent-classified input, leave empty to disable
     property Agent;
   end;
 
@@ -549,6 +528,8 @@ begin
       WriteLine('[error: ' + AErrorMsg + ']', True);
     afrModelNotSet:
       WriteLine('[agent not configured: ' + AErrorMsg + ']', True);
+    else
+      ;
   end;
   // Blank line after any finish for visual separation from the next prompt
   WriteLine('', False);
@@ -625,8 +606,49 @@ begin
 end;
 
 function TCustomTermManager.GetPromptText: string;
+var
+  ModelName, CtxUsed, CtxTotal, CtxPercent, Ctx, CtxKb, CtxUsedKb, CtxTotalKb: string;
 begin
-  Result := StringReplace(FPrompt, '{path}', GetEffectivePath, [rfReplaceAll]);
+  Result := FPrompt;
+  // Agent-related placeholders, empty when no agent is attached
+  if Assigned(FAgent) then
+  begin
+    ModelName := FAgent.ModelName;
+    CtxUsed := IntToStr(FAgent.ContextUsed);
+    if FAgent.ContextTotal > 0 then
+    begin
+      CtxTotal := IntToStr(FAgent.ContextTotal);
+      CtxPercent := IntToStr(FAgent.ContextPercent);
+      Ctx := CtxUsed + '/' + CtxTotal;
+    end
+    else
+    begin
+      // Show zero when total is unknown, do not invent numbers
+      CtxTotal := '0';
+      CtxPercent := '0';
+      Ctx := '0';
+    end;
+    CtxUsedKb := IntToStr(FAgent.ContextUsedKb);
+    if FAgent.ContextTotalKb > 0 then
+    begin
+      CtxTotalKb := IntToStr(FAgent.ContextTotalKb);
+      CtxKb := CtxUsedKb + '/' + CtxTotalKb + 'KB';
+    end
+    else
+    begin
+      CtxTotalKb := '0';
+      CtxKb := '0';
+    end;
+    Result := StringReplace(Result, '{model}', ModelName, [rfReplaceAll]);
+    Result := StringReplace(Result, '{context_used}', CtxUsed, [rfReplaceAll]);
+    Result := StringReplace(Result, '{context_total}', CtxTotal, [rfReplaceAll]);
+    Result := StringReplace(Result, '{context_percent}', CtxPercent, [rfReplaceAll]);
+    Result := StringReplace(Result, '{context}', Ctx, [rfReplaceAll]);
+    Result := StringReplace(Result, '{context_used_kb}', CtxUsedKb, [rfReplaceAll]);
+    Result := StringReplace(Result, '{context_total_kb}', CtxTotalKb, [rfReplaceAll]);
+    Result := StringReplace(Result, '{context_kb}', CtxKb, [rfReplaceAll]);
+  end;
+  Result := StringReplace(Result, '{path}', GetEffectivePath, [rfReplaceAll]);
 end;
 
 procedure TCustomTermManager.DoRoute(const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean);
@@ -1125,13 +1147,16 @@ begin
           end
           else
             DoAgentExecute(Payload);
+        else
+          ;
       end;
     end;
   finally
     {$IFDEF WINDOWS}
     if InModeSaved then
-      SetConsoleMode(InHandle, InMode);
+      SetConsoleMode(InHandle, InMode)
     {$ENDIF}
+    ;
   end;
   DoExit(FLastExitCode);
 end;

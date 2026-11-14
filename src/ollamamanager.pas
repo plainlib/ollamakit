@@ -75,6 +75,12 @@ type
     FBaseURL: string;
     FPopupMenu: TPopupMenu;
     FKeepAlive: integer;
+    // num_ctx value sent with requests, 0 means use Ollama default
+    FNumCtx: integer;
+    // Prompt tokens reported by the last completed request
+    FLastPromptEvalCount: integer;
+    // Generated tokens reported by the last completed request
+    FLastEvalCount: integer;
     FAutoRefresh: boolean;
     FConnectionTimeout: integer;
     FRequestTimeout: integer;
@@ -121,6 +127,10 @@ type
     function IsCloudModel(const ModelName: string): boolean;
     function BuildModelInfo(const ModelName: string): string;
 
+    // Returns GetLastUsageTotal for read-only property
+    function GetLastUsageTotal: integer;
+    // Builds optional "options" JSON fragment for num_ctx
+    function BuildOptionsJson: string;
     // Error reporting helper
     procedure DoError(Kind: TOllamaErrorKind; const ModelName, Msg: string);
 
@@ -188,12 +198,25 @@ type
     procedure BgFinished(const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
     procedure UnregisterThread(AThread: TThread);
 
+    // Resets usage counters to zero
+    procedure ResetUsage;
+    // Returns context length of a loaded model from last refresh, 0 if unknown
+    function GetModelContextLength(const ModelName: string): int64;
+
     property BaseURL: string read FBaseURL write SetBaseURL;
     property PopupMenu: TPopupMenu read FPopupMenu write SetPopupMenu;
     property Active: boolean read FActive write SetActive default True;
     property IsConnected: boolean read FConnected;
     property IsConnecting: boolean read FConnecting;
     property KeepAlive: integer read FKeepAlive write FKeepAlive default -1;
+    // num_ctx value sent with requests, 0 means use Ollama default
+    property NumCtx: integer read FNumCtx write FNumCtx default 0;
+    // Prompt tokens reported by the last completed request
+    property LastPromptEvalCount: integer read FLastPromptEvalCount;
+    // Generated tokens reported by the last completed request
+    property LastEvalCount: integer read FLastEvalCount;
+    // Sum of prompt and generated tokens from the last request
+    property LastUsageTotal: integer read GetLastUsageTotal;
     property AutoRefresh: boolean read FAutoRefresh write FAutoRefresh default True;
     property ConnectionTimeout: integer read FConnectionTimeout write FConnectionTimeout default 5000;
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 30000;
@@ -217,6 +240,8 @@ type
     property PopupMenu;
     // keep_alive value sent with start requests; -1 means no time limit
     property KeepAlive;
+    // num_ctx value sent with requests, 0 means use Ollama default
+    property NumCtx;
     // Master switch; when False no connection attempts are made and the menu is empty
     property Active;
     // When True, the model list is refreshed before each menu popup
@@ -365,6 +390,8 @@ begin
           if FErrorKind = oekNone then
             FPsJson := FManager.ApiGet('/api/ps', FErrorKind, FErrorMsg);
         end;
+        else
+          ;
       end;
     end;
   finally
@@ -373,7 +400,7 @@ begin
       try
         Synchronize(@DoFinish);
       except
-        // Ignore - cannot reach the main thread during shutdown
+        ; // Ignore - cannot reach the main thread during shutdown
       end;
     end;
   end;
@@ -400,6 +427,9 @@ begin
   inherited Create(AOwner);
   FBaseURL := 'http://localhost:11434';
   FKeepAlive := -1;
+  FNumCtx := 0;
+  FLastPromptEvalCount := 0;
+  FLastEvalCount := 0;
   FAutoRefresh := True;
   FConnectionTimeout := 5000;
   FRequestTimeout := 30000;
@@ -467,6 +497,52 @@ begin
   inherited Destroy;
 end;
 
+function TCustomOllamaManager.GetLastUsageTotal: integer;
+begin
+  Result := FLastPromptEvalCount + FLastEvalCount;
+end;
+
+function TCustomOllamaManager.BuildOptionsJson: string;
+begin
+  if FNumCtx > 0 then
+    Result := Format(',"options":{"num_ctx":%d}', [FNumCtx])
+  else
+    Result := '';
+end;
+
+procedure TCustomOllamaManager.ResetUsage;
+begin
+  FLastPromptEvalCount := 0;
+  FLastEvalCount := 0;
+end;
+
+function TCustomOllamaManager.GetModelContextLength(const ModelName: string): int64;
+var
+  Idx: integer;
+  PsJson: string;
+  PsData: TJSONData;
+begin
+  Result := 0;
+  if not Assigned(FRunningDetails) then
+    Exit;
+  Idx := FRunningDetails.IndexOfName(ModelName);
+  if Idx < 0 then
+    Exit;
+  PsJson := FRunningDetails.ValueFromIndex[Idx];
+  PsData := nil;
+  try
+    try
+      PsData := GetJSON(PsJson);
+      if (PsData <> nil) and (PsData.JSONType = jtObject) then
+        Result := TJSONObject(PsData).Get('context_length', int64(0));
+    except
+      Result := 0;
+    end;
+  finally
+    PsData.Free;
+  end;
+end;
+
 procedure TCustomOllamaManager.DoError(Kind: TOllamaErrorKind; const ModelName, Msg: string);
 begin
   if Kind = oekNone then
@@ -476,7 +552,7 @@ begin
   try
     FOnError(Self, Kind, ModelName, Msg);
   except
-    // User handler raised an exception; ignore so the manager stays consistent
+    ; // User handler raised an exception; ignore so the manager stays consistent
   end;
 end;
 
@@ -512,7 +588,7 @@ begin
   try
     FOnConnecting(Self);
   except
-    // Ignore user handler exceptions
+    ; // Ignore user handler exceptions
   end;
 
   TOllamaBgThread.Create(Self, boRefresh, '', FConnectGen);
@@ -554,13 +630,13 @@ begin
       try
         FOnConnected(Self);
       except
-        // Ignore user handler exceptions
+        ; // Ignore user handler exceptions
       end;
       if Assigned(FOnModelsRefreshed) then
       try
         FOnModelsRefreshed(Self, FInstalledModels);
       except
-        // Ignore user handler exceptions
+        ; // Ignore user handler exceptions
       end;
     except
       // Defensive - should not normally happen
@@ -613,7 +689,13 @@ begin
   // Remove stale items streamed from a previous design-time build; only
   // relevant in the IDE so the .lfm is not polluted on the next save
   if (csDesigning in ComponentState) and Assigned(FPopupMenu) then
+  begin
     ClearPopupMenu;
+    Exit;
+  end;
+  // Kick off the initial refresh so RunningDetails is populated for the agent
+  if FActive then
+    BeginConnect;
 end;
 
 procedure TCustomOllamaManager.Notification(AComponent: TComponent; Operation: TOperation);
@@ -1054,7 +1136,7 @@ begin
         end;
       end;
     except
-      // Invalid JSON - return whatever was parsed so far
+      ; // Invalid JSON - return whatever was parsed so far
     end;
   finally
     Data.Free;
@@ -1166,7 +1248,7 @@ begin
             Found := True;
           end;
         except
-          // Invalid cached JSON, treat as not loaded
+          ; // Invalid cached JSON, treat as not loaded
         end;
       finally
         PsData.Free;
@@ -1553,6 +1635,8 @@ type
     Buffer: string;
     FullFinal: string;
     AccumulatedToolCalls: string;
+    LastPromptEvalCount: integer;
+    LastEvalCount: integer;
     Done: boolean;
     Cancelled: boolean;
     UserCallback: TOllamaStreamCallback;
@@ -1590,6 +1674,12 @@ begin
           AToolCalls := ToolCallsData.AsJSON;
       end;
       ADone := Obj.Get('done', False);
+      // Usage counters only present in the final chunk
+      if ADone then
+      begin
+        LastPromptEvalCount := Obj.Get('prompt_eval_count', 0);
+        LastEvalCount := Obj.Get('eval_count', 0);
+      end;
       Result := True;
     except
       Result := False;
@@ -1603,9 +1693,12 @@ procedure TOllamaChatStreamHelper.HandleRaw(const AChunk: string; var ACancel: b
 var
   P: integer;
   OneLine, ChunkContent, ChunkThinking, ChunkToolCalls: string;
-  IsDone: boolean;
+  IsDone: boolean = False;
 begin
   Buffer := Buffer + AChunk;
+  ChunkContent := '';
+  ChunkThinking := '';
+  ChunkToolCalls := '';
   P := Pos(#10, Buffer);
   while P > 0 do
   begin
@@ -1662,8 +1755,6 @@ function TCustomOllamaManager.ChatStream(const ModelName, MessagesJson, ToolsJso
   AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
 var
   JsonBody, ErrFromNetwork, Url: string;
-  Kind: TOllamaErrorKind;
-  ErrMsg: string;
   Tm: TTimeout;
   Helper: TOllamaChatStreamHelper;
 begin
@@ -1678,10 +1769,11 @@ begin
   end;
 
   if ToolsJson <> '' then
-    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d,"stream":true}',
-      [ModelName, MessagesJson, ToolsJson, FKeepAlive])
+    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
+      [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d,"stream":true}', [ModelName, MessagesJson, FKeepAlive]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -1714,6 +1806,9 @@ begin
       Exit;
     end;
 
+    // Store usage counters reported by the server
+    FLastPromptEvalCount := Helper.LastPromptEvalCount;
+    FLastEvalCount := Helper.LastEvalCount;
     Result := Helper.FullFinal;
   finally
     Helper.Free;
@@ -1743,10 +1838,11 @@ begin
     Exit;
   end;
   if ToolsJson <> '' then
-    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d,"stream":false}',
-      [ModelName, MessagesJson, ToolsJson, FKeepAlive])
+    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
+      [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d,"stream":false}', [ModelName, MessagesJson, FKeepAlive]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
@@ -1768,6 +1864,9 @@ begin
       Data := GetJSON(Result);
       if (Data <> nil) and (Data.JSONType = jtObject) then
       begin
+        // Extract usage counters from the top-level response
+        FLastPromptEvalCount := TJSONObject(Data).Get('prompt_eval_count', 0);
+        FLastEvalCount := TJSONObject(Data).Get('eval_count', 0);
         MsgData := TJSONObject(Data).Find('message');
         if (MsgData <> nil) and (MsgData.JSONType = jtObject) then
         begin
@@ -1786,7 +1885,7 @@ begin
         end;
       end;
     except
-      // Ignore parse errors, caller still gets raw response
+      ; // Ignore parse errors, caller still gets raw response
     end;
   finally
     Data.Free;
