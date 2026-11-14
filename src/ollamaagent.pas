@@ -26,6 +26,7 @@ type
 
   TAgentRouteEvent = procedure(Sender: TObject; AOp: TAgentOperation; const APayload: string; var AAllow: boolean) of object;
   TAgentChunkEvent = procedure(Sender: TObject; const AText: string) of object;
+  TAgentThinkingEvent = procedure(Sender: TObject; const AText: string) of object;
   TAgentToolCallEvent = procedure(Sender: TObject; const AName, AArgsJson: string) of object;
   TAgentToolResultEvent = procedure(Sender: TObject; const AName, AResult: string) of object;
   TAgentExecCommandEvent = procedure(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean) of object;
@@ -74,6 +75,7 @@ type
     FModelName: string;
     FSystemPrompt: TCaption;
     FMaxSteps: integer;
+    FRequestTimeout: integer;
     FFeatures: TAgentFeatures;
     FRootPath: string;
     FTools: TAgentTools;
@@ -85,6 +87,7 @@ type
     FLog: boolean;
     FOnRoute: TAgentRouteEvent;
     FOnChunk: TAgentChunkEvent;
+    FOnThinking: TAgentThinkingEvent;
     FOnToolCall: TAgentToolCallEvent;
     FOnToolResult: TAgentToolResultEvent;
     FOnExecCommand: TAgentExecCommandEvent;
@@ -140,6 +143,8 @@ type
     property SystemPrompt: TCaption read FSystemPrompt write FSystemPrompt;
     // Maximum number of agent iterations before giving up
     property MaxSteps: integer read FMaxSteps write FMaxSteps default 20;
+    // Per-request timeout in ms, 0 means use OllamaManager default
+    property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 0;
     // Feature toggles for streaming, file tools and shell execution
     property Features: TAgentFeatures read FFeatures write FFeatures default [afStreaming, afFileTools];
     // Sandbox directory for file tools, empty means process cwd
@@ -154,6 +159,8 @@ type
     property OnRoute: TAgentRouteEvent read FOnRoute write FOnRoute;
     // Fired for every streamed text chunk from the model
     property OnChunk: TAgentChunkEvent read FOnChunk write FOnChunk;
+    // Fired for every thinking chunk from the model
+    property OnThinking: TAgentThinkingEvent read FOnThinking write FOnThinking;
     // Fired when the LLM requests a tool, after host approval
     property OnToolCall: TAgentToolCallEvent read FOnToolCall write FOnToolCall;
     // Fired with the tool result before it is sent back to the model
@@ -216,6 +223,12 @@ type
     procedure Invoke; override;
   end;
 
+  TThinkingCall = class(TAgentCallBase)
+  public
+    Text: string;
+    procedure Invoke; override;
+  end;
+
   TToolCallCall = class(TAgentCallBase)
   public
     Name, Args: string;
@@ -261,6 +274,16 @@ begin
   try
     if Assigned(Agent.FOnChunk) then
       Agent.FOnChunk(Agent, Text);
+  finally
+    Free;
+  end;
+end;
+
+procedure TThinkingCall.Invoke;
+begin
+  try
+    if Assigned(Agent.FOnThinking) then
+      Agent.FOnThinking(Agent, Text);
   finally
     Free;
   end;
@@ -329,8 +352,11 @@ type
     FUserText: string;
     FCurrentContent: string;
     procedure HandleStreamChunk(const AContent: string; var ACancel: boolean);
+    procedure HandleFullContent(const AContent: string; var ACancel: boolean);
+    procedure HandleThinkingChunk(const AText: string; var ACancel: boolean);
     procedure QueueRoute(AOp: TAgentOperation; const APayload: string; out AAllow: boolean);
     procedure QueueChunk(const AText: string);
+    procedure QueueThinking(const AText: string);
     procedure QueueToolCall(const AName, AArgs: string);
     procedure QueueToolResult(const AName, AResult: string);
     procedure QueueFinish(AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
@@ -364,6 +390,28 @@ begin
     QueueChunk(AContent);
 end;
 
+procedure TOllamaAgentThread.HandleFullContent(const AContent: string; var ACancel: boolean);
+begin
+  if FAgent.FCancelled then
+  begin
+    ACancel := True;
+    Exit;
+  end;
+  FCurrentContent := FCurrentContent + AContent;
+  // Non-streaming call, emit full content as one chunk
+  QueueChunk(AContent);
+end;
+
+procedure TOllamaAgentThread.HandleThinkingChunk(const AText: string; var ACancel: boolean);
+begin
+  if FAgent.FCancelled then
+  begin
+    ACancel := True;
+    Exit;
+  end;
+  QueueThinking(AText);
+end;
+
 procedure TOllamaAgentThread.QueueRoute(AOp: TAgentOperation; const APayload: string; out AAllow: boolean);
 var
   Call: TRouteCall;
@@ -393,6 +441,19 @@ begin
   if not Assigned(FAgent.FOnChunk) then
     Exit;
   Call := TChunkCall.Create;
+  Call.Agent := FAgent;
+  Call.Text := AText;
+  TThread.Queue(nil, @Call.Invoke);
+end;
+
+procedure TOllamaAgentThread.QueueThinking(const AText: string);
+var
+  Call: TThinkingCall;
+begin
+  FAgent.LogLine(Format('Thinking chunk len=%d', [Length(AText)]));
+  if not Assigned(FAgent.FOnThinking) then
+    Exit;
+  Call := TThinkingCall.Create;
   Call.Agent := FAgent;
   Call.Text := AText;
   TThread.Queue(nil, @Call.Invoke);
@@ -441,7 +502,7 @@ end;
 
 procedure TOllamaAgentThread.Execute;
 var
-  Step, I: integer;
+  Step, I, SavedTimeout: integer;
   MessagesArr: TJSONArray;
   MessagesJson, ToolsJson, FinalJson, ErrMsg: string;
   Kind: TOllamaErrorKind;
@@ -528,17 +589,23 @@ begin
 
         FCurrentContent := '';
         MessagesJson := MessagesArr.AsJSON;
-        FAgent.LogLine(Format('Step %d messages=%d', [Step, MessagesArr.Count]));
+        FAgent.LogLine(Format('Step %d messages=%d timeout=%d', [Step, MessagesArr.Count, FAgent.OllamaManager.RequestTimeout]));
 
-        if ToolsJson <> '' then
-        begin
-          // Use non-streaming when tools present to reliably get tool_calls
-          FinalJson := FAgent.OllamaManager.ChatWithTools(FAgent.ModelName, MessagesJson, ToolsJson, Kind, ErrMsg);
-        end
-        else
-        begin
-          // Plain chat streams tokens to the console
-          FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, '', @HandleStreamChunk, Kind, ErrMsg);
+        // Temporarily override manager timeout when agent has its own
+        SavedTimeout := FAgent.OllamaManager.RequestTimeout;
+        if FAgent.FRequestTimeout > 0 then
+          FAgent.OllamaManager.RequestTimeout := FAgent.FRequestTimeout;
+        try
+          // Always stream, tool_calls are accumulated by the helper
+          if afStreaming in FAgent.FFeatures then
+            FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
+              @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg)
+          else
+            // Streaming disabled, use non-streaming with full content chunk
+            FinalJson := FAgent.OllamaManager.ChatWithTools(FAgent.ModelName, MessagesJson, ToolsJson,
+              @HandleFullContent, @HandleThinkingChunk, Kind, ErrMsg);
+        finally
+          FAgent.OllamaManager.RequestTimeout := SavedTimeout;
         end;
 
         if FAgent.FCancelled or (Kind = oekCancelled) then
@@ -591,12 +658,7 @@ begin
               FinalContent := TJSONObject(MessageData).Get('content', '');
             if FinalContent = '' then
               FinalContent := FCurrentContent;
-            // Emit one chunk so streaming console shows the text before finish
-            if (afStreaming in FAgent.FFeatures) and (FinalContent <> '') then
-            begin
-              FAgent.LogLine(Format('Emitting content chunk len=%d', [Length(FinalContent)]));
-              QueueChunk(FinalContent);
-            end;
+            // Content is already emitted by ChatStream or ChatWithTools callbacks
             FAgent.LogLine(Format('Finished: content_len=%d tool_calls=0', [Length(FinalContent)]));
             Reason := afrSuccess;
             Exit;
@@ -718,6 +780,7 @@ begin
   FModelName := '';
   FSystemPrompt := '';
   FMaxSteps := 20;
+  FRequestTimeout := 0;
   FFeatures := [afStreaming, afFileTools];
   FRootPath := '';
   FKeepHistory := False;

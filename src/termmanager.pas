@@ -11,7 +11,8 @@ unit TermManager;
 interface
 
 uses
-  Classes, SysUtils, Controls, DateUtils, Process, OllamaAgent{$IFDEF WINDOWS}, Windows{$ENDIF};
+  Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser,
+  OllamaAgent{$IFDEF WINDOWS}, Windows{$ENDIF};
 
 type
   // Classification of a single input line
@@ -27,6 +28,12 @@ type
     FPath: string;
     FPrompt: string;
     FWelcome: TCaption;
+    // Label printed before agent thinking block, followed by a newline
+    FThinkingLabel: TCaption;
+    // When False only the label is printed, thinking text is suppressed
+    FShowThinking: boolean;
+    // Label printed on its own line before a tool call, {name} and {args} placeholders
+    FToolCallLabel: TCaption;
     // True when last written char was CR or LF, used to keep prompt on fresh line
     FLastCharWasNewLine: boolean;
     // Remove emoji and symbol chars that console fonts cannot render
@@ -44,8 +51,13 @@ type
     FAgent: TOllamaAgent;
     // Previous agent handlers, restored when agent is detached
     FPrevAgentOnChunk: TAgentChunkEvent;
+    FPrevAgentOnThinking: TAgentThinkingEvent;
+    FPrevAgentOnToolCall: TAgentToolCallEvent;
+    FPrevAgentOnToolResult: TAgentToolResultEvent;
     FPrevAgentOnFinish: TAgentFinishEvent;
     FPrevAgentOnExecCommand: TAgentExecCommandEvent;
+    // True while writing agent thinking before the first content chunk
+    FInThinking: boolean;
     FOnRoute: TTermRouteEvent;
     FOnOutput: TTermOutputEvent;
     FOnAgentExecute: TTermAgentEvent;
@@ -83,6 +95,14 @@ type
     procedure PumpOutput(const AData: rawbytestring; AIsStderr: boolean); virtual;
     // Redirects agent streamed chunks to console output
     procedure HandleAgentChunk(Sender: TObject; const AText: string);
+    // Closes the active thinking block with a trailing blank line
+    procedure CloseThinking;
+    // Redirects agent thinking chunks to console output with a label
+    procedure HandleAgentThinking(Sender: TObject; const AText: string);
+    // Prints tool call label with surrounding blank lines
+    procedure HandleAgentToolCall(Sender: TObject; const AName, AArgsJson: string);
+    // Forwards tool result to host handler without console output
+    procedure HandleAgentToolResult(Sender: TObject; const AName, AResult: string);
     // Finalizes console line after agent run
     procedure HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
     // Executes agent shell command through configured shell and returns output
@@ -106,6 +126,12 @@ type
     property Prompt: string read FPrompt write FPrompt;
     // Banner printed once before the first prompt
     property Welcome: TCaption read FWelcome write FWelcome;
+    // Label printed on its own line before agent thinking text
+    property ThinkingLabel: TCaption read FThinkingLabel write FThinkingLabel;
+    // When False, only the label is printed, thinking text is hidden
+    property ShowThinking: boolean read FShowThinking write FShowThinking default True;
+    // Label printed on its own line before a tool call, {name} and {args} placeholders
+    property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
     // Replace emoji and unsupported symbols with nothing on output
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
     // Commands handled internally without invoking the shell
@@ -144,6 +170,12 @@ type
     property Prompt;
     // Banner printed once before the first prompt
     property Welcome;
+    // Label printed on its own line before agent thinking text
+    property ThinkingLabel;
+    // When False, only the label is printed, thinking text is hidden
+    property ShowThinking;
+    // Label printed on its own line before a tool call, {name} and {args} placeholders
+    property ToolCallLabel;
     // Remove emoji and unsupported symbols before writing to console
     property StripEmoji;
     // List of commands handled internally without shell
@@ -287,12 +319,17 @@ begin
   FPath := '';
   FPrompt := '{path}> ';
   FWelcome := '';
+  FThinkingLabel := '[Thinking]';
+  FShowThinking := True;
+  FToolCallLabel := '[{name}: {command}]';
   FLastCharWasNewLine := True;
   FStripEmoji := True;
   FAgent := nil;
   FPrevAgentOnChunk := nil;
+  FPrevAgentOnThinking := nil;
   FPrevAgentOnFinish := nil;
   FPrevAgentOnExecCommand := nil;
+  FInThinking := False;
   FBuiltinCommands := TStringList.Create;
   FBuiltinCommands.Add('cd');
   FBuiltinCommands.Add('pwd');
@@ -358,8 +395,12 @@ begin
     FAgent.RemoveFreeNotification(Self);
   FAgent := AValue;
   FPrevAgentOnChunk := nil;
+  FPrevAgentOnThinking := nil;
+  FPrevAgentOnToolCall := nil;
+  FPrevAgentOnToolResult := nil;
   FPrevAgentOnFinish := nil;
   FPrevAgentOnExecCommand := nil;
+  FInThinking := False;
   if Assigned(FAgent) then
   begin
     FAgent.FreeNotification(Self);
@@ -371,15 +412,109 @@ end;
 
 procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
 begin
+  // Close thinking block with a blank line for visual separation
+  if FInThinking then
+  begin
+    WriteLine('', True);
+    WriteLine('', True);
+    FInThinking := False;
+  end;
   WriteText(AText, False);
   if Assigned(FPrevAgentOnChunk) then
     FPrevAgentOnChunk(Sender, AText);
+end;
+
+procedure TCustomTermManager.CloseThinking;
+begin
+  if not FInThinking then
+    Exit;
+  // Close the last thinking line if it was not terminated
+  if not FLastCharWasNewLine then
+    WriteLine('', True);
+  // Emit blank line for visual separation from the next block
+  WriteLine('', True);
+  FInThinking := False;
+end;
+
+procedure TCustomTermManager.HandleAgentThinking(Sender: TObject; const AText: string);
+begin
+  // Emit label and newline once at the beginning of a thinking block
+  if not FInThinking then
+  begin
+    WriteLine(FThinkingLabel, True);
+    FInThinking := True;
+  end;
+  // Show thinking text only when enabled, otherwise just the label
+  if FShowThinking then
+    WriteText(AText, True);
+  if Assigned(FPrevAgentOnThinking) then
+    FPrevAgentOnThinking(Sender, AText);
+end;
+
+procedure TCustomTermManager.HandleAgentToolCall(Sender: TObject; const AName, AArgsJson: string);
+var
+  LabelText, Key: string;
+  Data: TJSONData;
+  Obj: TJSONObject;
+  P, KeyStart, KeyEnd: integer;
+begin
+  CloseThinking;
+  LabelText := FToolCallLabel;
+  // Substitute {name} and {args} first
+  LabelText := StringReplace(LabelText, '{name}', AName, [rfReplaceAll]);
+  LabelText := StringReplace(LabelText, '{args}', AArgsJson, [rfReplaceAll]);
+  // Replace remaining {key} with corresponding JSON field value when present
+  Data := nil;
+  try
+    try
+      Data := GetJSON(AArgsJson);
+    except
+      Data := nil;
+    end;
+    if (Data <> nil) and (Data.JSONType = jtObject) then
+    begin
+      Obj := TJSONObject(Data);
+      P := 1;
+      while P <= Length(LabelText) do
+      begin
+        KeyStart := Pos('{', LabelText, P);
+        if KeyStart = 0 then
+          Break;
+        KeyEnd := Pos('}', LabelText, KeyStart);
+        if KeyEnd = 0 then
+          Break;
+        Key := Copy(LabelText, KeyStart + 1, KeyEnd - KeyStart - 1);
+        if Obj.Find(Key) <> nil then
+          LabelText := Copy(LabelText, 1, KeyStart - 1) + Obj.Find(Key).AsString + Copy(LabelText, KeyEnd + 1, MaxInt)
+        else
+          P := KeyEnd + 1;
+      end;
+    end;
+  finally
+    Data.Free;
+  end;
+  // Close the current line if it was not terminated
+  if not FLastCharWasNewLine then
+    WriteLine('', True);
+  WriteLine(LabelText, True);
+  // Blank line after tool call for visual separation
+  WriteLine('', True);
+  if Assigned(FPrevAgentOnToolCall) then
+    FPrevAgentOnToolCall(Sender, AName, AArgsJson);
+end;
+
+procedure TCustomTermManager.HandleAgentToolResult(Sender: TObject; const AName, AResult: string);
+begin
+  // Tool result is forwarded to the model, no console output here
+  if Assigned(FPrevAgentOnToolResult) then
+    FPrevAgentOnToolResult(Sender, AName, AResult);
 end;
 
 procedure TCustomTermManager.HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
 var
   Streamed: boolean;
 begin
+  CloseThinking;
   Streamed := Assigned(FAgent) and (afStreaming in FAgent.Features);
   case AReason of
     afrSuccess:
@@ -401,6 +536,8 @@ begin
     afrModelNotSet:
       WriteLine('[agent not configured: ' + AErrorMsg + ']', True);
   end;
+  // Blank line after any finish for visual separation from the next prompt
+  WriteLine('', False);
   if Assigned(FPrevAgentOnFinish) then
     FPrevAgentOnFinish(Sender, AReason, AAnswer, AErrorMsg);
 end;
@@ -935,9 +1072,15 @@ begin
           begin
             // Save user handlers, install our own for the duration of the run
             FPrevAgentOnChunk := FAgent.OnChunk;
+            FPrevAgentOnThinking := FAgent.OnThinking;
+            FPrevAgentOnToolCall := FAgent.OnToolCall;
+            FPrevAgentOnToolResult := FAgent.OnToolResult;
             FPrevAgentOnFinish := FAgent.OnFinish;
             FPrevAgentOnExecCommand := FAgent.OnExecCommand;
             FAgent.OnChunk := @HandleAgentChunk;
+            FAgent.OnThinking := @HandleAgentThinking;
+            FAgent.OnToolCall := @HandleAgentToolCall;
+            FAgent.OnToolResult := @HandleAgentToolResult;
             FAgent.OnFinish := @HandleAgentFinish;
             FAgent.OnExecCommand := @HandleAgentExecCommand;
             try
@@ -961,11 +1104,18 @@ begin
             finally
               // Restore user handlers so designer state is preserved
               FAgent.OnChunk := FPrevAgentOnChunk;
+              FAgent.OnThinking := FPrevAgentOnThinking;
+              FAgent.OnToolCall := FPrevAgentOnToolCall;
+              FAgent.OnToolResult := FPrevAgentOnToolResult;
               FAgent.OnFinish := FPrevAgentOnFinish;
               FAgent.OnExecCommand := FPrevAgentOnExecCommand;
               FPrevAgentOnChunk := nil;
+              FPrevAgentOnThinking := nil;
+              FPrevAgentOnToolCall := nil;
+              FPrevAgentOnToolResult := nil;
               FPrevAgentOnFinish := nil;
               FPrevAgentOnExecCommand := nil;
+              FInThinking := False;
             end;
           end
           else

@@ -173,10 +173,16 @@ type
     function Chat(const ModelName, UserMessage: string): string;
     // Streaming chat with optional tools, returns the final JSON chunk or empty on error
     function ChatStream(const ModelName, MessagesJson, ToolsJson: string; AOnChunk: TOllamaStreamCallback;
-      out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
-    // Non-streaming chat with tools, reliably returns tool_calls in the response
+      out AKind: TOllamaErrorKind; out AErrorMsg: string): string; overload;
+    // Streaming chat with separate content and thinking callbacks
+    function ChatStream(const ModelName, MessagesJson, ToolsJson: string; AOnContent, AOnThinking: TOllamaStreamCallback;
+      out AKind: TOllamaErrorKind; out AErrorMsg: string): string; overload;
+    // Non-streaming chat with tools, emits thinking and content once each
+    function ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; AOnContent, AOnThinking: TOllamaStreamCallback;
+      out AKind: TOllamaErrorKind; out AErrorMsg: string): string; overload;
+    // Non-streaming chat with tools, returns tool_calls only
     function ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; out AKind: TOllamaErrorKind;
-      out AErrorMsg: string): string;
+      out AErrorMsg: string): string; overload;
 
     // Called by the background thread via Synchronize
     procedure BgFinished(const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
@@ -1541,25 +1547,30 @@ begin
 end;
 
 type
-  { Internal helper that parses SSE chunks and forwards content to user callback }
+  // Internal helper that parses SSE chunks and forwards content and thinking
   TOllamaChatStreamHelper = class
   public
     Buffer: string;
     FullFinal: string;
+    AccumulatedToolCalls: string;
     Done: boolean;
     Cancelled: boolean;
     UserCallback: TOllamaStreamCallback;
-    function ParseChunk(const ALine: string; var AContent: string; var ADone: boolean): boolean;
+    ThinkingCallback: TOllamaStreamCallback;
+    function ParseChunk(const ALine: string; var AContent, AThinking, AToolCalls: string; var ADone: boolean): boolean;
     procedure HandleRaw(const AChunk: string; var ACancel: boolean);
   end;
 
-function TOllamaChatStreamHelper.ParseChunk(const ALine: string; var AContent: string; var ADone: boolean): boolean;
+function TOllamaChatStreamHelper.ParseChunk(const ALine: string; var AContent, AThinking, AToolCalls: string;
+  var ADone: boolean): boolean;
 var
-  Data: TJSONData;
+  Data, MsgData, ToolCallsData: TJSONData;
   Obj, Msg: TJSONObject;
 begin
   Result := False;
   AContent := '';
+  AThinking := '';
+  AToolCalls := '';
   ADone := False;
   Data := nil;
   try
@@ -1568,9 +1579,16 @@ begin
       if (Data = nil) or (Data.JSONType <> jtObject) then
         Exit;
       Obj := TJSONObject(Data);
-      Msg := Obj.Objects['message'];
-      if Assigned(Msg) then
+      MsgData := Obj.Find('message');
+      if (MsgData <> nil) and (MsgData.JSONType = jtObject) then
+      begin
+        Msg := TJSONObject(MsgData);
         AContent := Msg.Get('content', '');
+        AThinking := Msg.Get('thinking', '');
+        ToolCallsData := Msg.Find('tool_calls');
+        if (ToolCallsData <> nil) and (ToolCallsData.JSONType = jtArray) and (TJSONArray(ToolCallsData).Count > 0) then
+          AToolCalls := ToolCallsData.AsJSON;
+      end;
       ADone := Obj.Get('done', False);
       Result := True;
     except
@@ -1584,8 +1602,8 @@ end;
 procedure TOllamaChatStreamHelper.HandleRaw(const AChunk: string; var ACancel: boolean);
 var
   P: integer;
-  OneLine, ChunkContent: string;
-  IsDone: boolean = False;
+  OneLine, ChunkContent, ChunkThinking, ChunkToolCalls: string;
+  IsDone: boolean;
 begin
   Buffer := Buffer + AChunk;
   P := Pos(#10, Buffer);
@@ -1595,11 +1613,26 @@ begin
     Buffer := Copy(Buffer, P + 1, MaxInt);
     if OneLine <> '' then
     begin
-      if ParseChunk(OneLine, ChunkContent, IsDone) then
+      if ParseChunk(OneLine, ChunkContent, ChunkThinking, ChunkToolCalls, IsDone) then
       begin
-        // Keep final chunk around for tool_calls parsing
+        // Accumulate tool_calls, they arrive before the final done chunk
+        if ChunkToolCalls <> '' then
+          AccumulatedToolCalls := ChunkToolCalls;
         if IsDone then
-          FullFinal := OneLine;
+        begin
+          // Synthesize final chunk with any accumulated tool_calls
+          if AccumulatedToolCalls <> '' then
+            FullFinal := '{"message":{"role":"assistant","content":"","tool_calls":' + AccumulatedToolCalls + '},"done":true}'
+          else
+            FullFinal := OneLine;
+        end;
+        // Emit thinking first, then content
+        if (ChunkThinking <> '') and Assigned(ThinkingCallback) then
+        begin
+          Cancelled := ACancel;
+          ThinkingCallback(ChunkThinking, Cancelled);
+          ACancel := Cancelled;
+        end;
         if (ChunkContent <> '') and Assigned(UserCallback) then
         begin
           Cancelled := ACancel;
@@ -1621,6 +1654,12 @@ end;
 
 function TCustomOllamaManager.ChatStream(const ModelName, MessagesJson, ToolsJson: string; AOnChunk: TOllamaStreamCallback;
   out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
+begin
+  Result := ChatStream(ModelName, MessagesJson, ToolsJson, AOnChunk, nil, AKind, AErrorMsg);
+end;
+
+function TCustomOllamaManager.ChatStream(const ModelName, MessagesJson, ToolsJson: string;
+  AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
 var
   JsonBody, ErrFromNetwork, Url: string;
   Kind: TOllamaErrorKind;
@@ -1652,9 +1691,11 @@ begin
   try
     Helper.Buffer := '';
     Helper.FullFinal := '';
+    Helper.AccumulatedToolCalls := '';
     Helper.Done := False;
     Helper.Cancelled := False;
-    Helper.UserCallback := AOnChunk;
+    Helper.UserCallback := AOnContent;
+    Helper.ThinkingCallback := AOnThinking;
 
     ErrFromNetwork := '';
     if not TNetwork.WebStreamRequest(wmPost, Url, JsonBody, nil, 'OllamaManager/1.0', 'application/json',
@@ -1681,8 +1722,16 @@ end;
 
 function TCustomOllamaManager.ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; out AKind: TOllamaErrorKind;
   out AErrorMsg: string): string;
+begin
+  Result := ChatWithTools(ModelName, MessagesJson, ToolsJson, nil, nil, AKind, AErrorMsg);
+end;
+
+function TCustomOllamaManager.ChatWithTools(const ModelName, MessagesJson, ToolsJson: string;
+  AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
 var
-  JsonBody: string;
+  JsonBody, ContentStr, ThinkingStr: string;
+  Data, MsgData: TJSONData;
+  Cancelled: boolean;
 begin
   Result := '';
   AKind := oekNone;
@@ -1705,12 +1754,42 @@ begin
     Result := '';
     Exit;
   end;
-  // Guard against successful-but-empty responses that break JSON parsing
   if Trim(Result) = '' then
   begin
     AKind := oekUnknown;
     AErrorMsg := 'Empty response from server';
     DoError(AKind, ModelName, AErrorMsg);
+    Exit;
+  end;
+  // Emit thinking and content as single chunks from the full response
+  Data := nil;
+  try
+    try
+      Data := GetJSON(Result);
+      if (Data <> nil) and (Data.JSONType = jtObject) then
+      begin
+        MsgData := TJSONObject(Data).Find('message');
+        if (MsgData <> nil) and (MsgData.JSONType = jtObject) then
+        begin
+          ThinkingStr := TJSONObject(MsgData).Get('thinking', '');
+          ContentStr := TJSONObject(MsgData).Get('content', '');
+          if (ThinkingStr <> '') and Assigned(AOnThinking) then
+          begin
+            Cancelled := False;
+            AOnThinking(ThinkingStr, Cancelled);
+          end;
+          if (ContentStr <> '') and Assigned(AOnContent) then
+          begin
+            Cancelled := False;
+            AOnContent(ContentStr, Cancelled);
+          end;
+        end;
+      end;
+    except
+      // Ignore parse errors, caller still gets raw response
+    end;
+  finally
+    Data.Free;
   end;
 end;
 
