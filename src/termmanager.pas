@@ -1394,10 +1394,11 @@ var
   // Collects full UTF-8 sequence that conhost splits across key events
   procedure CollectBrokenUtf8(var AC: WideChar);
   const
-    WAIT_TIMEOUT_MS = 10;
+    WAIT_TIMEOUT_MS = 100;
+    MAX_CONSUMED = 64;
   var
     Raw: RawByteString;
-    B, Nb, Attempts: Integer;
+    B, Nb, Attempts, TotalConsumed: Integer;
     Skip: boolean;
   begin
     B := Ord(AC) and $FF;
@@ -1411,11 +1412,11 @@ var
     else
       Nb := 1;
     Skip := False;
+    TotalConsumed := 0;
     while (Nb > 0) and not Skip do
     begin
       Attempts := 0;
-      // Poll the input queue in short intervals instead of blocking
-      while Attempts < WAIT_TIMEOUT_MS do
+      while (Attempts < WAIT_TIMEOUT_MS) and (TotalConsumed < MAX_CONSUMED) do
       begin
         if not PeekConsoleInput(Handle, NextRec, 1, N) then
         begin
@@ -1428,10 +1429,12 @@ var
           Inc(Attempts);
           Continue;
         end;
+        // Consume keyup and non-key events that sit between UTF-8 byte halves
         if (NextRec.EventType <> KEY_EVENT) or (not NextRec.Event.KeyEvent.bKeyDown) then
         begin
-          Skip := True;
-          Break;
+          ReadConsoleInput(Handle, NextRec, 1, N);
+          Inc(TotalConsumed);
+          Continue;
         end;
         B := Ord(NextRec.Event.KeyEvent.UnicodeChar) and $FF;
         if (B < $80) or (B > $BF) then
@@ -1445,6 +1448,8 @@ var
         Break;
       end;
       if Attempts >= WAIT_TIMEOUT_MS then
+        Skip := True;
+      if TotalConsumed >= MAX_CONSUMED then
         Skip := True;
     end;
     if Nb = 0 then
@@ -1499,8 +1504,12 @@ begin
       Continue;
 
     C := Rec.Event.KeyEvent.UnicodeChar;
-    // Conhost with UTF-8 CP wraps each raw byte as $FFxx, collect sequence
-    if Ord(C) >= $FF00 then
+    // Two conhost variants observed in the wild for UTF-8 input:
+    //   high-byte wrapper ($FFxx) - raw byte sits in the low 8 bits
+    //   plain byte       ($00xx) - UTF-8 lead byte sits in the low 8 bits
+    // Both need CollectBrokenUtf8 to assemble the full sequence
+    if (Ord(C) >= $FF00) or
+       ((Ord(C) >= $C2) and (Ord(C) <= $F4)) then
       CollectBrokenUtf8(C);
 
     case Rec.Event.KeyEvent.wVirtualKeyCode of
