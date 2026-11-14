@@ -38,6 +38,8 @@ type
   TOllamaErrorEvent = procedure(Sender: TObject; Kind: TOllamaErrorKind; const ModelName: string; const ErrorMsg: string) of object;
   { Event fired when pull progress changes (simplified: only start/finish) }
   TPullProgressEvent = procedure(Sender: TObject; const ModelName: string; Percent: integer) of object;
+  { Text callback for streaming chat, set ACancel to True to abort }
+  TOllamaStreamCallback = procedure(const AContent: string; var ACancel: boolean) of object;
   { Event fired before a background refresh/connection attempt starts }
   TConnectingEvent = procedure(Sender: TObject) of object;
   { Event fired after a successful refresh/connection }
@@ -169,6 +171,12 @@ type
     // Core API calls, return an empty string on failure and report via OnError
     function Generate(const ModelName, Prompt: string): string;
     function Chat(const ModelName, UserMessage: string): string;
+    // Streaming chat with optional tools, returns the final JSON chunk or empty on error
+    function ChatStream(const ModelName, MessagesJson, ToolsJson: string; AOnChunk: TOllamaStreamCallback;
+      out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
+    // Non-streaming chat with tools, reliably returns tool_calls in the response
+    function ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; out AKind: TOllamaErrorKind;
+      out AErrorMsg: string): string;
 
     // Called by the background thread via Synchronize
     procedure BgFinished(const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
@@ -1251,16 +1259,18 @@ begin
         else
           ErrorMsg := Result;
 
+        // Trim whitespace-only descriptions, they carry no information
+        ErrorMsg := Trim(ErrorMsg);
         if ErrorMsg = '' then
         begin
           if SockErr then
-            ErrorMsg := HTTP.Sock.LastErrorDesc
+            ErrorMsg := Format('Socket error %d: %s', [HTTP.Sock.LastError, Trim(HTTP.Sock.LastErrorDesc)])
           else if (HTTP <> nil) and (HTTP.ResultCode <> 0) then
-            ErrorMsg := Format(rsHttpError, [HTTP.ResultCode, HTTP.ResultString])
+            ErrorMsg := Format(rsHttpError, [HTTP.ResultCode, Trim(HTTP.ResultString)])
           else
             ErrorMsg := rsConnectionError;
-          if ErrorMsg = '' then
-            ErrorMsg := rsConnectionError;
+          if Trim(ErrorMsg) = '' then
+            ErrorMsg := 'Empty error response from server';
         end;
         Result := '';
       end;
@@ -1527,6 +1537,180 @@ begin
   begin
     DoError(Kind, ModelName, ErrMsg);
     Result := '';
+  end;
+end;
+
+type
+  { Internal helper that parses SSE chunks and forwards content to user callback }
+  TOllamaChatStreamHelper = class
+  public
+    Buffer: string;
+    FullFinal: string;
+    Done: boolean;
+    Cancelled: boolean;
+    UserCallback: TOllamaStreamCallback;
+    function ParseChunk(const ALine: string; var AContent: string; var ADone: boolean): boolean;
+    procedure HandleRaw(const AChunk: string; var ACancel: boolean);
+  end;
+
+function TOllamaChatStreamHelper.ParseChunk(const ALine: string; var AContent: string; var ADone: boolean): boolean;
+var
+  Data: TJSONData;
+  Obj, Msg: TJSONObject;
+begin
+  Result := False;
+  AContent := '';
+  ADone := False;
+  Data := nil;
+  try
+    try
+      Data := GetJSON(ALine);
+      if (Data = nil) or (Data.JSONType <> jtObject) then
+        Exit;
+      Obj := TJSONObject(Data);
+      Msg := Obj.Objects['message'];
+      if Assigned(Msg) then
+        AContent := Msg.Get('content', '');
+      ADone := Obj.Get('done', False);
+      Result := True;
+    except
+      Result := False;
+    end;
+  finally
+    Data.Free;
+  end;
+end;
+
+procedure TOllamaChatStreamHelper.HandleRaw(const AChunk: string; var ACancel: boolean);
+var
+  P: integer;
+  OneLine, ChunkContent: string;
+  IsDone: boolean = False;
+begin
+  Buffer := Buffer + AChunk;
+  P := Pos(#10, Buffer);
+  while P > 0 do
+  begin
+    OneLine := Trim(Copy(Buffer, 1, P - 1));
+    Buffer := Copy(Buffer, P + 1, MaxInt);
+    if OneLine <> '' then
+    begin
+      if ParseChunk(OneLine, ChunkContent, IsDone) then
+      begin
+        // Keep final chunk around for tool_calls parsing
+        if IsDone then
+          FullFinal := OneLine;
+        if (ChunkContent <> '') and Assigned(UserCallback) then
+        begin
+          Cancelled := ACancel;
+          UserCallback(ChunkContent, Cancelled);
+          ACancel := Cancelled;
+        end;
+        if IsDone then
+        begin
+          Done := True;
+          ACancel := True;
+        end;
+      end;
+    end;
+    if ACancel then
+      Break;
+    P := Pos(#10, Buffer);
+  end;
+end;
+
+function TCustomOllamaManager.ChatStream(const ModelName, MessagesJson, ToolsJson: string; AOnChunk: TOllamaStreamCallback;
+  out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
+var
+  JsonBody, ErrFromNetwork, Url: string;
+  Kind: TOllamaErrorKind;
+  ErrMsg: string;
+  Tm: TTimeout;
+  Helper: TOllamaChatStreamHelper;
+begin
+  Result := '';
+  AKind := oekNone;
+  AErrorMsg := '';
+  if Trim(MessagesJson) = '' then
+  begin
+    AKind := oekUnknown;
+    AErrorMsg := 'Empty messages';
+    Exit;
+  end;
+
+  if ToolsJson <> '' then
+    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d,"stream":true}',
+      [ModelName, MessagesJson, ToolsJson, FKeepAlive])
+  else
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d,"stream":true}', [ModelName, MessagesJson, FKeepAlive]);
+
+  Tm.Connection := FConnectionTimeout;
+  Tm.Request := FRequestTimeout;
+  Url := FBaseURL + '/api/chat';
+
+  Helper := TOllamaChatStreamHelper.Create;
+  try
+    Helper.Buffer := '';
+    Helper.FullFinal := '';
+    Helper.Done := False;
+    Helper.Cancelled := False;
+    Helper.UserCallback := AOnChunk;
+
+    ErrFromNetwork := '';
+    if not TNetwork.WebStreamRequest(wmPost, Url, JsonBody, nil, 'OllamaManager/1.0', 'application/json',
+      'application/json', Tm, @Helper.HandleRaw, ErrFromNetwork) then
+    begin
+      AKind := oekConnection;
+      AErrorMsg := ErrFromNetwork;
+      DoError(AKind, ModelName, AErrorMsg);
+      Exit;
+    end;
+
+    if Helper.Cancelled and not Helper.Done then
+    begin
+      AKind := oekCancelled;
+      AErrorMsg := 'Cancelled by user';
+      Exit;
+    end;
+
+    Result := Helper.FullFinal;
+  finally
+    Helper.Free;
+  end;
+end;
+
+function TCustomOllamaManager.ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; out AKind: TOllamaErrorKind;
+  out AErrorMsg: string): string;
+var
+  JsonBody: string;
+begin
+  Result := '';
+  AKind := oekNone;
+  AErrorMsg := '';
+  if Trim(MessagesJson) = '' then
+  begin
+    AKind := oekUnknown;
+    AErrorMsg := 'Empty messages';
+    Exit;
+  end;
+  if ToolsJson <> '' then
+    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d,"stream":false}',
+      [ModelName, MessagesJson, ToolsJson, FKeepAlive])
+  else
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d,"stream":false}', [ModelName, MessagesJson, FKeepAlive]);
+  Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
+  if AKind <> oekNone then
+  begin
+    DoError(AKind, ModelName, AErrorMsg);
+    Result := '';
+    Exit;
+  end;
+  // Guard against successful-but-empty responses that break JSON parsing
+  if Trim(Result) = '' then
+  begin
+    AKind := oekUnknown;
+    AErrorMsg := 'Empty response from server';
+    DoError(AKind, ModelName, AErrorMsg);
   end;
 end;
 

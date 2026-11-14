@@ -11,7 +11,7 @@ unit TermManager;
 interface
 
 uses
-  Classes, SysUtils, Controls, DateUtils, Process{$IFDEF WINDOWS}, Windows{$ENDIF};
+  Classes, SysUtils, Controls, DateUtils, Process, OllamaAgent{$IFDEF WINDOWS}, Windows{$ENDIF};
 
 type
   // Classification of a single input line
@@ -27,6 +27,10 @@ type
     FPath: string;
     FPrompt: string;
     FWelcome: TCaption;
+    // True when last written char was CR or LF, used to keep prompt on fresh line
+    FLastCharWasNewLine: boolean;
+    // Remove emoji and symbol chars that console fonts cannot render
+    FStripEmoji: boolean;
     FBuiltinCommands: TStringList;
     FHistory: TStringList;
     FHistoryMax: integer;
@@ -36,12 +40,21 @@ type
     FSearchPath: boolean;
     FRunning: boolean;
     FLastExitCode: integer;
+    // Attached agent used to answer agent-classified input
+    FAgent: TOllamaAgent;
+    // Previous agent handlers, restored when agent is detached
+    FPrevAgentOnChunk: TAgentChunkEvent;
+    FPrevAgentOnFinish: TAgentFinishEvent;
+    FPrevAgentOnExecCommand: TAgentExecCommandEvent;
     FOnRoute: TTermRouteEvent;
     FOnOutput: TTermOutputEvent;
     FOnAgentExecute: TTermAgentEvent;
     FOnExit: TTermExitEvent;
     procedure SetPath(const AValue: string);
+    procedure SetAgent(const AValue: TOllamaAgent);
   protected
+    // Clears agent reference when it is removed at runtime
+    procedure Notification(AComponent: TComponent; Operation: TOperation); override;
     // Returns Path or process current directory when Path is empty
     function GetEffectivePath: string; virtual;
     // Returns prompt text with {path} placeholder replaced by Path
@@ -68,6 +81,12 @@ type
     function IsExternalCommand(const AName: string): boolean; virtual;
     // Converts OEM-encoded shell output to UTF-8 and prints it
     procedure PumpOutput(const AData: rawbytestring; AIsStderr: boolean); virtual;
+    // Redirects agent streamed chunks to console output
+    procedure HandleAgentChunk(Sender: TObject; const AText: string);
+    // Finalizes console line after agent run
+    procedure HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
+    // Executes agent shell command through configured shell and returns output
+    procedure HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -75,12 +94,20 @@ type
     procedure Run; virtual;
     // Requests the loop to stop after current iteration
     procedure Stop; virtual;
+    // Runs shell command capturing output as UTF-8, returns combined stdout and stderr
+    function ExecuteCommandCapture(const ACommand: string; out AExitCode: integer): string; virtual;
+    // Writes raw text without line ending, flushes for streaming output
+    procedure WriteText(const AText: string; AIsStderr: boolean = False); virtual;
+    // Writes text followed by a line ending, flushes immediately
+    procedure WriteLine(const AText: string; AIsStderr: boolean = False); virtual;
     // Working directory shared by shell and agent, empty means process cwd
     property Path: string read FPath write SetPath;
     // Prompt template with {path} placeholder
     property Prompt: string read FPrompt write FPrompt;
     // Banner printed once before the first prompt
     property Welcome: TCaption read FWelcome write FWelcome;
+    // Replace emoji and unsupported symbols with nothing on output
+    property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
     // Commands handled internally without invoking the shell
     property BuiltinCommands: TStringList read FBuiltinCommands;
     // Maximum number of lines kept in history buffer
@@ -105,6 +132,8 @@ type
     property OnAgentExecute: TTermAgentEvent read FOnAgentExecute write FOnAgentExecute;
     // Fires when the input loop finishes
     property OnExit: TTermExitEvent read FOnExit write FOnExit;
+    // Optional agent that answers agent-classified input
+    property Agent: TOllamaAgent read FAgent write SetAgent;
   end;
 
   TTermManager = class(TCustomTermManager)
@@ -115,6 +144,8 @@ type
     property Prompt;
     // Banner printed once before the first prompt
     property Welcome;
+    // Remove emoji and unsupported symbols before writing to console
+    property StripEmoji;
     // List of commands handled internally without shell
     property BuiltinCommands;
     // Maximum number of lines kept in history buffer
@@ -135,6 +166,8 @@ type
     property OnAgentExecute;
     // Fires when the input loop finishes
     property OnExit;
+    // Optional agent used to answer agent-classified input
+    property Agent;
   end;
 
 implementation
@@ -146,6 +179,10 @@ type
 // Forward declarations for helpers used before their definition
 procedure ClearScreen; forward;
 function CheckAndConsumeInterrupt: boolean; forward;
+function CheckAndConsumeEsc: boolean; forward;
+{$IFDEF WINDOWS}
+procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString); forward;
+{$ENDIF}
 
 // Returns True if path contains drive letter or starts with path delimiter
 function IsAbsolutePath(const APath: string): boolean;
@@ -157,10 +194,15 @@ begin
   {$ENDIF}
 end;
 
+// Returns the byte position before the previous character, UTF-8 aware
 function Utf8PrevPos(const S: string; APos: integer): integer;
 begin
   Result := APos - 1;
   while (Result > 0) and ((byte(S[Result]) and $C0) = $80) do
+    Dec(Result);
+  // Result points to the start byte of the previous character
+  // For multi-byte starts still need to step back once to be before it
+  if (Result > 0) and (byte(S[Result]) >= $C0) then
     Dec(Result);
 end;
 
@@ -190,12 +232,50 @@ begin
   end;
 end;
 
-function WideCharToUtf8(const C: widechar): string;
+// Returns UTF-8 bytes tagged with CP_UTF8 to avoid implicit recoding
+function WideCharToUtf8(const C: widechar): rawbytestring;
 var
   U: unicodestring;
 begin
   U := C;
   Result := UTF8Encode(U);
+  SetCodePage(Result, CP_UTF8, False);
+end;
+
+// Removes emoji and symbol ranges that plain console fonts cannot render
+function StripEmojiChars(const AText: string): string;
+var
+  Wide, Filtered: unicodestring;
+  I, J: integer;
+  Code: cardinal;
+begin
+  Wide := UTF8Decode(AText);
+  Filtered := '';
+  SetLength(Filtered, Length(Wide));
+  J := 0;
+  for I := 1 to Length(Wide) do
+  begin
+    Code := Ord(Wide[I]);
+    // Non-BMP surrogate pairs, all emoji live above U+FFFF
+    if (Code >= $D800) and (Code <= $DFFF) then
+      Continue;
+    // Technical symbols, misc symbols and dingbats, arrows
+    if (Code >= $2300) and (Code <= $23FF) then
+      Continue;
+    if (Code >= $2600) and (Code <= $27BF) then
+      Continue;
+    if (Code >= $2B00) and (Code <= $2BFF) then
+      Continue;
+    // Zero-width joiner and variation selectors
+    if Code = $200D then
+      Continue;
+    if (Code >= $FE00) and (Code <= $FE0F) then
+      Continue;
+    Inc(J);
+    Filtered[J] := Wide[I];
+  end;
+  SetLength(Filtered, J);
+  Result := UTF8Encode(Filtered);
 end;
 
 { TCustomTermManager }
@@ -207,6 +287,12 @@ begin
   FPath := '';
   FPrompt := '{path}> ';
   FWelcome := '';
+  FLastCharWasNewLine := True;
+  FStripEmoji := True;
+  FAgent := nil;
+  FPrevAgentOnChunk := nil;
+  FPrevAgentOnFinish := nil;
+  FPrevAgentOnExecCommand := nil;
   FBuiltinCommands := TStringList.Create;
   FBuiltinCommands.Add('cd');
   FBuiltinCommands.Add('pwd');
@@ -228,6 +314,7 @@ end;
 
 destructor TCustomTermManager.Destroy;
 begin
+  SetAgent(nil);
   FHistory.Free;
   FBuiltinCommands.Free;
   inherited Destroy;
@@ -256,6 +343,123 @@ begin
   end;
 end;
 
+procedure TCustomTermManager.Notification(AComponent: TComponent; Operation: TOperation);
+begin
+  inherited Notification(AComponent, Operation);
+  if (Operation = opRemove) and (AComponent = FAgent) then
+    SetAgent(nil);
+end;
+
+procedure TCustomTermManager.SetAgent(const AValue: TOllamaAgent);
+begin
+  if FAgent = AValue then
+    Exit;
+  if Assigned(FAgent) then
+    FAgent.RemoveFreeNotification(Self);
+  FAgent := AValue;
+  FPrevAgentOnChunk := nil;
+  FPrevAgentOnFinish := nil;
+  FPrevAgentOnExecCommand := nil;
+  if Assigned(FAgent) then
+  begin
+    FAgent.FreeNotification(Self);
+    // Share terminal directory with agent file tools at runtime only
+    if not (csDesigning in ComponentState) and (FAgent.RootPath = '') then
+      FAgent.RootPath := GetEffectivePath;
+  end;
+end;
+
+procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
+begin
+  WriteText(AText, False);
+  if Assigned(FPrevAgentOnChunk) then
+    FPrevAgentOnChunk(Sender, AText);
+end;
+
+procedure TCustomTermManager.HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
+var
+  Streamed: boolean;
+begin
+  Streamed := Assigned(FAgent) and (afStreaming in FAgent.Features);
+  case AReason of
+    afrSuccess:
+    begin
+      // Signal empty response so the user is not left with silence
+      if AAnswer = '' then
+        WriteLine('[empty response from model]', True)
+      else if not Streamed then
+        WriteLine(AAnswer, False)
+      else if not FLastCharWasNewLine then
+        WriteLine('', False);
+    end;
+    afrCancelled:
+      WriteLine('^C', True);
+    afrMaxSteps:
+      WriteLine('[max steps reached]', True);
+    afrError:
+      WriteLine('[error: ' + AErrorMsg + ']', True);
+    afrModelNotSet:
+      WriteLine('[agent not configured: ' + AErrorMsg + ']', True);
+  end;
+  if Assigned(FPrevAgentOnFinish) then
+    FPrevAgentOnFinish(Sender, AReason, AAnswer, AErrorMsg);
+end;
+
+procedure TCustomTermManager.HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
+var
+  ExitCode: integer;
+begin
+  // When host provided own handler, let it run and skip default execution
+  if Assigned(FPrevAgentOnExecCommand) then
+  begin
+    FPrevAgentOnExecCommand(Sender, ACommand, AResult, AAllow);
+    Exit;
+  end;
+  AAllow := True;
+  ExitCode := 0;
+  AResult := ExecuteCommandCapture(ACommand, ExitCode);
+end;
+
+procedure TCustomTermManager.WriteText(const AText: string; AIsStderr: boolean);
+var
+  Utf8: rawbytestring;
+  Sanitized: string;
+begin
+  if AText = '' then
+    Exit;
+  if FStripEmoji then
+    Sanitized := StripEmojiChars(AText)
+  else
+    Sanitized := AText;
+  Utf8 := UTF8Encode(Sanitized);
+  {$IFDEF WINDOWS}
+  if AIsStderr then
+    WriteUtf8ToHandle(GetStdHandle(STD_ERROR_HANDLE), Utf8)
+  else
+    WriteUtf8ToHandle(GetStdHandle(STD_OUTPUT_HANDLE), Utf8);
+  {$ELSE}
+  if AIsStderr then
+  begin
+    Write(ErrOutput, AText);
+    Flush(ErrOutput);
+  end
+  else
+  begin
+    Write(Output, AText);
+    Flush(Output);
+  end;
+  {$ENDIF}
+  FLastCharWasNewLine := AText[Length(AText)] in [#10, #13];
+  if Assigned(FOnOutput) then
+    FOnOutput(Self, AText, AIsStderr);
+end;
+
+procedure TCustomTermManager.WriteLine(const AText: string; AIsStderr: boolean);
+begin
+  WriteText(AText + LineEnding, AIsStderr);
+  FLastCharWasNewLine := True;
+end;
+
 function TCustomTermManager.GetEffectivePath: string;
 begin
   if FPath <> '' then
@@ -282,12 +486,7 @@ end;
 
 procedure TCustomTermManager.DoOutput(const AText: string; AIsStderr: boolean);
 begin
-  if AIsStderr then
-    Write(ErrOutput, AText)
-  else
-    Write(Output, AText);
-  if Assigned(FOnOutput) then
-    FOnOutput(Self, AText, AIsStderr);
+  WriteText(AText, AIsStderr);
 end;
 
 procedure TCustomTermManager.DoAgentExecute(const AText: string);
@@ -418,7 +617,12 @@ begin
   else if Cmd = 'pwd' then
     DoOutput(GetEffectivePath + LineEnding, False)
   else if (Cmd = 'cls') or (Cmd = 'clear') then
-    ClearScreen
+  begin
+    // Clear agent conversation history together with the screen
+    if Assigned(FAgent) then
+      FAgent.ClearHistory;
+    ClearScreen;
+  end
   else if Cmd = 'history' then
   begin
     for I := 0 to FHistory.Count - 1 do
@@ -554,13 +758,127 @@ begin
   end;
 end;
 
+function TCustomTermManager.ExecuteCommandCapture(const ACommand: string; out AExitCode: integer): string;
+var
+  Process: TProcess;
+  Buffer: TTermBuffer;
+  BytesRead: longint;
+  RawData, Captured, Tmp: rawbytestring;
+  StartTime: TDateTime;
+  N: integer;
+begin
+  Result := '';
+  RawData := '';
+  AExitCode := -1;
+  Buffer := Default(TTermBuffer);
+  if ACommand = '' then
+    Exit;
+  Captured := '';
+  Process := TProcess.Create(nil);
+  try
+    Process.Executable := FShellExec;
+    {$IFDEF WINDOWS}
+    Process.Parameters.Add('/c');
+    {$ELSE}
+    Process.Parameters.Add('-c');
+    {$ENDIF}
+    Process.Parameters.Add(ACommand);
+    Process.Options := [poUsePipes, poNoConsole];
+    Process.CurrentDirectory := GetEffectivePath;
+    Process.Execute;
+    StartTime := Now;
+
+    while Process.Running do
+    begin
+      if (FCommandTimeout > 0) and (MilliSecondsBetween(Now, StartTime) >= FCommandTimeout) then
+      begin
+        Process.Terminate(1);
+        Break;
+      end;
+
+      if Process.Output.NumBytesAvailable > 0 then
+      begin
+        N := Process.Output.NumBytesAvailable;
+        if N > SizeOf(Buffer) then
+          N := SizeOf(Buffer);
+        BytesRead := Process.Output.Read(Buffer[0], N);
+        if BytesRead > 0 then
+        begin
+          SetLength(RawData, BytesRead);
+          Move(Buffer[0], RawData[1], BytesRead);
+          Captured := Captured + RawData;
+        end;
+      end;
+
+      if Process.Stderr.NumBytesAvailable > 0 then
+      begin
+        N := Process.Stderr.NumBytesAvailable;
+        if N > SizeOf(Buffer) then
+          N := SizeOf(Buffer);
+        BytesRead := Process.Stderr.Read(Buffer[0], N);
+        if BytesRead > 0 then
+        begin
+          SetLength(RawData, BytesRead);
+          Move(Buffer[0], RawData[1], BytesRead);
+          Captured := Captured + RawData;
+        end;
+      end;
+
+      Sleep(10);
+    end;
+
+    // Drain remaining output after termination
+    while Process.Output.NumBytesAvailable > 0 do
+    begin
+      N := Process.Output.NumBytesAvailable;
+      if N > SizeOf(Buffer) then
+        N := SizeOf(Buffer);
+      BytesRead := Process.Output.Read(Buffer[0], N);
+      if BytesRead > 0 then
+      begin
+        SetLength(RawData, BytesRead);
+        Move(Buffer[0], RawData[1], BytesRead);
+        Captured := Captured + RawData;
+      end;
+    end;
+    while Process.Stderr.NumBytesAvailable > 0 do
+    begin
+      N := Process.Stderr.NumBytesAvailable;
+      if N > SizeOf(Buffer) then
+        N := SizeOf(Buffer);
+      BytesRead := Process.Stderr.Read(Buffer[0], N);
+      if BytesRead > 0 then
+      begin
+        SetLength(RawData, BytesRead);
+        Move(Buffer[0], RawData[1], BytesRead);
+        Captured := Captured + RawData;
+      end;
+    end;
+
+    AExitCode := Process.ExitStatus;
+
+    // Convert OEM bytes from shell to UTF-8
+    Tmp := Captured;
+    SetCodePage(Tmp, GetOEMCP, False);
+    SetCodePage(Tmp, CP_UTF8, True);
+    Result := string(Tmp);
+  finally
+    Process.Free;
+  end;
+end;
+
 procedure TCustomTermManager.AddToHistory(const ALine: string);
+var
+  Tagged: rawbytestring;
 begin
   if ALine = '' then
     Exit;
-  if (FHistory.Count > 0) and (FHistory[FHistory.Count - 1] = ALine) then
+  // Tag as UTF-8 without recoding so SetCodePage works on RawByteString
+  Tagged := ALine;
+  SetCodePage(Tagged, CP_UTF8, False);
+  if (FHistory.Count > 0) and (FHistory[FHistory.Count - 1] = Tagged) then
     Exit;
-  FHistory.Add(ALine);
+  FHistory.Add(Tagged);
   while FHistory.Count > FHistoryMax do
     FHistory.Delete(0);
 end;
@@ -570,37 +888,95 @@ var
   Line, Payload: string;
   Kind: TTermInputKind;
   Allow: boolean;
+  CancelledShown: boolean;
+  {$IFDEF WINDOWS}
+  InHandle: THandle;
+  InMode: DWORD = 0;
+  InModeSaved: boolean;
+  {$ENDIF}
 begin
   {$IFDEF WINDOWS}
   // Force UTF-8 everywhere so OEM->UTF-8 conversion is consistent
+  DefaultSystemCodePage := CP_UTF8;
   SetMultiByteConversionCodePage(CP_UTF8);
-  SetConsoleOutputCP(CP_UTF8);
   SetConsoleCP(CP_UTF8);
+  SetConsoleOutputCP(CP_UTF8);
   SetTextCodePage(Output, CP_UTF8);
   SetTextCodePage(ErrOutput, CP_UTF8);
+  // Disable console echo and line editing, we draw input ourselves
+  InHandle := GetStdHandle(STD_INPUT_HANDLE);
+  InModeSaved := GetConsoleMode(InHandle, InMode);
+  if InModeSaved then
+    SetConsoleMode(InHandle, InMode and not (ENABLE_ECHO_INPUT or ENABLE_LINE_INPUT or ENABLE_PROCESSED_INPUT));
   {$ENDIF}
   // Print banner once before the loop if host configured one
   if FWelcome <> '' then
     DoOutput(FWelcome + LineEnding, False);
   FRunning := True;
   FLastExitCode := 0;
-  while FRunning do
-  begin
-    Line := ReadLine;
-    if not FRunning then
-      Break;
-    Kind := ClassifyLine(Line, Payload);
-    if Kind = tikEmpty then
-      Continue;
-    Allow := True;
-    DoRoute(Line, Payload, Kind, Allow);
-    if not Allow then
-      Continue;
-    case Kind of
-      tikBuiltin: HandleBuiltin(Payload);
-      tikCommand: FLastExitCode := ExecuteCommand(Payload);
-      tikAgent: DoAgentExecute(Payload);
+  try
+    while FRunning do
+    begin
+      Line := ReadLine;
+      if not FRunning then
+        Break;
+      Kind := ClassifyLine(Line, Payload);
+      if Kind = tikEmpty then
+        Continue;
+      Allow := True;
+      DoRoute(Line, Payload, Kind, Allow);
+      if not Allow then
+        Continue;
+      case Kind of
+        tikBuiltin: HandleBuiltin(Payload);
+        tikCommand: FLastExitCode := ExecuteCommand(Payload);
+        tikAgent:
+          if Assigned(FAgent) then
+          begin
+            // Save user handlers, install our own for the duration of the run
+            FPrevAgentOnChunk := FAgent.OnChunk;
+            FPrevAgentOnFinish := FAgent.OnFinish;
+            FPrevAgentOnExecCommand := FAgent.OnExecCommand;
+            FAgent.OnChunk := @HandleAgentChunk;
+            FAgent.OnFinish := @HandleAgentFinish;
+            FAgent.OnExecCommand := @HandleAgentExecCommand;
+            try
+              FAgent.RunAsync(Payload);
+              // Pump events and watch for ESC so user can cancel
+              CancelledShown := False;
+              while not FAgent.Done do
+              begin
+                CheckSynchronize(50);
+                if not CancelledShown and CheckAndConsumeEsc then
+                begin
+                  FAgent.Cancel;
+                  WriteLine('^C (cancelling...)', True);
+                  CancelledShown := True;
+                end;
+              end;
+              CheckSynchronize(0);
+              // Ensure prompt starts on a fresh line even if finish was missed
+              if not FLastCharWasNewLine then
+                WriteLine('', False);
+            finally
+              // Restore user handlers so designer state is preserved
+              FAgent.OnChunk := FPrevAgentOnChunk;
+              FAgent.OnFinish := FPrevAgentOnFinish;
+              FAgent.OnExecCommand := FPrevAgentOnExecCommand;
+              FPrevAgentOnChunk := nil;
+              FPrevAgentOnFinish := nil;
+              FPrevAgentOnExecCommand := nil;
+            end;
+          end
+          else
+            DoAgentExecute(Payload);
+      end;
     end;
+  finally
+    {$IFDEF WINDOWS}
+    if InModeSaved then
+      SetConsoleMode(InHandle, InMode);
+    {$ENDIF}
   end;
   DoExit(FLastExitCode);
 end;
@@ -611,6 +987,36 @@ begin
 end;
 
 {$IFDEF WINDOWS}
+
+// Writes UTF-8 bytes directly to handle bypassing codepage conversion
+procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString);
+var
+  Mode: DWORD;
+  Written: DWORD;
+  Wide: UnicodeString;
+  Ok: boolean;
+begin
+  if Length(ABytes) = 0 then
+    Exit;
+  Mode := 0;
+  Written := 0;
+  Ok := False;
+  if (AHandle <> INVALID_HANDLE_VALUE) and GetConsoleMode(AHandle, Mode) then
+  begin
+    Wide := UTF8Decode(ABytes);
+    if Length(Wide) > 0 then
+      Ok := WriteConsoleW(AHandle, PWideChar(Wide), Length(Wide), Written, nil);
+  end;
+  // Fallback when WriteConsoleW fails or handle is not a console
+  if not Ok then
+    WriteFile(AHandle, ABytes[1], Length(ABytes), Written, nil);
+end;
+
+// Writes text to stdout as UTF-8, bypassing Output codepage
+procedure ConWriteUtf8(const AText: string);
+begin
+  WriteUtf8ToHandle(GetStdHandle(STD_OUTPUT_HANDLE), UTF8Encode(AText));
+end;
 
 procedure ConGotoXY(X, Y: Integer);
 var
@@ -640,7 +1046,7 @@ var
   Written: DWORD;
 begin
   Written := 0;
-  Info:= Default(TConsoleScreenBufferInfo);
+  Info := Default(TConsoleScreenBufferInfo);
   if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
   begin
     Count := Info.dwSize.X - Info.dwCursorPosition.X;
@@ -731,25 +1137,117 @@ begin
   end;
 end;
 
+function CheckAndConsumeEsc: boolean;
+var
+  Handle: THandle;
+  Rec: INPUT_RECORD;
+  N: DWORD;
+begin
+  Result := False;
+  Rec := Default(INPUT_RECORD);
+  N := 0;
+  Handle := GetStdHandle(STD_INPUT_HANDLE);
+  if not PeekConsoleInput(Handle, Rec, 1, N) then
+    Exit;
+  if N = 0 then
+    Exit;
+  if Rec.EventType <> KEY_EVENT then
+    Exit;
+  if not Rec.Event.KeyEvent.bKeyDown then
+    Exit;
+  if Rec.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE then
+  begin
+    ReadConsoleInput(Handle, Rec, 1, N);
+    Result := True;
+  end;
+end;
+
 function TCustomTermManager.ReadLine: string;
 var
   Handle: THandle;
   // Explicit init silences the "not initialized" hint
-  Rec: INPUT_RECORD;
+  Rec, NextRec: INPUT_RECORD;
   N: DWORD = 0;
-  Line, PromptText, ChS: string;
-  CursorPos, HistIndex, PromptRow, PromptCol: Integer;
+  Line, PromptText: RawByteString;
+  ChS: RawByteString;
+  CursorPos, HistIndex, PromptRow, PromptCol, OldLen: Integer;
   C: WideChar;
+  Wide: UnicodeString;
+
+  // Collects full UTF-8 sequence that conhost splits across key events
+  procedure CollectBrokenUtf8(var AC: WideChar);
+  const
+    WAIT_TIMEOUT_MS = 10;
+  var
+    Raw: RawByteString;
+    B, Nb, Attempts: Integer;
+    Skip: boolean;
+  begin
+    B := Ord(AC) and $FF;
+    if not (B in [$C2..$F4]) then
+      Exit;
+    Raw := AnsiChar(B);
+    if B >= $F0 then
+      Nb := 3
+    else if B >= $E0 then
+      Nb := 2
+    else
+      Nb := 1;
+    Skip := False;
+    while (Nb > 0) and not Skip do
+    begin
+      Attempts := 0;
+      // Poll the input queue in short intervals instead of blocking
+      while Attempts < WAIT_TIMEOUT_MS do
+      begin
+        if not PeekConsoleInput(Handle, NextRec, 1, N) then
+        begin
+          Skip := True;
+          Break;
+        end;
+        if N = 0 then
+        begin
+          Sleep(1);
+          Inc(Attempts);
+          Continue;
+        end;
+        if (NextRec.EventType <> KEY_EVENT) or (not NextRec.Event.KeyEvent.bKeyDown) then
+        begin
+          Skip := True;
+          Break;
+        end;
+        B := Ord(NextRec.Event.KeyEvent.UnicodeChar) and $FF;
+        if (B < $80) or (B > $BF) then
+        begin
+          // Next event is not a continuation byte, sequence is broken
+          Skip := True;
+          Break;
+        end;
+        ReadConsoleInput(Handle, NextRec, 1, N);
+        Raw := Raw + AnsiChar(B);
+        Dec(Nb);
+        Break;
+      end;
+      if Attempts >= WAIT_TIMEOUT_MS then
+        Skip := True;
+    end;
+    if Nb = 0 then
+    begin
+      Wide := UTF8Decode(Raw);
+      if Length(Wide) > 0 then
+        AC := Wide[1];
+    end;
+  end;
 
   procedure Redraw;
   var
-    DisplayPrefix: string;
+    DisplayPrefix: RawByteString;
   begin
     // Hide cursor, redraw only input area, then show at final position
     HideConsoleCursor;
     ConGotoXY(PromptCol, PromptRow);
     ConClearLineFromCursor;
-    Write(Line);
+    ConWriteUtf8(Line);
     DisplayPrefix := Copy(Line, 1, CursorPos);
     ConGotoXY(PromptCol + Utf8CharCount(DisplayPrefix), PromptRow);
     ShowConsoleCursor;
@@ -759,11 +1257,17 @@ begin
   Result := '';
   Rec := Default(INPUT_RECORD);
   Line := '';
+  // Force UTF-8 tag so raw inserts do not get re-encoded later
+  SetCodePage(Line, CP_UTF8, False);
   CursorPos := 0;
   HistIndex := FHistory.Count;
 
   PromptText := GetPromptText;
-  Write(PromptText);
+  // Ensure prompt starts on a fresh line after streaming output
+  if not FLastCharWasNewLine then
+    ConWriteUtf8(LineEnding);
+  ConWriteUtf8(PromptText);
+  FLastCharWasNewLine := False;
   PromptRow := ConWhereY;
   PromptCol := Utf8CharCount(PromptText) + 1;
 
@@ -779,11 +1283,15 @@ begin
       Continue;
 
     C := Rec.Event.KeyEvent.UnicodeChar;
+    // Conhost with UTF-8 CP wraps each raw byte as $FFxx, collect sequence
+    if Ord(C) >= $FF00 then
+      CollectBrokenUtf8(C);
 
     case Rec.Event.KeyEvent.wVirtualKeyCode of
       VK_RETURN:
         begin
-          WriteLn;
+          ConWriteUtf8(LineEnding);
+          FLastCharWasNewLine := True;
           Break;
         end;
       VK_BACK:
@@ -812,6 +1320,7 @@ begin
             if HistIndex >= FHistory.Count then
               HistIndex := FHistory.Count - 1;
             Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
             CursorPos := Length(Line);
           end;
         end
@@ -833,6 +1342,8 @@ begin
         begin
           Dec(HistIndex);
           Line := FHistory[HistIndex];
+          // History strings come from AddToHistory, retag as UTF-8
+          SetCodePage(Line, CP_UTF8, False);
           CursorPos := Length(Line);
         end;
       VK_DOWN:
@@ -840,6 +1351,7 @@ begin
         begin
           Inc(HistIndex);
           Line := FHistory[HistIndex];
+          SetCodePage(Line, CP_UTF8, False);
           CursorPos := Length(Line);
         end
         else if HistIndex < FHistory.Count then
@@ -859,12 +1371,15 @@ begin
         begin
           ConGotoXY(1, PromptRow);
           ConClearLineFromCursor;
-          Write(PromptText, Line, '^C');
-          WriteLn;
+          ConWriteUtf8(PromptText);
+          ConWriteUtf8(Line);
+          ConWriteUtf8('^C');
+          ConWriteUtf8(LineEnding);
           Line := '';
           CursorPos := 0;
           HistIndex := FHistory.Count;
-          Write(PromptText);
+          ConWriteUtf8(PromptText);
+          FLastCharWasNewLine := False;
           PromptRow := ConWhereY;
           PromptCol := Utf8CharCount(PromptText) + 1;
           Continue;
@@ -872,15 +1387,19 @@ begin
         else if Ord(C) >= 32 then
         begin
           ChS := WideCharToUtf8(C);
+          OldLen := Length(Line);
           Insert(ChS, Line, CursorPos + 1);
-          Inc(CursorPos, Length(ChS));
+          SetCodePage(Line, CP_UTF8, False);
+          Inc(CursorPos, Length(Line) - OldLen);
         end;
     else
       if Ord(C) >= 32 then
       begin
         ChS := WideCharToUtf8(C);
+        OldLen := Length(Line);
         Insert(ChS, Line, CursorPos + 1);
-        Inc(CursorPos, Length(ChS));
+        SetCodePage(Line, CP_UTF8, False);
+        Inc(CursorPos, Length(Line) - OldLen);
       end;
     end;
 
@@ -914,6 +1433,11 @@ begin
 end;
 
 function CheckAndConsumeInterrupt: boolean;
+begin
+  Result := False;
+end;
+
+function CheckAndConsumeEsc: boolean;
 begin
   Result := False;
 end;

@@ -8,7 +8,8 @@ unit ollamakit;
 interface
 
 uses
-  OllamaManager, TermManager, OllamaKitRegister, LazarusPackageIntf;
+  OllamaManager, OllamaAgent, TermManager, OllamaKitRegister, 
+  LazarusPackageIntf;
 
 implementation
 

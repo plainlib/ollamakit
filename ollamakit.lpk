@@ -54,6 +54,10 @@ SOFTWARE.
         <UnitName Value="OllamaManager"/>
       </Item>
       <Item>
+        <Filename Value="src\ollamaagent.pas"/>
+        <UnitName Value="ollamaagent"/>
+      </Item>
+      <Item>
         <Filename Value="src\termmanager.pas"/>
         <UnitName Value="TermManager"/>
       </Item>
