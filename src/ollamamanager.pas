@@ -100,6 +100,8 @@ type
     FActive: boolean;
     FConnectGen: integer;
     FShutdown: boolean;
+    FLastPopupTick: QWord;
+    FWasConnectedAtPopup: boolean;
 
     // Popup menu handling
     FPrevPopupHandler: TNotifyEvent;
@@ -145,6 +147,7 @@ type
     procedure SetMenuSections(const Value: TOllamaMenuSections);
 
   protected
+    procedure Loaded; override;
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
   public
     constructor Create(AOwner: TComponent); override;
@@ -393,6 +396,8 @@ begin
   FActive := True;
   FConnectGen := 0;
   FShutdown := False;
+  FLastPopupTick := 0;
+  FWasConnectedAtPopup := False;
 
   FInstalledModels := TStringList.Create;
   FRunningModels := TStringList.Create;
@@ -477,6 +482,8 @@ procedure TCustomOllamaManager.BeginConnect;
 begin
   if FShutdown then
     Exit;
+  if csDesigning in ComponentState then
+    Exit;
   if not FActive then
     Exit;
   if FConnecting then
@@ -550,8 +557,10 @@ begin
     NewRunning.Free;
   end;
 
-  // Refresh the popup so newly fetched models appear on the next open
-  if Assigned(FPopupMenu) then
+  // Rebuilding the popup while it is still visible causes a visible flicker
+  // on some platforms. Skip the rebuild unless the connection state changed
+  // or the menu was opened more than 500 ms ago.
+  if Assigned(FPopupMenu) and ((FConnected <> FWasConnectedAtPopup) or (GetTickCount64 - FLastPopupTick > 500)) then
     BuildPopupMenu;
 end;
 
@@ -582,6 +591,15 @@ begin
 
   if (FStartingModels.Count = 0) and Assigned(FProgressTimer) then
     FProgressTimer.Enabled := False;
+end;
+
+procedure TCustomOllamaManager.Loaded;
+begin
+  inherited Loaded;
+  // Remove stale items streamed from a previous design-time build; only
+  // relevant in the IDE so the .lfm is not polluted on the next save
+  if (csDesigning in ComponentState) and Assigned(FPopupMenu) then
+    ClearPopupMenu;
 end;
 
 procedure TCustomOllamaManager.Notification(AComponent: TComponent; Operation: TOperation);
@@ -680,6 +698,8 @@ end;
 
 procedure TCustomOllamaManager.DoPopup(Sender: TObject);
 begin
+  FLastPopupTick := GetTickCount64;
+  FWasConnectedAtPopup := FConnected;
   if FActive and FAutoRefresh and not FConnecting then
     BeginConnect;
   BuildPopupMenu;
@@ -715,6 +735,8 @@ var
 begin
   if not Assigned(FPopupMenu) then
     Exit;
+  if csDesigning in ComponentState then
+    Exit;
 
   ClearPopupMenu;
 
@@ -736,25 +758,13 @@ begin
       HasContentAbove := True;
     end;
 
-    // Server item is always available while the manager is active
-    if msServer in FMenuSections then
-    begin
-      ModelItem := TMenuItem.Create(FPopupMenu);
-      ModelItem.Caption := rsServerMenu;
-      ModelItem.Tag := TAG_SERVER;
-      ModelItem.OnClick := @MenuServerClick;
-      FPopupMenu.Items.Insert(InsertPos, ModelItem);
-      Inc(InsertPos);
-      HasContentAbove := True;
-    end;
-
     if FConnected then
     begin
       if msModels in FMenuSections then
       begin
         HasModels := (FInstalledModels.Count > 0) or (FLoadingModels.Count > 0);
 
-        // Separator between the Pull/Server items and the model list
+        // Separator between the Pull item and the model list
         if HasContentAbove and HasModels then
         begin
           ModelItem := TMenuItem.Create(FPopupMenu);
@@ -882,8 +892,7 @@ begin
     end;
   end;
 
-  // Separator between the content block and Connect/Disconnect,
-  // only when there is something above to separate from
+  // Separator between the content block and the connection block
   if HasContentAbove then
   begin
     ModelItem := TMenuItem.Create(FPopupMenu);
@@ -893,13 +902,25 @@ begin
     Inc(InsertPos);
   end;
 
-  // Connect item: turns into a disabled "Connecting..." label while a
-  // connection attempt is in progress
+  // Server item is always visible for hot switching, placed above Connect
+  if msServer in FMenuSections then
+  begin
+    ModelItem := TMenuItem.Create(FPopupMenu);
+    ModelItem.Caption := rsServerMenu;
+    ModelItem.Tag := TAG_SERVER;
+    ModelItem.OnClick := @MenuServerClick;
+    FPopupMenu.Items.Insert(InsertPos, ModelItem);
+    Inc(InsertPos);
+  end;
+
+  // Connect item: turns into a disabled "Connecting..." label only during
+  // the initial connection; a background refresh of an already-connected
+  // manager keeps showing "Connect" (disabled) to avoid a visual flicker
   if msConnect in FMenuSections then
   begin
     ModelItem := TMenuItem.Create(FPopupMenu);
     ModelItem.Tag := TAG_CONNECTION;
-    if FConnecting then
+    if FConnecting and (not FConnected) then
     begin
       ModelItem.Caption := rsConnectingStatus;
       ModelItem.Enabled := False;
