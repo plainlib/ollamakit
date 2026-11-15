@@ -988,14 +988,12 @@ begin
         Exit;
       end;
 
-      if FAgent.SystemPrompt <> '' then
-      begin
-        MsgObj := TJSONObject.Create;
-        MsgObj.Add('role', 'system');
-        // Resolve {path} and {model} against current values
-        MsgObj.Add('content', FAgent.BuildSystemPrompt);
-        MessagesArr.Add(MsgObj);
-      end;
+      // Always send the system message, BuildSystemPrompt adds platform,
+      // workspace and enabled tools even when the user prompt is empty
+      MsgObj := TJSONObject.Create;
+      MsgObj.Add('role', 'system');
+      MsgObj.Add('content', FAgent.BuildSystemPrompt);
+      MessagesArr.Add(MsgObj);
 
       if FAgent.KeepHistory and (FAgent.FHistory <> '') then
       begin
@@ -1443,6 +1441,8 @@ begin
   if ToolList = '' then
     ToolList := 'none';
   Result := StringReplace(Result, '{tools}', ToolList, [rfReplaceAll]);
+  // Drop trailing whitespace so the environment block starts on a clean line
+  Result := TrimRight(Result);
 
   // Platform identity is compiled in, not guessed at runtime
   {$IFDEF WINDOWS}
