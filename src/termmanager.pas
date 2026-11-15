@@ -154,6 +154,14 @@ type
     FPrevAgentOnAskUser: TAgentAskUserEvent;
     // True while writing agent thinking before the first content chunk
     FInThinking: boolean;
+    // Set to True when the model produced its first chunk of any kind
+    FFirstChunkSeen: boolean;
+    // Shown when the agent is slow but the server is reachable
+    FWaitSlowHint: TCaption;
+    // Shown when the agent is slow and the server is unreachable
+    FWaitServerDownHint: TCaption;
+    // Delay in ms before checking server reachability, zero disables the check
+    FWaitCheckDelayMs: integer;
     // Shell history sharing options for the agent context prelude
     FShellHistory: TAgentShellHistory;
     // Log entries encoded as "C\x01cmd\x01output" or "E\x01cmd\x01output"
@@ -263,6 +271,9 @@ type
     property ColorOutput: boolean read FColorOutput write FColorOutput default True;
     property Colors: TTermColorScheme read FColors write SetColors;
     property DefaultModelLabel: TCaption read FDefaultModelLabel write FDefaultModelLabel;
+    property WaitSlowHint: TCaption read FWaitSlowHint write FWaitSlowHint;
+    property WaitServerDownHint: TCaption read FWaitServerDownHint write FWaitServerDownHint;
+    property WaitCheckDelayMs: integer read FWaitCheckDelayMs write FWaitCheckDelayMs default 10000;
     property BuiltinCommands: TStringList read FBuiltinCommands;
     property HistoryMax: integer read FHistoryMax write FHistoryMax default 200;
     property ShellExec: string read FShellExec write FShellExec;
@@ -304,6 +315,12 @@ type
     property Colors;
     // Label shown in the {info} badge when no model is selected
     property DefaultModelLabel;
+    // Hint shown when the agent waits longer than a second with reachable server
+    property WaitSlowHint;
+    // Hint shown when the agent waits longer than a second with unreachable server
+    property WaitServerDownHint;
+    // Delay in ms before checking server reachability, 0 disables the check
+    property WaitCheckDelayMs;
     // Commands executed internally without invoking the shell, extend to add your own
     property BuiltinCommands;
     // Maximum number of input lines kept in history, oldest are dropped first
@@ -590,6 +607,10 @@ begin
   FPrevAgentOnExecCommand := nil;
   FPrevAgentOnAskUser := nil;
   FInThinking := False;
+  FFirstChunkSeen := False;
+  FWaitSlowHint := 'Waiting for response, the model may be loading weights on the first call, please wait...';
+  FWaitServerDownHint := 'Waiting but server appears unreachable, check Ollama address with "set baseurl <url>"';
+  FWaitCheckDelayMs := 10000;
   FBuiltinCommands := TStringList.Create;
   FBuiltinCommands.Add('cd');
   FBuiltinCommands.Add('pwd');
@@ -719,6 +740,7 @@ end;
 
 procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
 begin
+  FFirstChunkSeen := True;
   // Close thinking block if open, this also resets color
   CloseThinking;
   WriteText(AText, False);
@@ -743,6 +765,7 @@ end;
 
 procedure TCustomTermManager.HandleAgentThinking(Sender: TObject; const AText: string);
 begin
+  FFirstChunkSeen := True;
   // Emit label and newline once at the beginning of a thinking block
   if not FInThinking then
   begin
@@ -1916,6 +1939,8 @@ var
   Kind: TTermInputKind;
   Allow: boolean;
   CancelledShown: boolean;
+  WaitShown: boolean;
+  StartTick: QWord;
   {$IFDEF WINDOWS}
   InHandle: THandle;
   InMode: DWORD = 0;
@@ -2018,12 +2043,26 @@ begin
             FAgent.OnExecCommand := @HandleAgentExecCommand;
             FAgent.OnAskUser := @HandleAgentAskUser;
             try
+              FFirstChunkSeen := False;
               FAgent.RunAsync(Payload);
               // Pump events and watch for Esc so user can cancel
+              StartTick := GetTickCount64;
+              WaitShown := False;
               CancelledShown := False;
               while not FAgent.Done do
               begin
                 CheckSynchronize(50);
+                // After WaitCheckDelayMs of silence show one hint, distinguishing
+                // reachable server from unreachable with a plain TCP check
+                if (not WaitShown) and (not FFirstChunkSeen) and (FWaitCheckDelayMs > 0) and
+                  (GetTickCount64 - StartTick >= QWord(FWaitCheckDelayMs)) then
+                begin
+                  if Assigned(FAgent.OllamaManager) and not FAgent.OllamaManager.CheckServerReachableQuick(500) then
+                    WriteLine(string(FWaitServerDownHint), True)
+                  else
+                    WriteLine(string(FWaitSlowHint), True);
+                  WaitShown := True;
+                end;
                 if not CancelledShown and CheckAndConsumeCancel then
                 begin
                   FAgent.Cancel;

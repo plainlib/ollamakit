@@ -202,6 +202,8 @@ type
     procedure ResetUsage;
     // Returns context length of a loaded model from last refresh, 0 if unknown
     function GetModelContextLength(const ModelName: string): int64;
+    // Quick TCP-only reachability check, no HTTP, no SSL, no locks
+    function CheckServerReachableQuick(ATimeoutMs: integer = 500): boolean;
 
     // Currently installed models as reported by the last refresh
     property InstalledModels: TStringList read FInstalledModels;
@@ -602,6 +604,61 @@ begin
   // Cache for next callers
   if (Result > 0) and Assigned(FRunningDetails) then
     FRunningDetails.Values[ModelName] := '{"context_length":' + IntToStr(Result) + '}';
+end;
+
+function TCustomOllamaManager.CheckServerReachableQuick(ATimeoutMs: integer): boolean;
+var
+  Sock: TTCPBlockSocket;
+  U, Scheme, Host: string;
+  Port, P: integer;
+begin
+  Result := False;
+  if Trim(FBaseURL) = '' then
+    Exit;
+  // Parse host and port from BaseURL without any HTTP library
+  U := Trim(FBaseURL);
+  Scheme := LowerCase(Copy(U, 1, 8));
+  if Pos('https://', Scheme) = 1 then
+  begin
+    U := Copy(U, 9, MaxInt);
+    Port := 443;
+  end
+  else if Pos('http://', Scheme) = 1 then
+  begin
+    U := Copy(U, 8, MaxInt);
+    Port := 80;
+  end
+  else
+    Exit;
+  // Cut path, query and fragment
+  P := 1;
+  while (P <= Length(U)) and not (U[P] in ['/', '?', '#']) do
+    Inc(P);
+  if P <= Length(U) then
+    U := Copy(U, 1, P - 1);
+  // Split host:port
+  P := Pos(':', U);
+  if P > 0 then
+  begin
+    Host := Copy(U, 1, P - 1);
+    Port := StrToIntDef(Copy(U, P + 1, MaxInt), Port);
+  end
+  else
+    Host := U;
+  if Host = '' then
+    Exit;
+  Sock := TTCPBlockSocket.Create;
+  try
+    Sock.ConnectionTimeout := ATimeoutMs;
+    try
+      Sock.Connect(Host, IntToStr(Port));
+      Result := Sock.LastError = 0;
+    except
+      Result := False;
+    end;
+  finally
+    Sock.Free;
+  end;
 end;
 
 procedure TCustomOllamaManager.DoError(Kind: TOllamaErrorKind; const ModelName, Msg: string);
@@ -1833,8 +1890,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -1902,8 +1959,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
