@@ -1128,7 +1128,7 @@ begin
     Ctx := CtxUsed + '/' + CtxTotal;
     CtxUsedKb := IntToStr(FAgent.ContextUsedKb);
     CtxTotalKb := IntToStr(FAgent.ContextTotalKb);
-    CtxKb := CtxUsedKb + '/' + CtxTotalKb + 'KB';
+    CtxKb := CtxUsedKb + '/' + CtxTotalKb + 'K';
   end
   else
   begin

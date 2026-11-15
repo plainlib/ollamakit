@@ -1083,6 +1083,9 @@ begin
           Reason := afrError;
           if ErrMsg = '' then
             ErrMsg := 'LLM error';
+          // Add an actionable hint for the most common context error
+          if Pos('context length', LowerCase(ErrMsg)) > 0 then
+            ErrMsg := ErrMsg + LineEnding + 'hint: use "cls" to clear history, or "set numctx <larger>" to raise the window';
           FAgent.LogLine(Format('Abort: chat error kind=%d msg="%s"', [Ord(Kind), ErrMsg]));
           Exit;
         end;
@@ -1477,6 +1480,11 @@ begin
     Result := Result + #10 + 'IMPORTANT: the only tools currently enabled are: ' + ToolList + '. ' +
       'You must not claim access to any tool that is not in this list. ' +
       'If the user asks for an action that requires an unavailable tool, ' + 'explain that the tool is not enabled.';
+  // Enforce file reading strategy when the tool is available
+  if Pos('read_file_lines', ToolList) > 0 then
+    Result := Result + #10 + 'When read_file returns a truncation notice, use read_file_lines with ' +
+      'start_line and end_line to read further parts of the file in chunks. ' +
+      'Do not give up on large files, read them in sections until you have the ' + 'content you need.';
 end;
 
 procedure TCustomOllamaAgent.ResetUsage;
@@ -1637,8 +1645,12 @@ begin
         '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative directory"}}}');
       AddTool(Arr, 'search_text', 'Search for a literal text pattern in files, returns file and line',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
-      AddTool(Arr, 'read_file_lines', 'Read a line range from a file, capped at 5000 lines per call',
-        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}');
+      AddTool(Arr, 'read_file_lines',
+        'Read a specific line range from a file. Use this instead of read_file when the file ' +
+        'is larger than 50 KB or when read_file returned a truncation notice. Each call reads ' +
+        'up to 5000 lines. To read a whole large file, call repeatedly with increasing start_line. ' +
+        'Example: path="src/mainform.pas", start_line=1, end_line=500 for the first 500 lines.',
+        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line to read, 1-based"},"end_line":{"type":"integer","description":"Last line to read, inclusive"}},"required":["path"]}');
       AddTool(Arr, 'edit_file',
         'Replace an exact string in a file. By default the old string must occur exactly once, set replace_all=true to replace all occurrences',
         '{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}');
@@ -1755,11 +1767,15 @@ begin
 end;
 
 function TCustomOllamaAgent.DoReadFile(AArgs: TJSONObject): string;
+const
+  MAX_READ_BYTES = 50000;
 var
-  RelPath, FullPath: string;
+  RelPath, FullPath, Content: string;
   Stream: TFileStream;
   Buf: TBytes = ();
   ReadCount: int64;
+  FullSize: int64;
+  I, LinesShown: integer;
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -1778,16 +1794,29 @@ begin
   end;
   Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
   try
-    SetLength(Buf, Min(Stream.Size, 100000));
+    FullSize := Stream.Size;
+    SetLength(Buf, Min(FullSize, MAX_READ_BYTES));
     if Length(Buf) > 0 then
       ReadCount := Stream.Read(Buf[0], Length(Buf))
     else
       ReadCount := 0;
     SetLength(Buf, ReadCount);
-    Result := TJSONString.Create(string(Buf)).AsJSON;
+    Content := string(Buf);
   finally
     Stream.Free;
   end;
+  // Tell the model how much was shown and where to continue
+  if FullSize > ReadCount then
+  begin
+    LinesShown := 0;
+    for I := 1 to Length(Content) do
+      if Content[I] = #10 then
+        Inc(LinesShown);
+    Content := Content + #10#10 + '[file truncated: showed ' + IntToStr(ReadCount) + ' of ' +
+      IntToStr(FullSize) + ' bytes (' + IntToStr(LinesShown) + ' lines). ' + 'Use read_file_lines with start_line=' +
+      IntToStr(LinesShown + 1) + ' to continue reading from where this message left off]';
+  end;
+  Result := TJSONString.Create(Content).AsJSON;
 end;
 
 function TCustomOllamaAgent.DoWriteFile(AArgs: TJSONObject): string;
