@@ -172,6 +172,8 @@ type
     function SafePath(const ARelPath: string): string; virtual;
     // Built-in tool implementations, invoked from DispatchTool
     function DoReadFile(AArgs: TJSONObject): string; virtual;
+    // Shows first and last lines of a file with a gap marker
+    function DoReadFilePreview(AArgs: TJSONObject): string; virtual;
     function DoWriteFile(AArgs: TJSONObject): string; virtual;
     function DoListFiles(AArgs: TJSONObject): string; virtual;
     function DoSearchText(AArgs: TJSONObject): string; virtual;
@@ -1480,7 +1482,11 @@ begin
     Result := Result + #10 + 'IMPORTANT: the only tools currently enabled are: ' + ToolList + '. ' +
       'You must not claim access to any tool that is not in this list. ' +
       'If the user asks for an action that requires an unavailable tool, ' + 'explain that the tool is not enabled.';
-  // Enforce file reading strategy when the tool is available
+  // Enforce file reading strategy when the tools are available
+  if Pos('read_file_preview', ToolList) > 0 then
+    Result := Result + #10 + 'When exploring an unknown file or a file larger than 50 KB, ALWAYS call ' +
+      'read_file_preview first to see its size, structure and first/last lines. ' +
+      'Only then decide whether to read the whole file with read_file or specific ' + 'ranges with read_file_lines.';
   if Pos('read_file_lines', ToolList) > 0 then
     Result := Result + #10 + 'When read_file returns a truncation notice, use read_file_lines with ' +
       'start_line and end_line to read further parts of the file in chunks. ' +
@@ -1639,6 +1645,12 @@ begin
     begin
       AddTool(Arr, 'read_file', 'Read contents of a file inside the workspace',
         '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}');
+      AddTool(Arr, 'read_file_preview',
+        'Show a quick preview of a text file: first N lines, last N lines and total size. ' +
+        'Language-agnostic, works for source code, markdown, configs, logs. ' +
+        'Use this FIRST when exploring an unknown file or a file larger than 50 KB, ' +
+        'before deciding whether to read the whole file with read_file or specific ranges ' + 'with read_file_lines.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"head":{"type":"integer","description":"Number of first lines to show, default 30, max 500"},"tail":{"type":"integer","description":"Number of last lines to show, default 30, max 500"}},"required":["path"]}');
       AddTool(Arr, 'write_file', 'Write contents to a file inside the workspace, creates parent directories',
         '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
       AddTool(Arr, 'list_files', 'List files in a directory inside the workspace, non-recursive',
@@ -1670,8 +1682,15 @@ begin
         '"config.*" finds config with any extension. Search is recursive by default, do NOT ' +
         'add a ** prefix. Character classes like [abc] are not supported. Capped at 2000 results.',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
-      AddTool(Arr, 'grep', 'Search files by regex or literal pattern, capped at 500 matches',
-        '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"},"literal":{"type":"boolean"}},"required":["pattern"]}');
+      AddTool(Arr, 'grep',
+        'Search text in files using a regex or literal pattern, capped at 500 matches. ' +
+        'path can be a single file (searches only that file, like Unix grep file.txt) ' +
+        'or a directory (searches all files in it recursively). ' +
+        'When scanning a directory, up to 2000 files are checked and common junk ' +
+        'directories like .git, node_modules, bin, obj are skipped automatically. ' +
+        'If scan_limited is true in the response, narrow the path and try again. ' +
+        'Returns JSON with file, line and text for each match.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory to search, default is workspace root"},"pattern":{"type":"string"},"recursive":{"type":"boolean","description":"Recurse into subdirectories when path is a directory, default true"},"literal":{"type":"boolean","description":"Literal substring match, default true, set false for regex"}},"required":["pattern"]}');
     end;
 
     if afExecCommand in FFeatures then
@@ -1729,6 +1748,7 @@ begin
     if afFileTools in FFeatures then
     begin
       Names.Add('read_file');
+      Names.Add('read_file_preview');
       Names.Add('write_file');
       Names.Add('list_files');
       Names.Add('search_text');
@@ -1812,11 +1832,120 @@ begin
     for I := 1 to Length(Content) do
       if Content[I] = #10 then
         Inc(LinesShown);
-    Content := Content + #10#10 + '[file truncated: showed ' + IntToStr(ReadCount) + ' of ' +
-      IntToStr(FullSize) + ' bytes (' + IntToStr(LinesShown) + ' lines). ' + 'Use read_file_lines with start_line=' +
+    Content := Content + #10#10 + '[file truncated: showed ' + IntToStr(ReadCount) + ' of ' + IntToStr(FullSize) +
+      ' bytes (' + IntToStr(LinesShown) + ' lines). ' + 'Use read_file_lines with start_line=' +
       IntToStr(LinesShown + 1) + ' to continue reading from where this message left off]';
   end;
   Result := TJSONString.Create(Content).AsJSON;
+end;
+
+function TCustomOllamaAgent.DoReadFilePreview(AArgs: TJSONObject): string;
+const
+  DEFAULT_HEAD = 30;
+  DEFAULT_TAIL = 30;
+  MAX_LINES_PER_EDGE = 500;
+  MAX_FILE_SIZE_FOR_PREVIEW = 10 * 1024 * 1024;
+var
+  RelPath, FullPath: string;
+  Lines: TStringList;
+  TotalLines, HeadCount, TailCount, I, SkippedCount: integer;
+  Size: int64;
+  Buf: TStringBuilder;
+  Stream: TFileStream;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if not FileExists(FullPath) then
+  begin
+    Result := '{"error": "file not found"}';
+    Exit;
+  end;
+  Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
+  try
+    Size := Stream.Size;
+  finally
+    Stream.Free;
+  end;
+  // Preview is meant for quick inspection, refuse absurdly large files
+  if Size > MAX_FILE_SIZE_FOR_PREVIEW then
+  begin
+    Result := '{"error": "file too large for preview (' + IntToStr(Size) +
+      ' bytes), use read_file_lines with start_line and end_line"}';
+    Exit;
+  end;
+  HeadCount := AArgs.Get('head', DEFAULT_HEAD);
+  TailCount := AArgs.Get('tail', DEFAULT_TAIL);
+  if HeadCount < 1 then
+    HeadCount := DEFAULT_HEAD;
+  if HeadCount > MAX_LINES_PER_EDGE then
+    HeadCount := MAX_LINES_PER_EDGE;
+  if TailCount < 0 then
+    TailCount := DEFAULT_TAIL;
+  if TailCount > MAX_LINES_PER_EDGE then
+    TailCount := MAX_LINES_PER_EDGE;
+  Lines := TStringList.Create;
+  try
+    try
+      Lines.LoadFromFile(FullPath);
+    except
+      Result := '{"error": "cannot read file"}';
+      Exit;
+    end;
+    TotalLines := Lines.Count;
+    Buf := TStringBuilder.Create;
+    try
+      Buf.Append('=== File preview: ' + RelPath + ' ===' + #10);
+      Buf.Append(Format('Size: %d bytes, %d lines', [Size, TotalLines]) + #10 + #10);
+      if TotalLines <= HeadCount + TailCount then
+      begin
+        Buf.Append('--- Full content (file is small) ---' + #10);
+        for I := 0 to TotalLines - 1 do
+        begin
+          Buf.Append(Lines[I]);
+          Buf.Append(#10);
+        end;
+      end
+      else
+      begin
+        Buf.Append(Format('--- First %d lines ---', [HeadCount]) + #10);
+        for I := 0 to HeadCount - 1 do
+        begin
+          Buf.Append(Lines[I]);
+          Buf.Append(#10);
+        end;
+        SkippedCount := TotalLines - HeadCount - TailCount;
+        Buf.Append(#10);
+        Buf.Append(Format('[... %d lines skipped, from line %d to line %d ...]', [SkippedCount, HeadCount +
+          1, TotalLines - TailCount]) + #10);
+        Buf.Append(#10);
+        if TailCount > 0 then
+        begin
+          Buf.Append(Format('--- Last %d lines ---', [TailCount]) + #10);
+          for I := TotalLines - TailCount to TotalLines - 1 do
+          begin
+            Buf.Append(Lines[I]);
+            Buf.Append(#10);
+          end;
+        end;
+      end;
+      Buf.Append(#10);
+      Buf.Append('To read a specific range use read_file_lines with start_line and end_line. ');
+      Buf.Append('To read the first 50 KB use read_file.');
+      Result := TJSONString.Create(Buf.ToString).AsJSON;
+    finally
+      Buf.Free;
+    end;
+  finally
+    Lines.Free;
+  end;
 end;
 
 function TCustomOllamaAgent.DoWriteFile(AArgs: TJSONObject): string;
@@ -2354,29 +2483,81 @@ end;
 function TCustomOllamaAgent.DoGrep(AArgs: TJSONObject): string;
 const
   MAX_MATCHES = 500;
-  MAX_FILE_SIZE = 5 * 1024 * 1024;
+  MAX_FILE_SIZE = 1024 * 1024;
+  MAX_FILES_SCANNED = 2000;
 var
   RelPath, FullPath, Pattern: string;
-  Recursive, Literal, HasMatch: boolean;
+  Recursive, Literal, SingleFile, ScanLimited: boolean;
   Files: TStringList;
   Matches: TJSONArray;
-  FileLines: TStringList;
-  I, J: integer;
-  Line: string;
-  MatchObj: TJSONObject;
+  I, FilesScanned: integer;
   BaseRoot: string;
   Regex: TRegExpr;
-  FileInfoRec: TSearchRec;
 
-// Tests a line against the current pattern, literal or regex
-  function LineMatches(const ALine: string): boolean;
+// Returns True for VCS, build output and package caches to skip
+  function IsJunkPath(const ARelPath: string): boolean;
+  var
+    Low: string;
   begin
-    if Literal then
-      Result := Pos(Pattern, ALine) > 0
-    else
-    begin
-      Regex.Expression := Pattern;
-      Result := Regex.Exec(ALine);
+    Low := '/' + LowerCase(StringReplace(ARelPath, '\\', '/', [rfReplaceAll])) + '/';
+    Result := (Pos('/.git/', Low) > 0) or (Pos('/.svn/', Low) > 0) or (Pos('/.hg/', Low) > 0) or
+      (Pos('/node_modules/', Low) > 0) or (Pos('/__pycache__/', Low) > 0) or (Pos('/bin/', Low) > 0) or
+      (Pos('/obj/', Low) > 0) or (Pos('/.vs/', Low) > 0) or (Pos('/.idea/', Low) > 0) or (Pos('/dist/', Low) > 0) or
+      (Pos('/build/', Low) > 0) or (Pos('/target/', Low) > 0);
+  end;
+
+  // Scans one file, appending matches to the shared Matches array
+  procedure ScanFile(const AFullPath, ARelPath: string);
+  var
+    Lines: TStringList;
+    J: integer;
+    Line: string;
+    MatchObj: TJSONObject;
+    FR: TSearchRec;
+    HasMatch: boolean;
+  begin
+    if Matches.Count >= MAX_MATCHES then
+      Exit;
+    if FindFirst(AFullPath, faAnyFile, FR) = 0 then
+    try
+      if FR.Size > MAX_FILE_SIZE then
+        Exit;
+    finally
+      FindClose(FR);
+    end;
+    Lines := TStringList.Create;
+    try
+      try
+        Lines.LoadFromFile(AFullPath);
+      except
+        Exit;
+      end;
+      for J := 0 to Lines.Count - 1 do
+      begin
+        if Matches.Count >= MAX_MATCHES then
+          Break;
+        Line := Lines[J];
+        if Literal then
+          HasMatch := Pos(Pattern, Line) > 0
+        else
+        begin
+          try
+            HasMatch := Regex.Exec(Line);
+          except
+            HasMatch := False;
+          end;
+        end;
+        if HasMatch then
+        begin
+          MatchObj := TJSONObject.Create;
+          MatchObj.Add('file', ARelPath);
+          MatchObj.Add('line', J + 1);
+          MatchObj.Add('text', Line);
+          Matches.Add(MatchObj);
+        end;
+      end;
+    finally
+      Lines.Free;
     end;
   end;
 
@@ -2399,61 +2580,52 @@ begin
     Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
     Exit;
   end;
-  if not DirectoryExists(FullPath) then
+  if not FileExists(FullPath) and not DirectoryExists(FullPath) then
   begin
-    Result := '{"error": "directory not found"}';
+    Result := '{"error": "path is neither a file nor a directory"}';
     Exit;
   end;
   BaseRoot := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
   Regex := nil;
   if not Literal then
+  begin
+    // Compile once, reuse for every line
     Regex := TRegExpr.Create;
+    Regex.Expression := Pattern;
+  end;
   Files := TStringList.Create;
   Matches := TJSONArray.Create;
+  ScanLimited := False;
+  FilesScanned := 0;
   try
-    FindAllFiles(Files, FullPath, '*.*', Recursive);
-    for I := 0 to Files.Count - 1 do
+    // A path to a file searches only that file, like Unix grep file.txt
+    SingleFile := FileExists(FullPath) and not DirectoryExists(FullPath);
+    if SingleFile then
     begin
-      if Matches.Count >= MAX_MATCHES then
-        Break;
-      if FindFirst(Files[I], faAnyFile, FileInfoRec) = 0 then
-      try
-        if FileInfoRec.Size > MAX_FILE_SIZE then
-          Continue;
-      finally
-        FindClose(FileInfoRec);
-      end;
-      FileLines := TStringList.Create;
-      try
-        try
-          FileLines.LoadFromFile(Files[I]);
-        except
-          Continue;
-        end;
-        for J := 0 to FileLines.Count - 1 do
+      ScanFile(FullPath, RelativeToRoot(BaseRoot, FullPath));
+    end
+    else
+    begin
+      FindAllFiles(Files, FullPath, '*.*', Recursive);
+      for I := 0 to Files.Count - 1 do
+      begin
+        if Matches.Count >= MAX_MATCHES then
+          Break;
+        if FilesScanned >= MAX_FILES_SCANNED then
         begin
-          if Matches.Count >= MAX_MATCHES then
-            Break;
-          Line := FileLines[J];
-          try
-            HasMatch := LineMatches(Line);
-          except
-            HasMatch := False;
-          end;
-          if HasMatch then
-          begin
-            MatchObj := TJSONObject.Create;
-            MatchObj.Add('file', RelativeToRoot(BaseRoot, Files[I]));
-            MatchObj.Add('line', J + 1);
-            MatchObj.Add('text', Line);
-            Matches.Add(MatchObj);
-          end;
+          ScanLimited := True;
+          Break;
         end;
-      finally
-        FileLines.Free;
+        if IsJunkPath(RelativeToRoot(BaseRoot, Files[I])) then
+          Continue;
+        Inc(FilesScanned);
+        ScanFile(Files[I], RelativeToRoot(BaseRoot, Files[I]));
       end;
+      if FilesScanned >= MAX_FILES_SCANNED then
+        ScanLimited := True;
     end;
     Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >= MAX_MATCHES, 'true', 'false') +
+      ', "scanned_files": ' + IntToStr(FilesScanned) + ', "scan_limited": ' + BoolToStr(ScanLimited, 'true', 'false') +
       ', "matches": ' + Matches.AsJSON + '}';
   finally
     Matches.Free;
@@ -2754,6 +2926,8 @@ begin
     begin
       if AName = 'read_file' then
         Exit(DoReadFile(Args))
+      else if AName = 'read_file_preview' then
+        Exit(DoReadFilePreview(Args))
       else if AName = 'write_file' then
         Exit(DoWriteFile(Args))
       else if AName = 'list_files' then
