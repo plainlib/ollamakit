@@ -18,6 +18,9 @@ type
   // Classification of a single input line
   TTermInputKind = (tikEmpty, tikBuiltin, tikCommand, tikAgent);
 
+  // Semantic color roles for console output, mapped to platform primitives
+  TTermColor = (tcDefault, tcDim, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge);
+
   TTermRouteEvent = procedure(Sender: TObject; const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean) of object;
   TTermOutputEvent = procedure(Sender: TObject; const AText: string; AIsStderr: boolean) of object;
   TTermAgentEvent = procedure(Sender: TObject; const AText: string) of object;
@@ -38,6 +41,8 @@ type
     FLastCharWasNewLine: boolean;
     // Remove emoji and symbol chars that console fonts cannot render
     FStripEmoji: boolean;
+    // Colorize badges and thinking text when console supports attributes
+    FColorOutput: boolean;
     FBuiltinCommands: TStringList;
     FHistory: TStringList;
     FHistoryMax: integer;
@@ -82,6 +87,8 @@ type
   protected
     // Clears agent reference when it is removed at runtime
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
+    // Applies a semantic color to subsequent output, no-op on non-Windows
+    procedure SetColor(AColor: TTermColor); virtual;
     // Returns Path or process current directory when Path is empty
     function GetEffectivePath: string; virtual;
     // Returns prompt text with {path} placeholder replaced by Path
@@ -145,6 +152,7 @@ type
     property ShowThinking: boolean read FShowThinking write FShowThinking default True;
     property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
+    property ColorOutput: boolean read FColorOutput write FColorOutput default True;
     property BuiltinCommands: TStringList read FBuiltinCommands;
     property HistoryMax: integer read FHistoryMax write FHistoryMax default 200;
     property ShellExec: string read FShellExec write FShellExec;
@@ -179,6 +187,8 @@ type
     property ToolCallLabel;
     // Strip emoji and unsupported symbol ranges that plain console fonts cannot render
     property StripEmoji;
+    // Colorize badges and thinking text when console supports attributes
+    property ColorOutput;
     // Commands executed internally without invoking the shell, extend to add your own
     property BuiltinCommands;
     // Maximum number of input lines kept in history, oldest are dropped first
@@ -323,6 +333,7 @@ begin
   FToolCallLabel := '[{name}: {command}]';
   FLastCharWasNewLine := True;
   FStripEmoji := True;
+  FColorOutput := True;
   FAgent := nil;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
@@ -439,13 +450,8 @@ end;
 
 procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
 begin
-  // Close thinking block with a blank line for visual separation
-  if FInThinking then
-  begin
-    WriteLine('', True);
-    WriteLine('', True);
-    FInThinking := False;
-  end;
+  // Close thinking block if open, this also resets color
+  CloseThinking;
   WriteText(AText, False);
   if Assigned(FPrevAgentOnChunk) then
     FPrevAgentOnChunk(Sender, AText);
@@ -453,14 +459,17 @@ end;
 
 procedure TCustomTermManager.CloseThinking;
 begin
-  if not FInThinking then
-    Exit;
-  // Close the last thinking line if it was not terminated
-  if not FLastCharWasNewLine then
+  if FInThinking then
+  begin
+    // Close the last thinking line if it was not terminated
+    if not FLastCharWasNewLine then
+      WriteLine('', True);
+    // Emit blank line for visual separation from the next block
     WriteLine('', True);
-  // Emit blank line for visual separation from the next block
-  WriteLine('', True);
-  FInThinking := False;
+    FInThinking := False;
+  end;
+  // Always reset color, even if no thinking block was open
+  SetColor(tcDefault);
 end;
 
 procedure TCustomTermManager.HandleAgentThinking(Sender: TObject; const AText: string);
@@ -468,7 +477,10 @@ begin
   // Emit label and newline once at the beginning of a thinking block
   if not FInThinking then
   begin
+    SetColor(tcThinkingBadge);
     WriteLine(FThinkingLabel, True);
+    // Switch to dim text for the reasoning body
+    SetColor(tcDim);
     FInThinking := True;
   end;
   // Show thinking text only when enabled, otherwise just the label
@@ -523,7 +535,9 @@ begin
   // Close the current line if it was not terminated
   if not FLastCharWasNewLine then
     WriteLine('', True);
+  SetColor(tcToolBadge);
   WriteLine(LabelText, True);
+  SetColor(tcDefault);
   // Blank line after tool call for visual separation
   WriteLine('', True);
   if Assigned(FPrevAgentOnToolCall) then
@@ -548,7 +562,11 @@ begin
     begin
       // Signal empty response so the user is not left with silence
       if AAnswer = '' then
-        WriteLine('[empty response from model]', True)
+      begin
+        SetColor(tcWarnBadge);
+        WriteLine('[empty response from model]', True);
+        SetColor(tcDefault);
+      end
       else if not Streamed then
         WriteLine(AAnswer, False)
       else if not FLastCharWasNewLine then
@@ -557,11 +575,23 @@ begin
     afrCancelled:
       WriteLine('^C', True);
     afrMaxSteps:
+    begin
+      SetColor(tcWarnBadge);
       WriteLine('[max steps reached]', True);
+      SetColor(tcDefault);
+    end;
     afrError:
+    begin
+      SetColor(tcErrorBadge);
       WriteLine('[error: ' + AErrorMsg + ']', True);
+      SetColor(tcDefault);
+    end;
     afrModelNotSet:
+    begin
+      SetColor(tcErrorBadge);
       WriteLine('[agent not configured: ' + AErrorMsg + ']', True);
+      SetColor(tcDefault);
+    end;
     else
       ;
   end;
@@ -600,8 +630,11 @@ begin
   CloseThinking;
   if not FLastCharWasNewLine then
     WriteLine('', False);
-  // Show the question on its own line, then read the answer
-  WriteLine('[agent asks] ' + AQuestion, True);
+  // Badge for the label, question text stays in default color
+  SetColor(tcToolBadge);
+  WriteText('[agent asks]', True);
+  SetColor(tcDefault);
+  WriteLine(' ' + AQuestion, True);
   WriteText(GetPromptText, False);
   AAnswer := ReadLine;
 end;
@@ -1372,6 +1405,8 @@ begin
   if InModeSaved then
     SetConsoleMode(InHandle, InMode and not (ENABLE_ECHO_INPUT or ENABLE_LINE_INPUT or ENABLE_PROCESSED_INPUT));
   {$ENDIF}
+  // Start with explicit bright white so prompt and banner match tcDefault
+  SetColor(tcDefault);
   // Print banner once before the loop if host configured one
   if FWelcome <> '' then
     DoOutput(FWelcome + LineEnding, False);
@@ -1470,6 +1505,48 @@ begin
 end;
 
 {$IFDEF WINDOWS}
+
+const
+  // Bright white for regular output, easy to read on dark backgrounds
+  CLR_DEFAULT = FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or
+    FOREGROUND_INTENSITY;
+  // Silver light gray for thinking text, contrasts with default white
+  CLR_DIM     = FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE;
+  // Badges use dark background with bright white text for readability
+  CLR_BADGE_THINKING = BACKGROUND_INTENSITY or FOREGROUND_RED or
+    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
+  CLR_BADGE_TOOL = BACKGROUND_BLUE or FOREGROUND_RED or
+    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
+  CLR_BADGE_ERROR = BACKGROUND_RED or FOREGROUND_RED or
+    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
+  CLR_BADGE_WARN = BACKGROUND_RED or BACKGROUND_GREEN;
+
+// Applies console text attribute directly, ignored for redirected handles
+procedure SetConsoleColor(AAttr: Word);
+var
+  Handle: THandle;
+begin
+  Handle := GetStdHandle(STD_OUTPUT_HANDLE);
+  SetConsoleTextAttribute(Handle, AAttr);
+end;
+
+procedure TCustomTermManager.SetColor(AColor: TTermColor);
+var
+  Attr: Word;
+begin
+  if not FColorOutput then
+    Exit;
+  case AColor of
+    tcDim: Attr := CLR_DIM;
+    tcThinkingBadge: Attr := CLR_BADGE_THINKING;
+    tcToolBadge: Attr := CLR_BADGE_TOOL;
+    tcErrorBadge: Attr := CLR_BADGE_ERROR;
+    tcWarnBadge: Attr := CLR_BADGE_WARN;
+    else
+      Attr := CLR_DEFAULT;
+  end;
+  SetConsoleColor(Attr);
+end;
 
 // Writes UTF-8 bytes directly to handle bypassing codepage conversion
 procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString);
@@ -1892,6 +1969,11 @@ begin
 end;
 
 {$ELSE}
+
+procedure TCustomTermManager.SetColor(AColor: TTermColor);
+begin
+  // No-op on non-Windows, override to emit ANSI escape sequences
+end;
 
 procedure ConGotoXY(X, Y: integer);
 begin
