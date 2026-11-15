@@ -50,6 +50,26 @@ type
 
   TCustomOllamaManager = class;
 
+  { Helper that dispatches pull progress from a worker thread to the main thread }
+  TPullProgressCall = class
+  public
+    Manager: TCustomOllamaManager;
+    ModelName: string;
+    Pct: integer;
+    procedure Fire;
+  end;
+
+  { Helper that parses NDJSON pull stream chunks and updates progress }
+  TPullStreamHelper = class
+  public
+    Manager: TCustomOllamaManager;
+    ModelName: string;
+    Buffer: string;
+    Done: boolean;
+    LastPct: integer;
+    procedure HandleRaw(const AChunk: string; var ACancel: boolean);
+  end;
+
   { Background worker for long-running Ollama operations }
   TOllamaBgThread = class(TThread)
   private
@@ -100,7 +120,9 @@ type
     FLoadingModels: TStringList;
     FStartingModels: TStringList;
     FStartingProgress: TStringList; // Name=Percent
+    FPullProgress: TStringList;     // Name=Percent for pull operations
     FStartSubItems: TStringList;    // Name=Object (TMenuItem)
+    FLoadingSubItems: TStringList;  // Name=Object (TMenuItem) for pull items
     FActiveThreads: TList;
     FProgressTimer: TTimer;
     FConnecting: boolean;
@@ -158,6 +180,11 @@ type
     procedure SetActive(const Value: boolean);
     procedure SetMenuSections(const Value: TOllamaMenuSections);
 
+    // Streaming pull used by background thread, holds the global SSL lock
+    function PullModelStream(const AModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+    // Applies pull progress from worker thread, must run on the main thread
+    procedure UpdatePullProgress(const AModelName: string; APct: integer);
+
   protected
     procedure Loaded; override;
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -194,6 +221,20 @@ type
     function ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; out AKind: TOllamaErrorKind;
       out AErrorMsg: string): string; overload;
 
+    // Synchronous model management, all return False on error and report via OnError
+    // ShowModel returns raw JSON from /api/show for the given model
+    function ShowModel(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+    // GetVersion returns the Ollama server version as plain text
+    function GetVersion(out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+    // CopyModel duplicates a model under a new name
+    function CopyModel(const Source, Destination: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+    // CreateModel builds a new model from a Modelfile content
+    function CreateModel(const ModelName, ModelfileContent: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+    // LoadModelSync loads the model into memory and waits until ready
+    function LoadModelSync(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+    // UnloadModelSync unloads the model from memory immediately
+    function UnloadModelSync(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+
     // Called by the background thread via Synchronize
     procedure BgFinished(const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
     procedure UnregisterThread(AThread: TThread);
@@ -202,11 +243,15 @@ type
     procedure ResetUsage;
     // Returns context length of a loaded model from last refresh, 0 if unknown
     function GetModelContextLength(const ModelName: string): int64;
+    // Returns cached /api/ps JSON for a running model, fetches on cache miss
+    function GetRunningModelJson(const AModelName: string): string;
     // Quick TCP-only reachability check, no HTTP, no SSL, no locks
     function CheckServerReachableQuick(ATimeoutMs: integer = 500): boolean;
 
     // Currently installed models as reported by the last refresh
     property InstalledModels: TStringList read FInstalledModels;
+    // Currently loaded models as reported by the last refresh
+    property RunningModels: TStringList read FRunningModels;
     property BaseURL: string read FBaseURL write SetBaseURL;
     property PopupMenu: TPopupMenu read FPopupMenu write SetPopupMenu;
     property Active: boolean read FActive write SetActive default True;
@@ -224,6 +269,7 @@ type
     property AutoRefresh: boolean read FAutoRefresh write FAutoRefresh default True;
     property ConnectionTimeout: integer read FConnectionTimeout write FConnectionTimeout default 5000;
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 30000;
+    // Per-chunk timeout in milliseconds during pull, 0 means use RequestTimeout
     property PullTimeout: integer read FPullTimeout write FPullTimeout default 0;
     property MenuSections: TOllamaMenuSections read FMenuSections write SetMenuSections default [msPull, msServer, msModels, msConnect];
 
@@ -254,7 +300,7 @@ type
     property ConnectionTimeout;
     // Timeout in milliseconds for regular API requests
     property RequestTimeout;
-    // Reserved timeout in milliseconds for pull operations; 0 means no limit
+    // Per-chunk timeout in milliseconds during pull, 0 means use RequestTimeout
     property PullTimeout;
     // Sections of the popup menu shown to the user; clear a flag to hide it
     property MenuSections;
@@ -281,6 +327,7 @@ resourcestring
   rsDeleteMenu = 'Delete';
   rsInfoMenu = 'Info...';
   rsLoadingModel = 'Loading %s...';
+  rsLoadingModelPercent = 'Loading %s... %d%%';
   rsStartingPercent = 'Starting... %d%%';
   rsDeleteConfirm = 'Delete model "%s"?';
   rsPullCaption = 'Pull Ollama model';
@@ -346,6 +393,90 @@ begin
   RegisterComponents('Ollama', [TOllamaManager]);
 end;
 
+{ TPullProgressCall }
+
+procedure TPullProgressCall.Fire;
+begin
+  try
+    if Assigned(Manager) then
+      Manager.UpdatePullProgress(ModelName, Pct);
+  finally
+    Free;
+  end;
+end;
+
+{ TPullStreamHelper }
+
+procedure TPullStreamHelper.HandleRaw(const AChunk: string; var ACancel: boolean);
+var
+  P: integer;
+  OneLine: string;
+  Data: TJSONData;
+  Obj: TJSONObject;
+  Status: string;
+  Completed, Total: int64;
+  Pct: integer;
+  Call: TPullProgressCall;
+begin
+  // Abort pull when the manager is shutting down
+  if Assigned(Manager) and Manager.FShutdown then
+  begin
+    ACancel := True;
+    Exit;
+  end;
+  Buffer := Buffer + AChunk;
+  P := Pos(#10, Buffer);
+  while P > 0 do
+  begin
+    OneLine := Trim(Copy(Buffer, 1, P - 1));
+    Buffer := Copy(Buffer, P + 1, MaxInt);
+    if OneLine <> '' then
+    begin
+      Data := nil;
+      try
+        try
+          Data := GetJSON(OneLine);
+        except
+          Data := nil;
+        end;
+        if (Data <> nil) and (Data.JSONType = jtObject) then
+        begin
+          Obj := TJSONObject(Data);
+          Status := Obj.Get('status', '');
+          if Status = 'success' then
+          begin
+            Done := True;
+            ACancel := True;
+          end
+          else
+          begin
+            Completed := Obj.Get('completed', int64(0));
+            Total := Obj.Get('total', int64(0));
+            if Total > 0 then
+            begin
+              Pct := Round(Completed * 100 / Total);
+              if Pct <> LastPct then
+              begin
+                LastPct := Pct;
+                Call := TPullProgressCall.Create;
+                Call.Manager := Manager;
+                Call.ModelName := ModelName;
+                Call.Pct := Pct;
+                TThread.Queue(nil, @Call.Fire);
+              end;
+            end;
+          end;
+        end;
+      finally
+        Data.Free;
+      end;
+    end;
+    if ACancel then
+      Break;
+    P := Pos(#10, Buffer);
+  end;
+end;
+
 { TOllamaBgThread }
 
 constructor TOllamaBgThread.Create(AManager: TCustomOllamaManager; AOp: TOllamaBgOp; const AModelName: string; AGen: integer = 0);
@@ -375,8 +506,8 @@ begin
       case FOp of
         boPull:
         begin
-          JsonBody := Format('{"name":"%s","stream":false}', [FModelName]);
-          FManager.ApiPost('/api/pull', JsonBody, FErrorKind, FErrorMsg);
+          // Streaming pull: parse progress from each chunk, no 30 s timeout
+          FManager.PullModelStream(FModelName, FErrorKind, FErrorMsg);
         end;
         boStart:
         begin
@@ -453,7 +584,9 @@ begin
   FLoadingModels := TStringList.Create;
   FStartingModels := TStringList.Create;
   FStartingProgress := TStringList.Create;
+  FPullProgress := TStringList.Create;
   FStartSubItems := TStringList.Create;
+  FLoadingSubItems := TStringList.Create;
   FActiveThreads := TList.Create;
 
   FInstalledModels.Sorted := True;
@@ -465,6 +598,7 @@ begin
 
   FRunningDetails.NameValueSeparator := '=';
   FStartingProgress.NameValueSeparator := '=';
+  FPullProgress.NameValueSeparator := '=';
 
   FProgressTimer := TTimer.Create(nil);
   FProgressTimer.Interval := 300;
@@ -497,7 +631,9 @@ begin
   FreeAndNil(FLoadingModels);
   FreeAndNil(FStartingModels);
   FreeAndNil(FStartingProgress);
+  FreeAndNil(FPullProgress);
   FreeAndNil(FStartSubItems);
+  FreeAndNil(FLoadingSubItems);
   inherited Destroy;
 end;
 
@@ -518,6 +654,86 @@ procedure TCustomOllamaManager.ResetUsage;
 begin
   FLastPromptEvalCount := 0;
   FLastEvalCount := 0;
+end;
+
+procedure TCustomOllamaManager.UpdatePullProgress(const AModelName: string; APct: integer);
+var
+  Idx: integer;
+  SubItem: TMenuItem;
+begin
+  if FShutdown then
+    Exit;
+  Idx := FPullProgress.IndexOfName(AModelName);
+  if Idx >= 0 then
+    FPullProgress.Values[AModelName] := IntToStr(APct)
+  else
+    FPullProgress.Add(AModelName + '=' + IntToStr(APct));
+  // Update menu item caption in place, no full rebuild needed
+  Idx := FLoadingSubItems.IndexOf(AModelName);
+  if Idx >= 0 then
+  begin
+    SubItem := TMenuItem(FLoadingSubItems.Objects[Idx]);
+    if Assigned(SubItem) then
+      SubItem.Caption := Format(rsLoadingModelPercent, [AModelName, APct]);
+  end;
+  if Assigned(FOnPullProgress) then
+  try
+    FOnPullProgress(Self, AModelName, APct);
+  except
+    ; // Ignore user handler exceptions
+  end;
+end;
+
+function TCustomOllamaManager.PullModelStream(const AModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+var
+  JsonBody, Url, ErrFromNetwork: string;
+  Tm: TTimeout;
+  Helper: TPullStreamHelper;
+begin
+  Result := False;
+  Kind := oekNone;
+  ErrorMsg := '';
+  if FShutdown then
+  begin
+    Kind := oekCancelled;
+    ErrorMsg := 'Cancelled';
+    Exit;
+  end;
+  JsonBody := Format('{"name":"%s","stream":true}', [AModelName.EscapeText]);
+  // Pull can take a long time, but each individual recv is bounded by the
+  // per-chunk timeout. PullTimeout overrides the request timeout when set.
+  if FPullTimeout > 0 then
+    Tm.Request := FPullTimeout
+  else
+    Tm.Request := FRequestTimeout;
+  Tm.Connection := FConnectionTimeout;
+  Url := FBaseURL + '/api/pull';
+  Helper := TPullStreamHelper.Create;
+  try
+    Helper.Manager := Self;
+    Helper.ModelName := AModelName;
+    Helper.Buffer := '';
+    Helper.Done := False;
+    Helper.LastPct := -1;
+    ErrFromNetwork := '';
+    // WebStreamRequest holds the global SSL lock, other HTTP calls block until pull ends
+    if not TNetwork.WebStreamRequest(wmPost, Url, JsonBody, nil, 'OllamaManager/1.0', 'application/json',
+      'application/json', Tm, @Helper.HandleRaw, ErrFromNetwork) then
+    begin
+      Kind := oekConnection;
+      ErrorMsg := ErrFromNetwork;
+      Exit;
+    end;
+    if Helper.Done then
+      Result := True
+    else
+    begin
+      Kind := oekConnection;
+      ErrorMsg := 'Pull interrupted before completion';
+    end;
+  finally
+    Helper.Free;
+  end;
 end;
 
 function TCustomOllamaManager.GetModelContextLength(const ModelName: string): int64;
@@ -604,6 +820,33 @@ begin
   // Cache for next callers
   if (Result > 0) and Assigned(FRunningDetails) then
     FRunningDetails.Values[ModelName] := '{"context_length":' + IntToStr(Result) + '}';
+end;
+
+function TCustomOllamaManager.GetRunningModelJson(const AModelName: string): string;
+var
+  Idx: integer;
+  PsJson: string;
+  Kind: TOllamaErrorKind;
+  ErrMsg: string;
+begin
+  Result := '';
+  // Fast path: cached details from the last refresh
+  if Assigned(FRunningDetails) then
+  begin
+    Idx := FRunningDetails.IndexOfName(AModelName);
+    if Idx >= 0 then
+      Exit(FRunningDetails.ValueFromIndex[Idx]);
+  end;
+  // Slow path: query /api/ps synchronously and cache the result
+  if FShutdown then
+    Exit;
+  PsJson := ApiGet('/api/ps', Kind, ErrMsg);
+  if Kind <> oekNone then
+    Exit;
+  ParseModels(PsJson, FRunningDetails);
+  Idx := FRunningDetails.IndexOfName(AModelName);
+  if Idx >= 0 then
+    Result := FRunningDetails.ValueFromIndex[Idx];
 end;
 
 function TCustomOllamaManager.CheckServerReachableQuick(ATimeoutMs: integer): boolean;
@@ -783,6 +1026,10 @@ begin
   if Idx >= 0 then
     FLoadingModels.Delete(Idx);
 
+  Idx := FPullProgress.IndexOfName(ModelName);
+  if Idx >= 0 then
+    FPullProgress.Delete(Idx);
+
   Idx := FStartingModels.IndexOf(ModelName);
   if Idx >= 0 then
     FStartingModels.Delete(Idx);
@@ -850,6 +1097,7 @@ begin
     Exit;
 
   FStartSubItems.Clear;
+  FLoadingSubItems.Clear;
 
   if Assigned(FPopupMenu) then
   begin
@@ -928,6 +1176,7 @@ begin
     Exit;
 
   FStartSubItems.Clear;
+  FLoadingSubItems.Clear;
 
   for I := FPopupMenu.Items.Count - 1 downto 0 do
   begin
@@ -940,7 +1189,7 @@ end;
 
 procedure TCustomOllamaManager.BuildPopupMenu;
 var
-  I, Pct, InsertPos: integer;
+  I, Pct, InsertPos, ProgIdx: integer;
   ModelItem, SubItem: TMenuItem;
   ModelName: string;
   IsRunning, IsStarting: boolean;
@@ -1073,13 +1322,19 @@ begin
           Inc(InsertPos);
         end;
 
-        // Loading models (pulling) grayed out
+        // Loading models (pulling) with live percent when available
         for I := 0 to FLoadingModels.Count - 1 do
         begin
           ModelItem := TMenuItem.Create(FPopupMenu);
-          ModelItem.Caption := Format(rsLoadingModel, [FLoadingModels[I]]);
+          ProgIdx := FPullProgress.IndexOfName(FLoadingModels[I]);
+          if ProgIdx >= 0 then
+            ModelItem.Caption := Format(rsLoadingModelPercent, [FLoadingModels[I], StrToIntDef(
+              FPullProgress.ValueFromIndex[ProgIdx], 0)])
+          else
+            ModelItem.Caption := Format(rsLoadingModel, [FLoadingModels[I]]);
           ModelItem.Tag := TAG_LOADING;
           ModelItem.Enabled := False;
+          FLoadingSubItems.AddObject(FLoadingModels[I], ModelItem);
           FPopupMenu.Items.Insert(InsertPos, ModelItem);
           Inc(InsertPos);
         end;
@@ -1653,12 +1908,18 @@ begin
 end;
 
 procedure TCustomOllamaManager.PullModel(const ModelName: string);
+var
+  Idx: integer;
 begin
   if FShutdown then
     Exit;
   if FLoadingModels.IndexOf(ModelName) >= 0 then
     Exit;
   FLoadingModels.Add(ModelName);
+  // Clear any stale progress so the caption starts without percent
+  Idx := FPullProgress.IndexOfName(ModelName);
+  if Idx >= 0 then
+    FPullProgress.Delete(Idx);
   if Assigned(FPopupMenu) then
     BuildPopupMenu;
   TOllamaBgThread.Create(Self, boPull, ModelName);
@@ -1744,6 +2005,94 @@ begin
     DoError(Kind, ModelName, ErrMsg);
     Result := '';
   end;
+end;
+
+function TCustomOllamaManager.ShowModel(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+var
+  JsonBody: string;
+begin
+  JsonBody := Format('{"name":"%s"}', [ModelName.EscapeText]);
+  Result := ApiPost('/api/show', JsonBody, Kind, ErrorMsg);
+  if Kind <> oekNone then
+  begin
+    DoError(Kind, ModelName, ErrorMsg);
+    Result := '';
+  end;
+end;
+
+function TCustomOllamaManager.GetVersion(out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+var
+  Data: TJSONData;
+begin
+  Result := ApiGet('/api/version', Kind, ErrorMsg);
+  if Kind <> oekNone then
+  begin
+    DoError(Kind, '', ErrorMsg);
+    Result := '';
+    Exit;
+  end;
+  // Extract version field from the JSON response
+  Data := nil;
+  try
+    try
+      Data := GetJSON(Result);
+      if (Data <> nil) and (Data.JSONType = jtObject) then
+        Result := TJSONObject(Data).Get('version', Result);
+    except
+      ; // Return raw JSON when parsing fails
+    end;
+  finally
+    Data.Free;
+  end;
+end;
+
+function TCustomOllamaManager.CopyModel(const Source, Destination: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+var
+  JsonBody: string;
+begin
+  JsonBody := Format('{"source":"%s","destination":"%s"}', [Source.EscapeText, Destination.EscapeText]);
+  // Response body is not needed, success is reported through Kind
+  ApiPost('/api/copy', JsonBody, Kind, ErrorMsg);
+  Result := Kind = oekNone;
+  if Kind <> oekNone then
+    DoError(Kind, Source, ErrorMsg);
+end;
+
+function TCustomOllamaManager.CreateModel(const ModelName, ModelfileContent: string; out Kind: TOllamaErrorKind;
+  out ErrorMsg: string): boolean;
+var
+  JsonBody: string;
+begin
+  JsonBody := Format('{"name":"%s","modelfile":"%s","stream":false}', [ModelName.EscapeText, ModelfileContent.EscapeText]);
+  // Response body is not needed, success is reported through Kind
+  ApiPost('/api/create', JsonBody, Kind, ErrorMsg);
+  Result := Kind = oekNone;
+  if Kind <> oekNone then
+    DoError(Kind, ModelName, ErrorMsg);
+end;
+
+function TCustomOllamaManager.LoadModelSync(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+var
+  JsonBody: string;
+begin
+  JsonBody := Format('{"model":"%s","prompt":"","keep_alive":%d,"stream":false}', [ModelName.EscapeText, FKeepAlive]);
+  // Response body is not needed, success is reported through Kind
+  ApiPost('/api/generate', JsonBody, Kind, ErrorMsg);
+  Result := Kind = oekNone;
+  if Kind <> oekNone then
+    DoError(Kind, ModelName, ErrorMsg);
+end;
+
+function TCustomOllamaManager.UnloadModelSync(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
+var
+  JsonBody: string;
+begin
+  JsonBody := Format('{"model":"%s","prompt":"","keep_alive":0,"stream":false}', [ModelName.EscapeText]);
+  // Response body is not needed, success is reported through Kind
+  ApiPost('/api/generate', JsonBody, Kind, ErrorMsg);
+  Result := Kind = oekNone;
+  if Kind <> oekNone then
+    DoError(Kind, ModelName, ErrorMsg);
 end;
 
 type
@@ -1890,8 +2239,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -1959,8 +2308,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin

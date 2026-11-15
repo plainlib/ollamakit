@@ -12,7 +12,7 @@ interface
 
 uses
   Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser, TypInfo,
-  OllamaAgent, AgentConfig{$IFDEF WINDOWS}, Windows{$ENDIF};
+  OllamaManager, OllamaAgent, AgentConfig{$IFDEF WINDOWS}, Windows{$ENDIF};
 
 type
   // Classification of a single input line
@@ -175,6 +175,13 @@ type
     FOnOutput: TTermOutputEvent;
     FOnAgentExecute: TTermAgentEvent;
     FOnExit: TTermExitEvent;
+    // Ollama operation tracking for synchronous console commands
+    FOllamaOpDone: boolean;
+    FOllamaOpKind: TOllamaErrorKind;
+    FOllamaOpError: string;
+    FOllamaWaitModel: string;
+    FOllamaPullPct: integer;
+    FOllamaPullLastStep: integer;
     procedure SetPath(const AValue: string);
     procedure SetAgent(const AValue: TCustomOllamaAgent);
     procedure SetHistory(const AValue: TStringList);
@@ -192,6 +199,31 @@ type
     procedure HandleTermSet(const AName, AValue: string);
     // Handles get term.<name>
     procedure HandleTermGet(const AName: string);
+    // Dispatches ollama <subcommand> to the API-backed implementation
+    procedure HandleOllamaCommand(const AArg: string);
+    // Handlers for the various ollama subcommands
+    procedure HandleOllamaList;
+    procedure HandleOllamaPs;
+    procedure HandleOllamaShow(const AModel: string);
+    procedure HandleOllamaPull(const AModel: string);
+    procedure HandleOllamaRm(const AModel: string);
+    procedure HandleOllamaStop(const AModel: string);
+    procedure HandleOllamaLoad(const AModel: string);
+    procedure HandleOllamaUnload(const AModel: string);
+    procedure HandleOllamaCopy(const ASource, ADest: string);
+    procedure HandleOllamaCreate(const AName, AFile: string);
+    procedure HandleOllamaVersion;
+    procedure HandleOllamaHelp;
+    // Temporary event handlers used while a command is in flight
+    procedure HandleOllamaModelsRefreshed(Sender: TObject; const Models: TStringList);
+    procedure HandleOllamaError(Sender: TObject; Kind: TOllamaErrorKind; const ModelName, Msg: string);
+    procedure HandleOllamaPullProgress(Sender: TObject; const ModelName: string; Percent: integer);
+    // Pumps sync events until the pending ollama operation finishes or times out
+    function WaitOllamaOp(ATimeoutMs: integer): boolean;
+    // Reads a small text file as string, returns empty when read fails
+    function ReadSmallTextFile(const APath: string): string;
+    // Formats a byte count as human-readable string like "23.4 GB"
+    function BytesToHumanText(const ABytes: int64): string;
   protected
     // Clears agent reference when it is removed at runtime
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -627,6 +659,13 @@ begin
   FBuiltinCommands.Add('settings');
   FBuiltinCommands.Add('models');
   FBuiltinCommands.Add('term');
+  FBuiltinCommands.Add('ollama');
+  FOllamaOpDone := True;
+  FOllamaOpKind := oekNone;
+  FOllamaOpError := '';
+  FOllamaWaitModel := '';
+  FOllamaPullPct := -1;
+  FOllamaPullLastStep := -1;
   FHistory := TStringList.Create;
   FHistoryMax := 200;
   FShellExec := 'cmd.exe';
@@ -1339,6 +1378,8 @@ begin
   end
   else if Cmd = 'models' then
     HandleModelsCommand(Arg)
+  else if Cmd = 'ollama' then
+    HandleOllamaCommand(Arg)
   else
     DoOutput('Unknown builtin: ' + Cmd + LineEnding, True);
 end;
@@ -1438,6 +1479,7 @@ begin
     end;
     DoOutput('' + LineEnding, False);
     DoOutput('Other commands: config (all settings), models (installed models), get/set <name>' + LineEnding, False);
+    DoOutput('Ollama management: ollama <subcommand>, e.g. "ollama list" or "ollama help"' + LineEnding, False);
     DoOutput('Agent properties: help agent, or just "?"' + LineEnding, False);
     DoOutput('Terminal properties: help term' + LineEnding, False);
     DoOutput('' + LineEnding, False);
@@ -1644,6 +1686,608 @@ begin
   finally
     T.Free;
   end;
+end;
+
+function TCustomTermManager.ReadSmallTextFile(const APath: string): string;
+var
+  Stream: TFileStream;
+  Buf: TBytes = ();
+  ReadCount: int64;
+begin
+  Result := '';
+  if not FileExists(APath) then
+    Exit;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Buf, Stream.Size);
+    if Length(Buf) > 0 then
+    begin
+      ReadCount := Stream.Read(Buf[0], Length(Buf));
+      SetLength(Buf, ReadCount);
+      Result := string(Buf);
+    end;
+  finally
+    Stream.Free;
+  end;
+end;
+
+function TCustomTermManager.WaitOllamaOp(ATimeoutMs: integer): boolean;
+var
+  StartTick: QWord;
+begin
+  StartTick := GetTickCount64;
+  while not FOllamaOpDone do
+  begin
+    CheckSynchronize(50);
+    if GetTickCount64 - StartTick >= QWord(ATimeoutMs) then
+      Exit(False);
+  end;
+  Result := True;
+end;
+
+procedure TCustomTermManager.HandleOllamaModelsRefreshed(Sender: TObject; const Models: TStringList);
+begin
+  // Done when the awaited model is present or when no specific model was set
+  if FOllamaWaitModel = '' then
+    FOllamaOpDone := True
+  else if Models.IndexOf(FOllamaWaitModel) >= 0 then
+    FOllamaOpDone := True;
+end;
+
+procedure TCustomTermManager.HandleOllamaError(Sender: TObject; Kind: TOllamaErrorKind; const ModelName, Msg: string);
+begin
+  if Kind = oekNone then
+    Exit;
+  FOllamaOpKind := Kind;
+  FOllamaOpError := Msg;
+  FOllamaOpDone := True;
+end;
+
+procedure TCustomTermManager.HandleOllamaPullProgress(Sender: TObject; const ModelName: string; Percent: integer);
+var
+  Step: integer;
+begin
+  if Percent < 0 then
+    Exit;
+  FOllamaPullPct := Percent;
+  Step := Percent div 10;
+  if (Step <> FOllamaPullLastStep) or (Percent = 100) then
+  begin
+    FOllamaPullLastStep := Step;
+    DoOutput(Format('  %d%%', [Percent]) + LineEnding, False);
+  end;
+end;
+
+procedure TCustomTermManager.HandleOllamaCommand(const AArg: string);
+var
+  Parts: TStringList;
+  Sub: string;
+begin
+  if not Assigned(FAgent) then
+  begin
+    DoOutput('error: no agent attached' + LineEnding, True);
+    Exit;
+  end;
+  if not Assigned(FAgent.OllamaManager) then
+  begin
+    DoOutput('error: agent has no OllamaManager' + LineEnding, True);
+    Exit;
+  end;
+  if Trim(AArg) = '' then
+  begin
+    HandleOllamaHelp;
+    Exit;
+  end;
+  Parts := TStringList.Create;
+  try
+    Parts.Delimiter := ' ';
+    Parts.StrictDelimiter := True;
+    Parts.DelimitedText := Trim(AArg);
+    if Parts.Count = 0 then
+    begin
+      HandleOllamaHelp;
+      Exit;
+    end;
+    Sub := LowerCase(Parts[0]);
+    if (Sub = 'list') or (Sub = 'ls') then
+      HandleOllamaList
+    else if Sub = 'ps' then
+      HandleOllamaPs
+    else if Sub = 'show' then
+    begin
+      if Parts.Count < 2 then
+      begin
+        DoOutput('usage: ollama show <model>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaShow(Parts[1]);
+    end
+    else if Sub = 'pull' then
+    begin
+      if Parts.Count < 2 then
+      begin
+        DoOutput('usage: ollama pull <model>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaPull(Parts[1]);
+    end
+    else if (Sub = 'rm') or (Sub = 'delete') then
+    begin
+      if Parts.Count < 2 then
+      begin
+        DoOutput('usage: ollama rm <model>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaRm(Parts[1]);
+    end
+    else if Sub = 'stop' then
+    begin
+      if Parts.Count < 2 then
+      begin
+        DoOutput('usage: ollama stop <model>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaStop(Parts[1]);
+    end
+    else if Sub = 'load' then
+    begin
+      if Parts.Count < 2 then
+      begin
+        DoOutput('usage: ollama load <model>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaLoad(Parts[1]);
+    end
+    else if Sub = 'unload' then
+    begin
+      if Parts.Count < 2 then
+      begin
+        DoOutput('usage: ollama unload <model>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaUnload(Parts[1]);
+    end
+    else if Sub = 'copy' then
+    begin
+      if Parts.Count < 3 then
+      begin
+        DoOutput('usage: ollama copy <source> <destination>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaCopy(Parts[1], Parts[2]);
+    end
+    else if Sub = 'create' then
+    begin
+      if Parts.Count < 3 then
+      begin
+        DoOutput('usage: ollama create <name> <modelfile-path>' + LineEnding, True);
+        Exit;
+      end;
+      HandleOllamaCreate(Parts[1], Parts[2]);
+    end
+    else if (Sub = 'version') or (Sub = '--version') or (Sub = '-v') then
+      HandleOllamaVersion
+    else if (Sub = 'help') or (Sub = '--help') or (Sub = '-h') then
+      HandleOllamaHelp
+    else
+    begin
+      DoOutput('error: unknown ollama subcommand: ' + Sub + LineEnding, True);
+      DoOutput('use "ollama help" for the full list' + LineEnding, True);
+    end;
+  finally
+    Parts.Free;
+  end;
+end;
+
+procedure TCustomTermManager.HandleOllamaList;
+var
+  Mgr: TCustomOllamaManager;
+  PrevRefreshed: TModelsRefreshedEvent;
+  PrevError: TOllamaErrorEvent;
+  I: integer;
+begin
+  Mgr := FAgent.OllamaManager;
+  if not Mgr.Active then
+  begin
+    DoOutput('error: OllamaManager is inactive, enable with "set active on"' + LineEnding, True);
+    Exit;
+  end;
+  DoOutput('Fetching model list from ' + Mgr.BaseURL + ' ...' + LineEnding, False);
+  PrevRefreshed := Mgr.OnModelsRefreshed;
+  PrevError := Mgr.OnError;
+  Mgr.OnModelsRefreshed := @HandleOllamaModelsRefreshed;
+  Mgr.OnError := @HandleOllamaError;
+  try
+    FOllamaWaitModel := '';
+    FOllamaOpDone := False;
+    FOllamaOpKind := oekNone;
+    FOllamaOpError := '';
+    Mgr.RefreshModels;
+    if not WaitOllamaOp(15000) then
+    begin
+      DoOutput('error: timeout waiting for model list' + LineEnding, True);
+      Exit;
+    end;
+  finally
+    Mgr.OnModelsRefreshed := PrevRefreshed;
+    Mgr.OnError := PrevError;
+  end;
+  if FOllamaOpKind <> oekNone then
+  begin
+    DoOutput('error: ' + FOllamaOpError + LineEnding, True);
+    Exit;
+  end;
+  if Mgr.InstalledModels.Count = 0 then
+  begin
+    DoOutput('(no models installed)' + LineEnding, False);
+    Exit;
+  end;
+  DoOutput(Format('Installed models (%d):', [Mgr.InstalledModels.Count]) + LineEnding, False);
+  for I := 0 to Mgr.InstalledModels.Count - 1 do
+    DoOutput('  ' + Mgr.InstalledModels[I] + LineEnding, False);
+end;
+
+function TCustomTermManager.BytesToHumanText(const ABytes: int64): string;
+begin
+  if ABytes >= int64(1024) * 1024 * 1024 then
+    Result := FormatFloat('0.0', ABytes / (1024.0 * 1024 * 1024)) + ' GB'
+  else if ABytes >= 1024 * 1024 then
+    Result := FormatFloat('0.0', ABytes / (1024.0 * 1024)) + ' MB'
+  else if ABytes >= 1024 then
+    Result := FormatFloat('0.0', ABytes / 1024.0) + ' KB'
+  else
+    Result := IntToStr(ABytes) + ' B';
+end;
+
+procedure TCustomTermManager.HandleOllamaPs;
+var
+  Mgr: TCustomOllamaManager;
+  PrevRefreshed: TModelsRefreshedEvent;
+  PrevError: TOllamaErrorEvent;
+  I: integer;
+  ModelName, Json, ExpiresAt, SizeStr, Processor, AUntil: string;
+  Data: TJSONData;
+  Obj: TJSONObject;
+  Size, SizeVram: int64;
+  VramPct, CpuPct: integer;
+
+// Human readable time until the model is unloaded, e.g. "4 minutes"
+  function FormatUntil(const AExpiresAt: string): string;
+  var
+    Y, M, D, H, Mn, S: integer;
+    ExpiresDate: TDateTime;
+    DiffDays: double;
+  begin
+    if AExpiresAt = '' then
+      Exit('unknown');
+    // Ollama emits YYYY-MM-DDTHH:MM:SS.nnnnnnnnn+HH:MM, ISO8601ToDate in FPC
+    // does not accept 9 fractional digits or numeric timezone offsets,
+    // so parse the fixed-width prefix manually and ignore fractional part
+    if Length(AExpiresAt) < 19 then
+      Exit(AExpiresAt);
+    Y := StrToIntDef(Copy(AExpiresAt, 1, 4), -1);
+    M := StrToIntDef(Copy(AExpiresAt, 6, 2), -1);
+    D := StrToIntDef(Copy(AExpiresAt, 9, 2), -1);
+    H := StrToIntDef(Copy(AExpiresAt, 12, 2), -1);
+    Mn := StrToIntDef(Copy(AExpiresAt, 15, 2), -1);
+    S := StrToIntDef(Copy(AExpiresAt, 18, 2), -1);
+    if (Y < 2000) or (M < 1) or (M > 12) or (D < 1) or (D > 31) or (H < 0) or (H > 23) or (Mn < 0) or
+      (Mn > 59) or (S < 0) or (S > 60) then
+      Exit(AExpiresAt);
+    try
+      ExpiresDate := EncodeDateTime(Y, M, D, H, Mn, S, 0);
+    except
+      Exit(AExpiresAt);
+    end;
+    // Ollama returns UTC, Now is local, compare in UTC to stay consistent
+    DiffDays := ExpiresDate - LocalTimeToUniversal(Now);
+    // keep_alive of -1 makes Ollama report a date far in the future
+    if DiffDays > 365 then
+      Exit('never');
+    if DiffDays <= 0 then
+      Exit('expiring');
+    if DiffDays < 1 / 24 / 60 then
+      Result := '< 1 minute'
+    else if DiffDays < 1 / 24 then
+      Result := Format('%d minutes', [Round(DiffDays * 24 * 60)])
+    else if DiffDays < 1 then
+      Result := Format('%d hours', [Round(DiffDays * 24)])
+    else
+      Result := Format('%d days', [Round(DiffDays)]);
+  end;
+
+begin
+  Mgr := FAgent.OllamaManager;
+  if not Mgr.Active then
+  begin
+    DoOutput('error: OllamaManager is inactive, enable with "set active on"' + LineEnding, True);
+    Exit;
+  end;
+  DoOutput('Fetching running models from ' + Mgr.BaseURL + ' ...' + LineEnding, False);
+  PrevRefreshed := Mgr.OnModelsRefreshed;
+  PrevError := Mgr.OnError;
+  Mgr.OnModelsRefreshed := @HandleOllamaModelsRefreshed;
+  Mgr.OnError := @HandleOllamaError;
+  try
+    FOllamaWaitModel := '';
+    FOllamaOpDone := False;
+    FOllamaOpKind := oekNone;
+    FOllamaOpError := '';
+    Mgr.RefreshModels;
+    if not WaitOllamaOp(15000) then
+    begin
+      DoOutput('error: timeout waiting for running models' + LineEnding, True);
+      Exit;
+    end;
+  finally
+    Mgr.OnModelsRefreshed := PrevRefreshed;
+    Mgr.OnError := PrevError;
+  end;
+  if FOllamaOpKind <> oekNone then
+  begin
+    DoOutput('error: ' + FOllamaOpError + LineEnding, True);
+    Exit;
+  end;
+  if Mgr.RunningModels.Count = 0 then
+  begin
+    DoOutput('(no running models)' + LineEnding, False);
+    Exit;
+  end;
+  // Header aligned with the CLI: NAME SIZE PROCESSOR UNTIL
+  DoOutput(Format('%-28s %-10s %-16s %s', ['NAME', 'SIZE', 'PROCESSOR', 'UNTIL']) + LineEnding, False);
+  for I := 0 to Mgr.RunningModels.Count - 1 do
+  begin
+    ModelName := Mgr.RunningModels[I];
+    Json := Mgr.GetRunningModelJson(ModelName);
+    Size := 0;
+    SizeVram := 0;
+    ExpiresAt := '';
+    SizeStr := 'unknown';
+    Processor := 'unknown';
+    AUntil := 'unknown';
+    if Json <> '' then
+    begin
+      Data := nil;
+      try
+        try
+          Data := GetJSON(Json);
+        except
+          Data := nil;
+        end;
+        if (Data <> nil) and (Data.JSONType = jtObject) then
+        begin
+          Obj := TJSONObject(Data);
+          Size := Obj.Get('size', int64(0));
+          SizeVram := Obj.Get('size_vram', int64(0));
+          ExpiresAt := Obj.Get('expires_at', '');
+          if Size > 0 then
+          begin
+            SizeStr := BytesToHumanText(Size);
+            if SizeVram >= Size then
+              Processor := '100% GPU'
+            else if SizeVram <= 0 then
+              Processor := '100% CPU'
+            else
+            begin
+              VramPct := Round(SizeVram * 100 / Size);
+              CpuPct := 100 - VramPct;
+              Processor := Format('%d%%/%d%% GPU/CPU', [VramPct, CpuPct]);
+            end;
+          end;
+          AUntil := FormatUntil(ExpiresAt);
+        end;
+      finally
+        Data.Free;
+      end;
+    end;
+    DoOutput(Format('%-28s %-10s %-16s %s', [ModelName, SizeStr, Processor, AUntil]) + LineEnding, False);
+  end;
+end;
+
+procedure TCustomTermManager.HandleOllamaShow(const AModel: string);
+var
+  Json, ErrMsg: string;
+  Kind: TOllamaErrorKind;
+  Data: TJSONData;
+begin
+  DoOutput('Fetching info for ' + AModel + ' ...' + LineEnding, False);
+  Json := FAgent.OllamaManager.ShowModel(AModel, Kind, ErrMsg);
+  if Kind <> oekNone then
+  begin
+    DoOutput('error: ' + ErrMsg + LineEnding, True);
+    Exit;
+  end;
+  Data := nil;
+  try
+    try
+      Data := GetJSON(Json);
+    except
+      Data := nil;
+    end;
+    if Data <> nil then
+      DoOutput(Data.FormatJSON + LineEnding, False)
+    else
+      DoOutput(Json + LineEnding, False);
+  finally
+    Data.Free;
+  end;
+end;
+
+procedure TCustomTermManager.HandleOllamaPull(const AModel: string);
+var
+  Mgr: TCustomOllamaManager;
+  PrevProgress: TPullProgressEvent;
+  PrevRefreshed: TModelsRefreshedEvent;
+  PrevError: TOllamaErrorEvent;
+  LastActivityTick: QWord;
+  LastPct: integer;
+begin
+  Mgr := FAgent.OllamaManager;
+  DoOutput('Pulling ' + AModel + ' from ' + Mgr.BaseURL + ' ...' + LineEnding, False);
+  PrevProgress := Mgr.OnPullProgress;
+  PrevRefreshed := Mgr.OnModelsRefreshed;
+  PrevError := Mgr.OnError;
+  Mgr.OnPullProgress := @HandleOllamaPullProgress;
+  Mgr.OnModelsRefreshed := @HandleOllamaModelsRefreshed;
+  Mgr.OnError := @HandleOllamaError;
+  try
+    FOllamaWaitModel := AModel;
+    FOllamaOpDone := False;
+    FOllamaOpKind := oekNone;
+    FOllamaOpError := '';
+    FOllamaPullPct := -1;
+    FOllamaPullLastStep := -1;
+    LastPct := -1;
+    Mgr.PullModel(AModel);
+    LastActivityTick := GetTickCount64;
+    while not FOllamaOpDone do
+    begin
+      CheckSynchronize(50);
+      // Reset inactivity clock whenever progress advances
+      if FOllamaPullPct <> LastPct then
+      begin
+        LastPct := FOllamaPullPct;
+        LastActivityTick := GetTickCount64;
+      end;
+      if GetTickCount64 - LastActivityTick >= QWord(60000) then
+      begin
+        DoOutput('error: no progress from server for 60 seconds' + LineEnding, True);
+        Exit;
+      end;
+    end;
+  finally
+    Mgr.OnPullProgress := PrevProgress;
+    Mgr.OnModelsRefreshed := PrevRefreshed;
+    Mgr.OnError := PrevError;
+  end;
+  if FOllamaOpKind <> oekNone then
+  begin
+    DoOutput('error: ' + FOllamaOpError + LineEnding, True);
+    Exit;
+  end;
+  DoOutput('pull complete: ' + AModel + LineEnding, False);
+end;
+
+procedure TCustomTermManager.HandleOllamaRm(const AModel: string);
+var
+  Mgr: TCustomOllamaManager;
+  PrevError: TOllamaErrorEvent;
+begin
+  Mgr := FAgent.OllamaManager;
+  DoOutput('Deleting ' + AModel + ' ...' + LineEnding, False);
+  PrevError := Mgr.OnError;
+  Mgr.OnError := @HandleOllamaError;
+  try
+    FOllamaWaitModel := '';
+    FOllamaOpDone := False;
+    FOllamaOpKind := oekNone;
+    FOllamaOpError := '';
+    Mgr.DeleteModel(AModel);
+  finally
+    Mgr.OnError := PrevError;
+  end;
+  if FOllamaOpKind <> oekNone then
+  begin
+    DoOutput('error: ' + FOllamaOpError + LineEnding, True);
+    Exit;
+  end;
+  DoOutput('deleted: ' + AModel + LineEnding, False);
+end;
+
+procedure TCustomTermManager.HandleOllamaStop(const AModel: string);
+var
+  Kind: TOllamaErrorKind;
+  ErrMsg: string;
+begin
+  DoOutput('Unloading ' + AModel + ' ...' + LineEnding, False);
+  if FAgent.OllamaManager.UnloadModelSync(AModel, Kind, ErrMsg) then
+    DoOutput('unloaded: ' + AModel + LineEnding, False)
+  else
+    DoOutput('error: ' + ErrMsg + LineEnding, True);
+end;
+
+procedure TCustomTermManager.HandleOllamaLoad(const AModel: string);
+var
+  Kind: TOllamaErrorKind;
+  ErrMsg: string;
+begin
+  DoOutput('Loading ' + AModel + ' into memory ...' + LineEnding, False);
+  if FAgent.OllamaManager.LoadModelSync(AModel, Kind, ErrMsg) then
+    DoOutput('loaded: ' + AModel + LineEnding, False)
+  else
+    DoOutput('error: ' + ErrMsg + LineEnding, True);
+end;
+
+procedure TCustomTermManager.HandleOllamaUnload(const AModel: string);
+begin
+  HandleOllamaStop(AModel);
+end;
+
+procedure TCustomTermManager.HandleOllamaCopy(const ASource, ADest: string);
+var
+  Kind: TOllamaErrorKind;
+  ErrMsg: string;
+begin
+  DoOutput('Copying ' + ASource + ' to ' + ADest + ' ...' + LineEnding, False);
+  if FAgent.OllamaManager.CopyModel(ASource, ADest, Kind, ErrMsg) then
+    DoOutput('copied: ' + ASource + ' -> ' + ADest + LineEnding, False)
+  else
+    DoOutput('error: ' + ErrMsg + LineEnding, True);
+end;
+
+procedure TCustomTermManager.HandleOllamaCreate(const AName, AFile: string);
+var
+  Kind: TOllamaErrorKind;
+  ErrMsg, Content: string;
+begin
+  if not FileExists(AFile) then
+  begin
+    DoOutput('error: file not found: ' + AFile + LineEnding, True);
+    Exit;
+  end;
+  DoOutput('Creating ' + AName + ' from ' + AFile + ' ...' + LineEnding, False);
+  Content := ReadSmallTextFile(AFile);
+  if Content = '' then
+  begin
+    DoOutput('error: cannot read ' + AFile + LineEnding, True);
+    Exit;
+  end;
+  if FAgent.OllamaManager.CreateModel(AName, Content, Kind, ErrMsg) then
+    DoOutput('created: ' + AName + LineEnding, False)
+  else
+    DoOutput('error: ' + ErrMsg + LineEnding, True);
+end;
+
+procedure TCustomTermManager.HandleOllamaVersion;
+var
+  Kind: TOllamaErrorKind;
+  ErrMsg, Ver: string;
+begin
+  Ver := FAgent.OllamaManager.GetVersion(Kind, ErrMsg);
+  if Kind <> oekNone then
+    DoOutput('error: ' + ErrMsg + LineEnding, True)
+  else
+    DoOutput('ollama version: ' + Ver + LineEnding, False);
+end;
+
+procedure TCustomTermManager.HandleOllamaHelp;
+begin
+  DoOutput('Ollama server management through OllamaManager, no external CLI' + LineEnding, False);
+  DoOutput('' + LineEnding, False);
+  DoOutput('  ollama list                        List installed models' + LineEnding, False);
+  DoOutput('  ollama ps                          List running models' + LineEnding, False);
+  DoOutput('  ollama show <model>                Show model details as JSON' + LineEnding, False);
+  DoOutput('  ollama pull <model>                Download model from registry' + LineEnding, False);
+  DoOutput('  ollama rm <model>                  Delete installed model' + LineEnding, False);
+  DoOutput('  ollama load <model>                Load model into memory' + LineEnding, False);
+  DoOutput('  ollama unload <model>              Unload model from memory' + LineEnding, False);
+  DoOutput('  ollama stop <model>                Alias for unload' + LineEnding, False);
+  DoOutput('  ollama copy <source> <dest>        Copy model under a new name' + LineEnding, False);
+  DoOutput('  ollama create <name> <file>        Create model from Modelfile' + LineEnding, False);
+  DoOutput('  ollama version                     Show server version' + LineEnding, False);
+  DoOutput('  ollama help                        This help' + LineEnding, False);
+  DoOutput('' + LineEnding, False);
+  DoOutput('All commands use the configured BaseURL, no shell invocation' + LineEnding, False);
 end;
 
 procedure TCustomTermManager.HandleModelsCommand(const AArg: string);
