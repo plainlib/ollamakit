@@ -11,20 +11,81 @@ unit TermManager;
 interface
 
 uses
-  Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser,
+  Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser, TypInfo,
   OllamaAgent, AgentConfig{$IFDEF WINDOWS}, Windows{$ENDIF};
 
 type
   // Classification of a single input line
   TTermInputKind = (tikEmpty, tikBuiltin, tikCommand, tikAgent);
 
-  // Semantic color roles for console output, mapped to platform primitives
-  TTermColor = (tcDefault, tcDim, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge);
+  // Standard 16-color Windows console palette
+  TConsoleColor = (
+    // Standard colors, 0 to 7
+    ccBlack, ccRed, ccGreen, ccYellow, ccBlue, ccMagenta, ccCyan, ccLightGray,
+    // Bright colors, 8 to 15
+    ccDarkGray, ccLightRed, ccLightGreen, ccLightYellow, ccLightBlue,
+    ccLightMagenta, ccLightCyan, ccWhite
+    );
+
+  // Semantic color roles used by terminal output
+  TTermColor = (tcDefault, tcDim, tcWelcome, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge);
 
   TTermRouteEvent = procedure(Sender: TObject; const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean) of object;
   TTermOutputEvent = procedure(Sender: TObject; const AText: string; AIsStderr: boolean) of object;
   TTermAgentEvent = procedure(Sender: TObject; const AText: string) of object;
   TTermExitEvent = procedure(Sender: TObject; AExitCode: integer) of object;
+
+type
+  // Foreground and background pair for a single badge style
+  TConsoleColorPair = class(TPersistent)
+  private
+    FBackground: TConsoleColor;
+    FForeground: TConsoleColor;
+  public
+    constructor Create;
+    procedure Assign(Source: TPersistent); override;
+  published
+    // Background color, ccBlack keeps the terminal default background
+    property Background: TConsoleColor read FBackground write FBackground default ccBlack;
+    // Foreground color for badge text
+    property Foreground: TConsoleColor read FForeground write FForeground default ccWhite;
+  end;
+
+  // Full color palette used by TermManager output
+  TTermColorScheme = class(TPersistent)
+  private
+    FDefaultText: TConsoleColor;
+    FThinkingText: TConsoleColor;
+    FWelcomeBadge: TConsoleColorPair;
+    FThinkingBadge: TConsoleColorPair;
+    FToolBadge: TConsoleColorPair;
+    FErrorBadge: TConsoleColorPair;
+    FWarnBadge: TConsoleColorPair;
+    procedure SetWelcomeBadge(const AValue: TConsoleColorPair);
+    procedure SetThinkingBadge(const AValue: TConsoleColorPair);
+    procedure SetToolBadge(const AValue: TConsoleColorPair);
+    procedure SetErrorBadge(const AValue: TConsoleColorPair);
+    procedure SetWarnBadge(const AValue: TConsoleColorPair);
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Assign(Source: TPersistent); override;
+  published
+    // Color of regular output such as prompt, model answers and command output
+    property DefaultText: TConsoleColor read FDefaultText write FDefaultText default ccWhite;
+    // Color of agent thinking text, shown between thinking badges
+    property ThinkingText: TConsoleColor read FThinkingText write FThinkingText default ccLightGray;
+    // Badge style for the welcome banner, empty background keeps terminal default
+    property WelcomeBadge: TConsoleColorPair read FWelcomeBadge write SetWelcomeBadge;
+    // Badge style for the [Thinking] label
+    property ThinkingBadge: TConsoleColorPair read FThinkingBadge write SetThinkingBadge;
+    // Badge style for tool call labels like [exec_command: dir]
+    property ToolBadge: TConsoleColorPair read FToolBadge write SetToolBadge;
+    // Badge style for error messages
+    property ErrorBadge: TConsoleColorPair read FErrorBadge write SetErrorBadge;
+    // Badge style for warning messages such as max steps reached
+    property WarnBadge: TConsoleColorPair read FWarnBadge write SetWarnBadge;
+  end;
 
   TCustomTermManager = class(TComponent)
   private
@@ -43,6 +104,8 @@ type
     FStripEmoji: boolean;
     // Colorize badges and thinking text when console supports attributes
     FColorOutput: boolean;
+    // Semantic color palette for output
+    FColors: TTermColorScheme;
     FBuiltinCommands: TStringList;
     FHistory: TStringList;
     FHistoryMax: integer;
@@ -75,7 +138,7 @@ type
     procedure SetPath(const AValue: string);
     procedure SetAgent(const AValue: TCustomOllamaAgent);
     procedure SetHistory(const AValue: TStringList);
-    function BuildToolsList(AFeatures: TAgentFeatures): string;
+    procedure SetColors(const AValue: TTermColorScheme);
     // Handles help, help agent, and ? alias
     procedure HandleHelpCommand(const AArg: string);
     // Handles set <name> <value>
@@ -153,6 +216,7 @@ type
     property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
     property ColorOutput: boolean read FColorOutput write FColorOutput default True;
+    property Colors: TTermColorScheme read FColors write SetColors;
     property BuiltinCommands: TStringList read FBuiltinCommands;
     property HistoryMax: integer read FHistoryMax write FHistoryMax default 200;
     property ShellExec: string read FShellExec write FShellExec;
@@ -189,6 +253,8 @@ type
     property StripEmoji;
     // Colorize badges and thinking text when console supports attributes
     property ColorOutput;
+    // Semantic color palette for output, expand to customize each role
+    property Colors;
     // Commands executed internally without invoking the shell, extend to add your own
     property BuiltinCommands;
     // Maximum number of input lines kept in history, oldest are dropped first
@@ -319,6 +385,107 @@ begin
   Result := UTF8Encode(Filtered);
 end;
 
+{ TConsoleColorPair }
+
+constructor TConsoleColorPair.Create;
+begin
+  inherited Create;
+  FBackground := ccBlack;
+  FForeground := ccWhite;
+end;
+
+procedure TConsoleColorPair.Assign(Source: TPersistent);
+var
+  Src: TConsoleColorPair;
+begin
+  if Source is TConsoleColorPair then
+  begin
+    Src := TConsoleColorPair(Source);
+    FBackground := Src.FBackground;
+    FForeground := Src.FForeground;
+  end
+  else
+    inherited Assign(Source);
+end;
+
+{ TTermColorScheme }
+
+constructor TTermColorScheme.Create;
+begin
+  inherited Create;
+  FDefaultText := ccWhite;
+  FThinkingText := ccLightGray;
+  FWelcomeBadge := TConsoleColorPair.Create;
+  FWelcomeBadge.Background := ccBlack;
+  FWelcomeBadge.Foreground := ccWhite;
+  FThinkingBadge := TConsoleColorPair.Create;
+  FThinkingBadge.Background := ccDarkGray;
+  FThinkingBadge.Foreground := ccWhite;
+  FToolBadge := TConsoleColorPair.Create;
+  FToolBadge.Background := ccBlue;
+  FToolBadge.Foreground := ccWhite;
+  FErrorBadge := TConsoleColorPair.Create;
+  FErrorBadge.Background := ccRed;
+  FErrorBadge.Foreground := ccWhite;
+  FWarnBadge := TConsoleColorPair.Create;
+  FWarnBadge.Background := ccYellow;
+  FWarnBadge.Foreground := ccWhite;
+end;
+
+destructor TTermColorScheme.Destroy;
+begin
+  FWelcomeBadge.Free;
+  FThinkingBadge.Free;
+  FToolBadge.Free;
+  FErrorBadge.Free;
+  FWarnBadge.Free;
+  inherited Destroy;
+end;
+
+procedure TTermColorScheme.SetWelcomeBadge(const AValue: TConsoleColorPair);
+begin
+  FWelcomeBadge.Assign(AValue);
+end;
+
+procedure TTermColorScheme.SetThinkingBadge(const AValue: TConsoleColorPair);
+begin
+  FThinkingBadge.Assign(AValue);
+end;
+
+procedure TTermColorScheme.SetToolBadge(const AValue: TConsoleColorPair);
+begin
+  FToolBadge.Assign(AValue);
+end;
+
+procedure TTermColorScheme.SetErrorBadge(const AValue: TConsoleColorPair);
+begin
+  FErrorBadge.Assign(AValue);
+end;
+
+procedure TTermColorScheme.SetWarnBadge(const AValue: TConsoleColorPair);
+begin
+  FWarnBadge.Assign(AValue);
+end;
+
+procedure TTermColorScheme.Assign(Source: TPersistent);
+var
+  Src: TTermColorScheme;
+begin
+  if Source is TTermColorScheme then
+  begin
+    Src := TTermColorScheme(Source);
+    FDefaultText := Src.FDefaultText;
+    FThinkingText := Src.FThinkingText;
+    FWelcomeBadge.Assign(Src.FWelcomeBadge);
+    FThinkingBadge.Assign(Src.FThinkingBadge);
+    FToolBadge.Assign(Src.FToolBadge);
+    FErrorBadge.Assign(Src.FErrorBadge);
+    FWarnBadge.Assign(Src.FWarnBadge);
+  end
+  else
+    inherited Assign(Source);
+end;
+
 { TCustomTermManager }
 
 constructor TCustomTermManager.Create(AOwner: TComponent);
@@ -334,6 +501,7 @@ begin
   FLastCharWasNewLine := True;
   FStripEmoji := True;
   FColorOutput := True;
+  FColors := TTermColorScheme.Create;
   FAgent := nil;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
@@ -373,6 +541,7 @@ end;
 destructor TCustomTermManager.Destroy;
 begin
   SetAgent(nil);
+  FColors.Free;
   FHistory.Free;
   FBuiltinCommands.Free;
   inherited Destroy;
@@ -448,6 +617,12 @@ begin
   FHistory.Assign(AValue);
 end;
 
+procedure TCustomTermManager.SetColors(const AValue: TTermColorScheme);
+begin
+  if Assigned(AValue) and (AValue <> FColors) then
+    FColors.Assign(AValue);
+end;
+
 procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
 begin
   // Close thinking block if open, this also resets color
@@ -479,7 +654,7 @@ begin
   begin
     SetColor(tcThinkingBadge);
     WriteLine(FThinkingLabel, True);
-    // Switch to dim text for the reasoning body
+    // Switch to thinking text color for the reasoning body
     SetColor(tcDim);
     FInThinking := True;
   end;
@@ -556,6 +731,8 @@ var
   Streamed: boolean;
 begin
   CloseThinking;
+  // Guarantee default color even if CloseThinking was bypassed
+  SetColor(tcDefault);
   Streamed := Assigned(FAgent) and FAgent.Streaming;
   case AReason of
     afrSuccess:
@@ -936,34 +1113,6 @@ begin
     DoOutput('Unknown builtin: ' + Cmd + LineEnding, True);
 end;
 
-// Returns comma separated short tool names for display in help
-function TCustomTermManager.BuildToolsList(AFeatures: TAgentFeatures): string;
-var
-  Parts: TStringList;
-begin
-  Parts := TStringList.Create;
-  try
-    if afFileTools in AFeatures then
-      Parts.Add('filetools');
-    if afExecCommand in AFeatures then
-      Parts.Add('exec');
-    if afGit in AFeatures then
-      Parts.Add('git');
-    if afInteractive in AFeatures then
-      Parts.Add('interactive');
-    if afFinish in AFeatures then
-      Parts.Add('finish');
-    if afWebTools in AFeatures then
-      Parts.Add('web');
-    if Parts.Count = 0 then
-      Result := 'none'
-    else
-      Result := StringReplace(Parts.CommaText, ',', ', ', [rfReplaceAll]);
-  finally
-    Parts.Free;
-  end;
-end;
-
 procedure TCustomTermManager.HandleHelpCommand(const AArg: string);
 var
   Topic, CommandsList: string;
@@ -978,6 +1127,26 @@ var
     while Length(Pad) < 38 do
       Pad := Pad + ' ';
     DoOutput(Pad + AValue + '  (' + ADesc + ')' + LineEnding, False);
+  end;
+
+  // Returns comma separated short tool names for display in help
+  function BuildToolsList(AFeatures: TAgentFeatures): string;
+  var
+    Parts: TStringList;
+    F: TAgentFeature;
+  begin
+    Parts := TStringList.Create;
+    try
+      for F := Low(TAgentFeature) to High(TAgentFeature) do
+        if F in AFeatures then
+          Parts.Add(LowerCase(Copy(GetEnumName(TypeInfo(TAgentFeature), Ord(F)), 3, MaxInt)));
+      if Parts.Count = 0 then
+        Result := 'none'
+      else
+        Result := StringReplace(Parts.CommaText, ',', ', ', [rfReplaceAll]);
+    finally
+      Parts.Free;
+    end;
   end;
 
 begin
@@ -1037,7 +1206,7 @@ end;
 procedure TCustomTermManager.HandleSetCommand(const AArg: string);
 var
   P: integer;
-  AName, Value, ErrMsg: string;
+  PropName, PropValue, ErrMsg: string;
 begin
   if Trim(AArg) = '' then
   begin
@@ -1048,16 +1217,16 @@ begin
   P := Pos(' ', AArg);
   if P > 0 then
   begin
-    AName := Copy(AArg, 1, P - 1);
-    Value := Trim(Copy(AArg, P + 1, MaxInt));
+    PropName := Copy(AArg, 1, P - 1);
+    PropValue := Trim(Copy(AArg, P + 1, MaxInt));
   end
   else
   begin
-    AName := Trim(AArg);
-    Value := '';
+    PropName := Trim(AArg);
+    PropValue := '';
   end;
-  if SetAgentProperty(FAgent, AName, Value, ErrMsg) then
-    DoOutput(AName + ' = ' + Value + LineEnding, False)
+  if SetAgentProperty(FAgent, PropName, PropValue, ErrMsg) then
+    DoOutput(PropName + ' = ' + PropValue + LineEnding, False)
   else
     DoOutput('error: ' + ErrMsg + LineEnding, True);
 end;
@@ -1106,7 +1275,7 @@ begin
     DoOutput('error: agent has no OllamaManager' + LineEnding, True);
     Exit;
   end;
-  // "models" refreshes from the server, "models cached" would use /api/ps only
+  // "models" always refreshes from the server
   if LowerCase(Trim(AArg)) <> '' then
     DoOutput('tip: models always refreshes from ' + FAgent.OllamaManager.BaseURL + LineEnding, True);
   DoOutput('Querying ' + FAgent.OllamaManager.BaseURL + ' ...' + LineEnding, False);
@@ -1405,11 +1574,15 @@ begin
   if InModeSaved then
     SetConsoleMode(InHandle, InMode and not (ENABLE_ECHO_INPUT or ENABLE_LINE_INPUT or ENABLE_PROCESSED_INPUT));
   {$ENDIF}
-  // Start with explicit bright white so prompt and banner match tcDefault
+  // Start with explicit default color so prompt and banner match scheme
   SetColor(tcDefault);
-  // Print banner once before the loop if host configured one
+  // Print banner in welcome color, then restore default for prompt
   if FWelcome <> '' then
+  begin
+    SetColor(tcWelcome);
     DoOutput(FWelcome + LineEnding, False);
+    SetColor(tcDefault);
+  end;
   FRunning := True;
   FLastExitCode := 0;
   try
@@ -1481,6 +1654,7 @@ begin
               FPrevAgentOnExecCommand := nil;
               FPrevAgentOnAskUser := nil;
               FInThinking := False;
+              SetColor(tcDefault);
             end;
           end
           else
@@ -1506,20 +1680,32 @@ end;
 
 {$IFDEF WINDOWS}
 
+// Maps palette color to Windows foreground attribute bits
+function ColorToAttr(AColor: TConsoleColor): Word;
 const
-  // Bright white for regular output, easy to read on dark backgrounds
-  CLR_DEFAULT = FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or
-    FOREGROUND_INTENSITY;
-  // Silver light gray for thinking text, contrasts with default white
-  CLR_DIM     = FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE;
-  // Badges use dark background with bright white text for readability
-  CLR_BADGE_THINKING = BACKGROUND_INTENSITY or FOREGROUND_RED or
-    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
-  CLR_BADGE_TOOL = BACKGROUND_BLUE or FOREGROUND_RED or
-    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
-  CLR_BADGE_ERROR = BACKGROUND_RED or FOREGROUND_RED or
-    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY;
-  CLR_BADGE_WARN = BACKGROUND_RED or BACKGROUND_GREEN;
+  MAP: array[TConsoleColor] of Word = (
+    // Standard colors, 0 to 7
+    0,                                                     // ccBlack
+    FOREGROUND_RED,                                        // ccRed
+    FOREGROUND_GREEN,                                      // ccGreen
+    FOREGROUND_RED or FOREGROUND_GREEN,                    // ccYellow
+    FOREGROUND_BLUE,                                       // ccBlue
+    FOREGROUND_RED or FOREGROUND_BLUE,                     // ccMagenta
+    FOREGROUND_GREEN or FOREGROUND_BLUE,                   // ccCyan
+    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE, // ccLightGray
+    // Bright colors, 8 to 15
+    FOREGROUND_INTENSITY,                                  // ccDarkGray
+    FOREGROUND_RED or FOREGROUND_INTENSITY,                // ccLightRed
+    FOREGROUND_GREEN or FOREGROUND_INTENSITY,              // ccLightGreen
+    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_INTENSITY, // ccLightYellow
+    FOREGROUND_BLUE or FOREGROUND_INTENSITY,               // ccLightBlue
+    FOREGROUND_RED or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightMagenta
+    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightCyan
+    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY // ccWhite
+  );
+begin
+  Result := MAP[AColor];
+end;
 
 // Applies console text attribute directly, ignored for redirected handles
 procedure SetConsoleColor(AAttr: Word);
@@ -1533,17 +1719,25 @@ end;
 procedure TCustomTermManager.SetColor(AColor: TTermColor);
 var
   Attr: Word;
+
+  // Combines background and foreground of a pair into a single attribute
+  function PairAttr(const APair: TConsoleColorPair): Word;
+  begin
+    Result := (ColorToAttr(APair.Background) shl 4) or ColorToAttr(APair.Foreground);
+  end;
+
 begin
   if not FColorOutput then
     Exit;
   case AColor of
-    tcDim: Attr := CLR_DIM;
-    tcThinkingBadge: Attr := CLR_BADGE_THINKING;
-    tcToolBadge: Attr := CLR_BADGE_TOOL;
-    tcErrorBadge: Attr := CLR_BADGE_ERROR;
-    tcWarnBadge: Attr := CLR_BADGE_WARN;
+    tcDim: Attr := ColorToAttr(FColors.ThinkingText);
+    tcWelcome: Attr := PairAttr(FColors.WelcomeBadge);
+    tcThinkingBadge: Attr := PairAttr(FColors.ThinkingBadge);
+    tcToolBadge: Attr := PairAttr(FColors.ToolBadge);
+    tcErrorBadge: Attr := PairAttr(FColors.ErrorBadge);
+    tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
     else
-      Attr := CLR_DEFAULT;
+      Attr := ColorToAttr(FColors.DefaultText);
   end;
   SetConsoleColor(Attr);
 end;
@@ -1842,8 +2036,7 @@ begin
     //   high-byte wrapper ($FFxx) - raw byte sits in the low 8 bits
     //   plain byte       ($00xx) - UTF-8 lead byte sits in the low 8 bits
     // Both need CollectBrokenUtf8 to assemble the full sequence
-    if (Ord(C) >= $FF00) or
-       ((Ord(C) >= $C2) and (Ord(C) <= $F4)) then
+    if (Ord(C) >= $FF00) or ((Ord(C) >= $C2) and (Ord(C) <= $F4)) then
       CollectBrokenUtf8(C);
 
     case Rec.Event.KeyEvent.wVirtualKeyCode of
@@ -1857,13 +2050,11 @@ begin
         if CursorPos > 0 then
         begin
           CursorPos := Utf8PrevPos(Line, CursorPos);
-          Delete(Line, CursorPos + 1,
-            Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+          Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
         end;
       VK_DELETE:
         // Delete current history entry if navigated but not edited
-        if (HistIndex >= 0) and (HistIndex < FHistory.Count) and
-           (Line = FHistory[HistIndex]) then
+        if (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
         begin
           FHistory.Delete(HistIndex);
           if HistIndex > 0 then
@@ -1884,8 +2075,7 @@ begin
           end;
         end
         else if CursorPos < Length(Line) then
-          Delete(Line, CursorPos + 1,
-            Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+          Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
       VK_LEFT:
         if CursorPos > 0 then
           CursorPos := Utf8PrevPos(Line, CursorPos);
