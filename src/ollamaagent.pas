@@ -11,7 +11,7 @@ unit OllamaAgent;
 interface
 
 uses
-  Classes, SysUtils, Controls, fpjson, jsonparser, OllamaManager;
+  Classes, SysUtils, Controls, fpjson, jsonparser, OllamaManager, Network;
 
 type
   // Feature toggles controlled by the Features set property
@@ -27,7 +27,9 @@ type
     // Enable ask_user tool, host shows the question and returns the answer via OnAskUser
     afInteractive,
     // Enable finish tool, model can declare the task complete and return a final message
-    afFinish
+    afFinish,
+    // Enable web tools: web_fetch and web_search, GET only, SSRF safe by default
+    afWebTools
     );
   TAgentFeatures = set of TAgentFeature;
 
@@ -49,6 +51,41 @@ type
 
 type
   TCustomOllamaAgent = class;
+
+  // Web access options used by web_fetch and web_search tools
+  TAgentWebOptions = class(TPersistent)
+  private
+    FSearchUrl: string;
+    FUserAgent: string;
+    FRequestTimeout: integer;
+    FMaxResponseBytes: integer;
+    FStripHtml: boolean;
+    FBlockLocalhost: boolean;
+    FBlockPrivateIPs: boolean;
+    FAllowedHosts: TStringList;
+    procedure SetAllowedHosts(const AValue: TStringList);
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Assign(Source: TPersistent); override;
+  published
+    // URL template for web_search, {query} is replaced with url-encoded text
+    property SearchUrl: string read FSearchUrl write FSearchUrl;
+    // User-Agent header sent with requests, use browser UA to avoid bot blocking
+    property UserAgent: string read FUserAgent write FUserAgent;
+    // Timeout in milliseconds for each web request
+    property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 15000;
+    // Maximum response body size in bytes, longer bodies are truncated
+    property MaxResponseBytes: integer read FMaxResponseBytes write FMaxResponseBytes default 524288;
+    // Strip HTML tags and entities before returning content to the model
+    property StripHtml: boolean read FStripHtml write FStripHtml default True;
+    // Block localhost, 127.0.0.1 and ::1 addresses
+    property BlockLocalhost: boolean read FBlockLocalhost write FBlockLocalhost default True;
+    // Block RFC1918 and link-local private IPv4 addresses
+    property BlockPrivateIPs: boolean read FBlockPrivateIPs write FBlockPrivateIPs default True;
+    // Host whitelist, when empty any host is allowed subject to blocks above
+    property AllowedHosts: TStringList read FAllowedHosts write SetAllowedHosts;
+  end;
 
   // User-defined tool registered in the Tools collection
   TAgentTool = class(TCollectionItem)
@@ -93,6 +130,7 @@ type
     FFeatures: TAgentFeatures;
     FRootPath: string;
     FTools: TAgentTools;
+    FWebOptions: TAgentWebOptions;
     FKeepHistory: boolean;
     FHistory: string;
     FDone: boolean;
@@ -113,6 +151,7 @@ type
     FOnFinish: TAgentFinishEvent;
     procedure SetOllamaManager(const AValue: TOllamaManager);
     procedure SetTools(const AValue: TAgentTools);
+    procedure SetWebOptions(const AValue: TAgentWebOptions);
     function GetRootPath: string;
     procedure SetRootPath(const AValue: string);
     function GetHistory: string;
@@ -148,6 +187,10 @@ type
     function DoGitCommit(AArgs: TJSONObject): string; virtual;
     // Ask user delegates to OnAskUser, host shows the question
     function DoAskUser(AArgs: TJSONObject): string; virtual;
+    // Web tools, GET only, subject to WebOptions restrictions
+    function DoWebFetchInternal(const AUrl: string; out AContent, AErrorMsg: string): boolean; virtual;
+    function DoWebFetch(AArgs: TJSONObject): string; virtual;
+    function DoWebSearch(AArgs: TJSONObject): string; virtual;
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -188,6 +231,7 @@ type
     property Features: TAgentFeatures read FFeatures write FFeatures default [afStreaming, afFileTools];
     property RootPath: string read GetRootPath write SetRootPath;
     property Tools: TAgentTools read FTools write SetTools;
+    property WebOptions: TAgentWebOptions read FWebOptions write SetWebOptions;
     property KeepHistory: boolean read FKeepHistory write FKeepHistory default False;
     property Log: boolean read FLog write FLog default False;
     property OnRoute: TAgentRouteEvent read FOnRoute write FOnRoute;
@@ -213,12 +257,14 @@ type
     property MaxSteps;
     // Per-request timeout in ms, 0 means use OllamaManager default
     property RequestTimeout;
-    // Feature toggles for streaming, file tools and shell execution
+    // Feature toggles for streaming, file tools, shell, git, web and interactive tools
     property Features;
     // Sandbox directory for file tools, empty means process cwd
     property RootPath;
     // Collection of user-defined tools
     property Tools;
+    // Web tools configuration, expand to adjust search URL, timeout, whitelist
+    property WebOptions;
     // When True, messages persist between RunAsync calls
     property KeepHistory;
     // When True, the agent logs every step and event to stderr
@@ -244,7 +290,7 @@ type
 implementation
 
 uses
-  FileUtil, Math, RegExpr;
+  FileUtil, Math, RegExpr, httpsend, blcksock;
 
 // Returns display name for an agent operation kind
 function AgentOpName(AOp: TAgentOperation): string;
@@ -337,6 +383,260 @@ begin
     Exit(True);
   {$ENDIF}
   Result := (Length(APath) >= 1) and (APath[1] in [PathDelim, '/']);
+end;
+
+// Returns position of ASubstr in AText starting at AStart, or 0 when not found
+function PosFrom(const ASubstr, AText: string; AStart: integer): integer;
+var
+  Partial: string;
+begin
+  if AStart < 1 then
+    AStart := 1;
+  if AStart > Length(AText) then
+    Exit(0);
+  Partial := Copy(AText, AStart, MaxInt);
+  Result := Pos(ASubstr, Partial);
+  if Result > 0 then
+    Result := Result + AStart - 1;
+end;
+
+// Percent-encodes a string for use in URL query values
+function UrlEncode(const S: string): string;
+const
+  HEX = '0123456789ABCDEF';
+var
+  I: integer;
+  C: byte;
+begin
+  Result := '';
+  for I := 1 to Length(S) do
+  begin
+    C := Ord(S[I]);
+    if ((C >= Ord('a')) and (C <= Ord('z'))) or ((C >= Ord('A')) and (C <= Ord('Z'))) or
+      ((C >= Ord('0')) and (C <= Ord('9'))) or (C in [Ord('-'), Ord('_'), Ord('.'), Ord('~')]) then
+      Result := Result + Chr(C)
+    else if C = Ord(' ') then
+      Result := Result + '+'
+    else
+      Result := Result + '%' + HEX[(C shr 4) + 1] + HEX[(C and $F) + 1];
+  end;
+end;
+
+// Returns True for localhost names and loopback addresses
+function IsLocalhostHost(const AHost: string): boolean;
+var
+  H: string;
+begin
+  H := LowerCase(Trim(AHost));
+  Result := (H = 'localhost') or (H = 'localhost.localdomain') or (H = '127.0.0.1') or (H = '0.0.0.0') or
+    (H = '::1') or (Copy(H, 1, 4) = '127.');
+end;
+
+// Returns True for RFC1918 private and link-local IPv4 addresses
+function IsPrivateIPv4(const AHost: string): boolean;
+var
+  Octet1, Octet2, P: integer;
+  Rest: string;
+begin
+  Result := False;
+  P := Pos('.', AHost);
+  if P = 0 then
+    Exit;
+  Octet1 := StrToIntDef(Copy(AHost, 1, P - 1), -1);
+  if Octet1 < 0 then
+    Exit;
+  Rest := Copy(AHost, P + 1, MaxInt);
+  P := Pos('.', Rest);
+  if P = 0 then
+    Exit;
+  Octet2 := StrToIntDef(Copy(Rest, 1, P - 1), -1);
+  if Octet2 < 0 then
+    Exit;
+  if Octet1 = 10 then
+    Exit(True);
+  if (Octet1 = 172) and (Octet2 >= 16) and (Octet2 <= 31) then
+    Exit(True);
+  if (Octet1 = 192) and (Octet2 = 168) then
+    Exit(True);
+  if (Octet1 = 169) and (Octet2 = 254) then
+    Exit(True);
+end;
+
+// Validates http or https URL and extracts the host into AHost
+function IsSafeHttpUrl(const AUrl: string; out AHost: string): boolean;
+var
+  U: string;
+  P: integer;
+begin
+  Result := False;
+  AHost := '';
+  U := LowerCase(Trim(AUrl));
+  if Copy(U, 1, 7) = 'http://' then
+    U := Copy(U, 8, MaxInt)
+  else if Copy(U, 1, 8) = 'https://' then
+    U := Copy(U, 9, MaxInt)
+  else
+    Exit;
+  P := 1;
+  while (P <= Length(U)) and not (U[P] in ['/', '?', '#', ':']) do
+    Inc(P);
+  AHost := Copy(U, 1, P - 1);
+  Result := AHost <> '';
+end;
+
+// Strips HTML tags, script and style blocks, decodes common entities
+function StripHtmlTags(const AHtml: string): string;
+var
+  I, P: integer;
+  LowerHtml: string;
+  InSkip: boolean;
+
+// Skips the current element until its closing tag
+  function SkipUntilClosing(const AOpenTag, ACloseTag: string): boolean;
+  var
+    ClosePos, EndPos: integer;
+  begin
+    Result := False;
+    if Copy(LowerHtml, I, Length(AOpenTag)) <> AOpenTag then
+      Exit;
+    ClosePos := PosFrom(ACloseTag, LowerHtml, I);
+    if ClosePos = 0 then
+      Exit;
+    EndPos := PosFrom('>', AHtml, ClosePos);
+    if EndPos = 0 then
+      EndPos := Length(AHtml);
+    I := EndPos + 1;
+    Result := True;
+  end;
+
+begin
+  Result := '';
+  LowerHtml := LowerCase(AHtml);
+  I := 1;
+  InSkip := False;
+  while I <= Length(AHtml) do
+  begin
+    if AHtml[I] = '<' then
+    begin
+      InSkip := SkipUntilClosing('<script', '</script');
+      if InSkip then
+        Continue;
+      InSkip := SkipUntilClosing('<style', '</style');
+      if InSkip then
+        Continue;
+      P := PosFrom('>', AHtml, I);
+      if P > 0 then
+      begin
+        I := P + 1;
+        Continue;
+      end;
+    end;
+    Result := Result + AHtml[I];
+    Inc(I);
+  end;
+  // Collapse whitespace
+  Result := StringReplace(Result, #13, ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, #9, ' ', [rfReplaceAll]);
+  while Pos('  ', Result) > 0 do
+    Result := StringReplace(Result, '  ', ' ', [rfReplaceAll]);
+  // Decode common entities
+  Result := StringReplace(Result, '&amp;', '&', [rfReplaceAll]);
+  Result := StringReplace(Result, '&lt;', '<', [rfReplaceAll]);
+  Result := StringReplace(Result, '&gt;', '>', [rfReplaceAll]);
+  Result := StringReplace(Result, '&quot;', '"', [rfReplaceAll]);
+  Result := StringReplace(Result, '&#39;', '''', [rfReplaceAll]);
+  Result := StringReplace(Result, '&nbsp;', ' ', [rfReplaceAll]);
+end;
+
+{ TAgentWebOptions }
+
+constructor TAgentWebOptions.Create;
+begin
+  inherited Create;
+  FSearchUrl := 'https://html.duckduckgo.com/html/?q={query}';
+  FUserAgent := 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' + 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+  FRequestTimeout := 15000;
+  FMaxResponseBytes := 524288;
+  FStripHtml := True;
+  FBlockLocalhost := True;
+  FBlockPrivateIPs := True;
+  FAllowedHosts := TStringList.Create;
+  FAllowedHosts.CaseSensitive := False;
+end;
+
+destructor TAgentWebOptions.Destroy;
+begin
+  FAllowedHosts.Free;
+  inherited Destroy;
+end;
+
+procedure TAgentWebOptions.SetAllowedHosts(const AValue: TStringList);
+begin
+  FAllowedHosts.Assign(AValue);
+end;
+
+procedure TAgentWebOptions.Assign(Source: TPersistent);
+var
+  Src: TAgentWebOptions;
+begin
+  if Source is TAgentWebOptions then
+  begin
+    Src := TAgentWebOptions(Source);
+    FSearchUrl := Src.FSearchUrl;
+    FUserAgent := Src.FUserAgent;
+    FRequestTimeout := Src.FRequestTimeout;
+    FMaxResponseBytes := Src.FMaxResponseBytes;
+    FStripHtml := Src.FStripHtml;
+    FBlockLocalhost := Src.FBlockLocalhost;
+    FBlockPrivateIPs := Src.FBlockPrivateIPs;
+    FAllowedHosts.Assign(Src.FAllowedHosts);
+  end
+  else
+    inherited Assign(Source);
+end;
+
+type
+  // Closes the HTTP socket after a hard deadline to abort blocked requests
+  TWebAbortWatchdog = class(TThread)
+  private
+    FSock: TTCPBlockSocket;
+    FTimeoutMs: integer;
+    FAborted: boolean;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(ASock: TTCPBlockSocket; ATimeoutMs: integer);
+    property Aborted: boolean read FAborted;
+  end;
+
+constructor TWebAbortWatchdog.Create(ASock: TTCPBlockSocket; ATimeoutMs: integer);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FSock := ASock;
+  FTimeoutMs := ATimeoutMs;
+  FAborted := False;
+end;
+
+procedure TWebAbortWatchdog.Execute;
+var
+  Elapsed: integer;
+begin
+  Elapsed := 0;
+  while (not Terminated) and (Elapsed < FTimeoutMs) do
+  begin
+    Sleep(100);
+    Inc(Elapsed, 100);
+  end;
+  if Terminated then
+    Exit;
+  FAborted := True;
+  try
+    FSock.CloseSocket;
+  except
+    ;
+  end;
 end;
 
 type
@@ -722,10 +1022,11 @@ begin
       MessagesArr.Add(MsgObj);
 
       ToolsJson := FAgent.BuildToolsSchemaJson;
-      FAgent.LogLine(Format('Features: streaming=%s fileTools=%s exec=%s git=%s interactive=%s finish=%s',
+      FAgent.LogLine(Format('Features: streaming=%s fileTools=%s exec=%s git=%s interactive=%s finish=%s web=%s',
         [BoolToStr(afStreaming in FAgent.FFeatures, 'on', 'off'), BoolToStr(afFileTools in FAgent.FFeatures, 'on', 'off'),
         BoolToStr(afExecCommand in FAgent.FFeatures, 'on', 'off'), BoolToStr(afGit in FAgent.FFeatures, 'on', 'off'),
-        BoolToStr(afInteractive in FAgent.FFeatures, 'on', 'off'), BoolToStr(afFinish in FAgent.FFeatures, 'on', 'off')]));
+        BoolToStr(afInteractive in FAgent.FFeatures, 'on', 'off'), BoolToStr(afFinish in FAgent.FFeatures, 'on', 'off'),
+        BoolToStr(afWebTools in FAgent.FFeatures, 'on', 'off')]));
       FAgent.LogLine(Format('Tools schema len=%d names=[%s]', [Length(ToolsJson), FAgent.BuildToolsNames]));
 
       // MaxSteps = 0 means unlimited
@@ -993,6 +1294,7 @@ begin
   FContextTotal := 0;
   FOnAskUser := nil;
   FTools := TAgentTools.Create(Self);
+  FWebOptions := TAgentWebOptions.Create;
 end;
 
 destructor TCustomOllamaAgent.Destroy;
@@ -1002,6 +1304,7 @@ begin
     CheckSynchronize(50);
   // Drain any queued events so they do not fire after Free
   CheckSynchronize(0);
+  FWebOptions.Free;
   FTools.Free;
   inherited Destroy;
 end;
@@ -1020,6 +1323,11 @@ end;
 procedure TCustomOllamaAgent.SetTools(const AValue: TAgentTools);
 begin
   FTools.Assign(AValue);
+end;
+
+procedure TCustomOllamaAgent.SetWebOptions(const AValue: TAgentWebOptions);
+begin
+  FWebOptions.Assign(AValue);
 end;
 
 procedure TCustomOllamaAgent.Notification(AComponent: TComponent; Operation: TOperation);
@@ -1092,10 +1400,27 @@ begin
 end;
 
 function TCustomOllamaAgent.BuildSystemPrompt: string;
+var
+  ToolList: string;
 begin
   Result := string(FSystemPrompt);
   Result := StringReplace(Result, '{path}', GetEffectiveRootPath, [rfReplaceAll]);
   Result := StringReplace(Result, '{model}', FModelName, [rfReplaceAll]);
+  // Resolve {tools} with the actual tool list or 'none'
+  ToolList := BuildToolsNames;
+  if ToolList = '' then
+    ToolList := 'none';
+  Result := StringReplace(Result, '{tools}', ToolList, [rfReplaceAll]);
+  // Append authoritative tool state so the model cannot claim disabled tools
+  if BuildToolsNames = '' then
+    Result := Result + #10#10 + 'IMPORTANT: no tools are currently enabled. You cannot run shell commands, ' +
+      'read or write files, list directories, search the workspace, access the ' +
+      'internet, or call any other external function. If the user asks for such ' +
+      'actions, explain that no tools are enabled and ask them to enable the ' + 'corresponding feature in the agent settings.'
+  else
+    Result := Result + #10#10 + 'IMPORTANT: the only tools currently enabled are: ' + ToolList + '. ' +
+      'You must not claim access to any tool that is not in this list. ' +
+      'If the user asks for an action that requires an unavailable tool, ' + 'explain that the tool is not enabled.';
 end;
 
 procedure TCustomOllamaAgent.ResetUsage;
@@ -1301,6 +1626,14 @@ begin
       AddTool(Arr, 'finish', 'Declare the task complete and return a final message to the user',
         '{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}');
 
+    if afWebTools in FFeatures then
+    begin
+      AddTool(Arr, 'web_fetch', 'Fetch content of an http or https URL using GET, returns plain text or HTML stripped',
+        '{"type":"object","properties":{"url":{"type":"string","description":"Full URL including scheme"}},"required":["url"]}');
+      AddTool(Arr, 'web_search', 'Search the web using the configured search engine and return results page text',
+        '{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}');
+    end;
+
     if Arr.Count > 0 then
       Result := Arr.AsJSON;
   finally
@@ -1346,6 +1679,11 @@ begin
       Names.Add('ask_user');
     if afFinish in FFeatures then
       Names.Add('finish');
+    if afWebTools in FFeatures then
+    begin
+      Names.Add('web_fetch');
+      Names.Add('web_search');
+    end;
     Result := Names.CommaText;
   finally
     Names.Free;
@@ -2132,6 +2470,164 @@ begin
     Result := '{"error": "user cancelled the question"}';
 end;
 
+function TCustomOllamaAgent.DoWebFetchInternal(const AUrl: string; out AContent, AErrorMsg: string): boolean;
+var
+  Headers, Cookies, ResponseHeaders: TStringList;
+  Err: boolean;
+  Tm: TTimeout;
+  HTTP: THTTPSend;
+  Watchdog: TWebAbortWatchdog;
+begin
+  Result := False;
+  AContent := '';
+  AErrorMsg := '';
+  Headers := TStringList.Create;
+  Cookies := TStringList.Create;
+  ResponseHeaders := nil;
+  HTTP := THTTPSend.Create;
+  Watchdog := nil;
+  try
+    try
+      // Hard deadline enforced by a watchdog that closes the socket
+      Watchdog := TWebAbortWatchdog.Create(HTTP.Sock, FWebOptions.RequestTimeout);
+      Watchdog.Start;
+      Tm.Connection := FWebOptions.RequestTimeout;
+      Tm.Request := FWebOptions.RequestTimeout;
+      AContent := TNetwork.WebRequest(wmGet, AUrl, '', Headers, FWebOptions.UserAgent, '',
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', False, Default(TProxy),
+        Tm, Cookies, ResponseHeaders, Err, HTTP);
+      if Watchdog.Aborted then
+      begin
+        AErrorMsg := 'request aborted after ' + IntToStr(FWebOptions.RequestTimeout) + ' ms';
+        AContent := '';
+        Exit;
+      end;
+      if Err then
+      begin
+        AErrorMsg := 'http request failed: ' + Copy(AContent, 1, 300);
+        AContent := '';
+        Exit;
+      end;
+      Result := True;
+    except
+      on E: Exception do
+      begin
+        AErrorMsg := 'request error: ' + E.Message;
+        AContent := '';
+        Result := False;
+      end;
+    end;
+  finally
+    if Watchdog <> nil then
+    begin
+      Watchdog.Terminate;
+      Watchdog.WaitFor;
+      Watchdog.Free;
+    end;
+    HTTP.Free;
+    Headers.Free;
+    Cookies.Free;
+    ResponseHeaders.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.DoWebFetch(AArgs: TJSONObject): string;
+var
+  Url, Host, Content, ErrorMsg: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  Url := Trim(AArgs.Get('url', ''));
+  if Url = '' then
+  begin
+    Result := '{"error": "url required"}';
+    Exit;
+  end;
+  if not IsSafeHttpUrl(Url, Host) then
+  begin
+    Result := '{"error": "only http and https urls are allowed"}';
+    Exit;
+  end;
+  // Whitelist takes priority when configured
+  if FWebOptions.AllowedHosts.Count > 0 then
+  begin
+    if FWebOptions.AllowedHosts.IndexOf(Host) < 0 then
+    begin
+      Result := '{"error": "host not in allowed list: ' + Host + '"}';
+      Exit;
+    end;
+  end;
+  if FWebOptions.BlockLocalhost and IsLocalhostHost(Host) then
+  begin
+    Result := '{"error": "localhost access is blocked"}';
+    Exit;
+  end;
+  if FWebOptions.BlockPrivateIPs and IsPrivateIPv4(Host) then
+  begin
+    Result := '{"error": "private ip access is blocked"}';
+    Exit;
+  end;
+  // Skip request entirely when cancellation is already requested
+  if FCancelled then
+  begin
+    Result := '{"error": "cancelled by user"}';
+    Exit;
+  end;
+  LogLine(Format('WebFetch url="%s"', [Copy(Url, 1, 200)]));
+  if not DoWebFetchInternal(Url, Content, ErrorMsg) then
+  begin
+    Result := '{"error": ' + TJSONString.Create(ErrorMsg).AsJSON + '}';
+    Exit;
+  end;
+  if Length(Content) > FWebOptions.MaxResponseBytes then
+    Content := Copy(Content, 1, FWebOptions.MaxResponseBytes) + #10 + '[truncated to ' +
+      IntToStr(FWebOptions.MaxResponseBytes) + ' bytes]';
+  if FWebOptions.StripHtml then
+    Content := StripHtmlTags(Content);
+  Result := '{"url": ' + TJSONString.Create(Url).AsJSON + ', "content": ' + TJSONString.Create(Content).AsJSON + '}';
+end;
+
+function TCustomOllamaAgent.DoWebSearch(AArgs: TJSONObject): string;
+var
+  Query, Template, Url, Content, ErrorMsg: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  Query := Trim(AArgs.Get('query', ''));
+  if Query = '' then
+  begin
+    Result := '{"error": "query required"}';
+    Exit;
+  end;
+  Template := FWebOptions.SearchUrl;
+  if Template = '' then
+  begin
+    Result := '{"error": "search url not configured"}';
+    Exit;
+  end;
+  Url := StringReplace(Template, '{query}', UrlEncode(Query), [rfReplaceAll]);
+  // Skip request entirely when cancellation is already requested
+  if FCancelled then
+  begin
+    Result := '{"error": "cancelled by user"}';
+    Exit;
+  end;
+  LogLine(Format('WebSearch query="%s" url="%s"', [Copy(Query, 1, 100), Copy(Url, 1, 200)]));
+  if not DoWebFetchInternal(Url, Content, ErrorMsg) then
+  begin
+    Result := '{"error": ' + TJSONString.Create(ErrorMsg).AsJSON + '}';
+    Exit;
+  end;
+  if Length(Content) > FWebOptions.MaxResponseBytes then
+    Content := Copy(Content, 1, FWebOptions.MaxResponseBytes) + #10 + '[truncated to ' +
+      IntToStr(FWebOptions.MaxResponseBytes) + ' bytes]';
+  if FWebOptions.StripHtml then
+    Content := StripHtmlTags(Content);
+  Result := '{"query": ' + TJSONString.Create(Query).AsJSON + ', "content": ' + TJSONString.Create(Content).AsJSON + '}';
+end;
+
 function TCustomOllamaAgent.DispatchTool(const AName, AArgsJson: string): string;
 var
   I: integer;
@@ -2233,6 +2729,14 @@ begin
 
     if (AName = 'ask_user') and (afInteractive in FFeatures) then
       Exit(DoAskUser(Args));
+
+    if afWebTools in FFeatures then
+    begin
+      if AName = 'web_fetch' then
+        Exit(DoWebFetch(Args))
+      else if AName = 'web_search' then
+        Exit(DoWebSearch(Args));
+    end;
 
     // finish is handled in Execute before DispatchTool is called
     Result := '{"error": "unknown tool: ' + AName + '"}';
