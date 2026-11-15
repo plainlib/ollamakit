@@ -106,6 +106,8 @@ type
     FColorOutput: boolean;
     // Semantic color palette for output
     FColors: TTermColorScheme;
+    // Label used in the {info} badge when no model is selected
+    FDefaultModelLabel: TCaption;
     FBuiltinCommands: TStringList;
     FHistory: TStringList;
     FHistoryMax: integer;
@@ -217,6 +219,7 @@ type
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
     property ColorOutput: boolean read FColorOutput write FColorOutput default True;
     property Colors: TTermColorScheme read FColors write SetColors;
+    property DefaultModelLabel: TCaption read FDefaultModelLabel write FDefaultModelLabel;
     property BuiltinCommands: TStringList read FBuiltinCommands;
     property HistoryMax: integer read FHistoryMax write FHistoryMax default 200;
     property ShellExec: string read FShellExec write FShellExec;
@@ -255,6 +258,8 @@ type
     property ColorOutput;
     // Semantic color palette for output, expand to customize each role
     property Colors;
+    // Label shown in the {info} badge when no model is selected
+    property DefaultModelLabel;
     // Commands executed internally without invoking the shell, extend to add your own
     property BuiltinCommands;
     // Maximum number of input lines kept in history, oldest are dropped first
@@ -502,6 +507,7 @@ begin
   FStripEmoji := True;
   FColorOutput := True;
   FColors := TTermColorScheme.Create;
+  FDefaultModelLabel := 'plainconsole';
   FAgent := nil;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
@@ -871,47 +877,65 @@ end;
 
 function TCustomTermManager.GetPromptText: string;
 var
-  ModelName, CtxUsed, CtxTotal, CtxPercent, Ctx, CtxKb, CtxUsedKb, CtxTotalKb: string;
+  ModelName, DefaultLabel, CtxUsed, CtxTotal, CtxPercent, Ctx, CtxKb, CtxUsedKb, CtxTotalKb: string;
+  InfoLabel, InfoCtx: string;
+  HasContext: boolean;
 begin
   Result := FPrompt;
-  // Agent-related placeholders, empty when no agent is attached
+  DefaultLabel := string(FDefaultModelLabel);
+  if DefaultLabel = '' then
+    DefaultLabel := 'plainconsole';
+
   if Assigned(FAgent) then
   begin
+    // Model name, empty when not selected
     ModelName := FAgent.ModelName;
+    // Context detection: total > 0 means we know the real window size
+    HasContext := FAgent.ContextTotal > 0;
+    // Individual placeholders always return numeric values, 0 when unknown
     CtxUsed := IntToStr(FAgent.ContextUsed);
-    if FAgent.ContextTotal > 0 then
-    begin
-      CtxTotal := IntToStr(FAgent.ContextTotal);
-      CtxPercent := IntToStr(FAgent.ContextPercent);
-      Ctx := CtxUsed + '/' + CtxTotal;
-    end
-    else
-    begin
-      // Show zero when total is unknown, do not invent numbers
-      CtxTotal := '0';
-      CtxPercent := '0';
-      Ctx := '0';
-    end;
+    CtxTotal := IntToStr(FAgent.ContextTotal);
+    CtxPercent := IntToStr(FAgent.ContextPercent);
+    Ctx := CtxUsed + '/' + CtxTotal;
     CtxUsedKb := IntToStr(FAgent.ContextUsedKb);
-    if FAgent.ContextTotalKb > 0 then
-    begin
-      CtxTotalKb := IntToStr(FAgent.ContextTotalKb);
-      CtxKb := CtxUsedKb + '/' + CtxTotalKb + 'KB';
-    end
-    else
-    begin
-      CtxTotalKb := '0';
-      CtxKb := '0';
-    end;
-    Result := StringReplace(Result, '{model}', ModelName, [rfReplaceAll]);
-    Result := StringReplace(Result, '{context_used}', CtxUsed, [rfReplaceAll]);
-    Result := StringReplace(Result, '{context_total}', CtxTotal, [rfReplaceAll]);
-    Result := StringReplace(Result, '{context_percent}', CtxPercent, [rfReplaceAll]);
-    Result := StringReplace(Result, '{context}', Ctx, [rfReplaceAll]);
-    Result := StringReplace(Result, '{context_used_kb}', CtxUsedKb, [rfReplaceAll]);
-    Result := StringReplace(Result, '{context_total_kb}', CtxTotalKb, [rfReplaceAll]);
-    Result := StringReplace(Result, '{context_kb}', CtxKb, [rfReplaceAll]);
+    CtxTotalKb := IntToStr(FAgent.ContextTotalKb);
+    CtxKb := CtxUsedKb + '/' + CtxTotalKb + 'KB';
+  end
+  else
+  begin
+    // No agent attached, all values default to 0
+    ModelName := '';
+    HasContext := False;
+    CtxUsed := '0';
+    CtxTotal := '0';
+    CtxPercent := '0';
+    Ctx := '0';
+    CtxUsedKb := '0';
+    CtxTotalKb := '0';
+    CtxKb := '0';
   end;
+
+  // Combined info badge: [model: ctx] when context is known, [plainconsole] otherwise
+  if ModelName <> '' then
+    InfoLabel := ModelName
+  else
+    InfoLabel := DefaultLabel;
+  if HasContext then
+    InfoCtx := ': ' + CtxKb + ' ' + CtxPercent + '%'
+  else
+    InfoCtx := '';
+  Result := StringReplace(Result, '{info}', InfoLabel + InfoCtx, [rfReplaceAll]);
+
+  // Individual placeholders for custom templates
+  Result := StringReplace(Result, '{model}', ModelName, [rfReplaceAll]);
+  Result := StringReplace(Result, '{default}', DefaultLabel, [rfReplaceAll]);
+  Result := StringReplace(Result, '{context_used}', CtxUsed, [rfReplaceAll]);
+  Result := StringReplace(Result, '{context_total}', CtxTotal, [rfReplaceAll]);
+  Result := StringReplace(Result, '{context_percent}', CtxPercent, [rfReplaceAll]);
+  Result := StringReplace(Result, '{context}', Ctx, [rfReplaceAll]);
+  Result := StringReplace(Result, '{context_used_kb}', CtxUsedKb, [rfReplaceAll]);
+  Result := StringReplace(Result, '{context_total_kb}', CtxTotalKb, [rfReplaceAll]);
+  Result := StringReplace(Result, '{context_kb}', CtxKb, [rfReplaceAll]);
   Result := StringReplace(Result, '{path}', GetEffectivePath, [rfReplaceAll]);
 end;
 
