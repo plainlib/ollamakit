@@ -152,6 +152,8 @@ type
     FOnExecCommand: TAgentExecCommandEvent;
     FOnAskUser: TAgentAskUserEvent;
     FOnFinish: TAgentFinishEvent;
+    // Optional context prepended to the next user message, cleared after use
+    FContextPrelude: string;
     procedure SetOllamaManager(const AValue: TOllamaManager);
     procedure SetTools(const AValue: TAgentTools);
     procedure SetWebOptions(const AValue: TAgentWebOptions);
@@ -220,6 +222,8 @@ type
 
     property Done: boolean read FDone;
     property FinalAnswer: string read FFinalAnswer;
+    // Context text placed before the next user message, cleared after the run
+    property ContextPrelude: string read FContextPrelude write FContextPrelude;
     property History: string read GetHistory write SetHistory;
     property ContextUsed: integer read FContextUsed;
     property ContextTotal: integer read FContextTotal;
@@ -1012,7 +1016,11 @@ begin
 
       MsgObj := TJSONObject.Create;
       MsgObj.Add('role', 'user');
-      MsgObj.Add('content', FUserText);
+      // Prepend host-supplied context such as recent shell commands
+      if FAgent.FContextPrelude <> '' then
+        MsgObj.Add('content', FAgent.FContextPrelude + #10#10 + FUserText)
+      else
+        MsgObj.Add('content', FUserText);
       MessagesArr.Add(MsgObj);
 
       ToolsJson := FAgent.BuildToolsSchemaJson;
@@ -1267,6 +1275,8 @@ begin
     end;
     MessagesArr.Free;
     QueueFinish(Reason, FAgent.FFinalAnswer, ErrMsg);
+    // Consume the prelude so it is not reused by the next run
+    FAgent.FContextPrelude := '';
     FAgent.FDone := True;
   end;
 end;

@@ -87,6 +87,27 @@ type
     property WarnBadge: TConsoleColorPair read FWarnBadge write SetWarnBadge;
   end;
 
+  // Shell history sharing options passed to the agent as context prelude
+  TAgentShellHistory = class(TPersistent)
+  private
+    FEnabled: boolean;
+    FMaxEntries: integer;
+    FMaxOutputBytes: integer;
+    FClearOnAgentRun: boolean;
+  public
+    constructor Create;
+    procedure Assign(Source: TPersistent); override;
+  published
+    // Share recent shell commands and their output with the agent
+    property Enabled: boolean read FEnabled write FEnabled default False;
+    // Maximum number of shell commands kept in the shared log
+    property MaxEntries: integer read FMaxEntries write FMaxEntries default 10;
+    // Maximum bytes captured per command output in the shared log
+    property MaxOutputBytes: integer read FMaxOutputBytes write FMaxOutputBytes default 2048;
+    // Clear the shell log after it has been passed to the agent
+    property ClearOnAgentRun: boolean read FClearOnAgentRun write FClearOnAgentRun default True;
+  end;
+
   TCustomTermManager = class(TComponent)
   private
     FPath: string;
@@ -133,6 +154,15 @@ type
     FPrevAgentOnAskUser: TAgentAskUserEvent;
     // True while writing agent thinking before the first content chunk
     FInThinking: boolean;
+    // Shell history sharing options for the agent context prelude
+    FShellHistory: TAgentShellHistory;
+    // Log entries encoded as "C\x01cmd\x01output" or "E\x01cmd\x01output"
+    FShellLog: TStringList;
+    // True while collecting output of the current command
+    FCapturing: boolean;
+    FCaptureCommand: string;
+    FCaptureOutput: string;
+    FCaptureError: boolean;
     FOnRoute: TTermRouteEvent;
     FOnOutput: TTermOutputEvent;
     FOnAgentExecute: TTermAgentEvent;
@@ -141,6 +171,7 @@ type
     procedure SetAgent(const AValue: TCustomOllamaAgent);
     procedure SetHistory(const AValue: TStringList);
     procedure SetColors(const AValue: TTermColorScheme);
+    procedure SetShellHistory(const AValue: TAgentShellHistory);
     // Handles help, help agent, and ? alias
     procedure HandleHelpCommand(const AArg: string);
     // Handles set <name> <value>
@@ -149,6 +180,10 @@ type
     procedure HandleGetCommand(const AArg: string);
     // Handles models, queries OllamaManager for available models
     procedure HandleModelsCommand(const AArg: string);
+    // Handles set term.<name> <value>
+    procedure HandleTermSet(const AName, AValue: string);
+    // Handles get term.<name>
+    procedure HandleTermGet(const AName: string);
   protected
     // Clears agent reference when it is removed at runtime
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -192,6 +227,12 @@ type
     procedure HandleAgentToolResult(Sender: TObject; const AName, AResult: string);
     // Finalizes console line after agent run
     procedure HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
+    // Records a shell command and its output for sharing with the agent
+    procedure RecordShellOperation(const ACommand, AOutput: string; AIsError: boolean); virtual;
+    // Builds formatted shell context string from the recorded operations
+    function BuildShellContext: string; virtual;
+    // Returns True for cls, clear, exit and quit which should not be logged
+    function IsMetaCommand(const ACommand: string): boolean; virtual;
     // Executes agent shell command through configured shell and returns output
     procedure HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
     // Prompts the user with a question and returns the typed answer
@@ -209,6 +250,8 @@ type
     procedure WriteText(const AText: string; AIsStderr: boolean = False); virtual;
     // Writes text followed by a line ending, flushes immediately
     procedure WriteLine(const AText: string; AIsStderr: boolean = False); virtual;
+    // Returns multi-line help for term.* properties
+    function FormatTermHelp: string; virtual;
 
     property Path: string read FPath write SetPath;
     property Prompt: string read FPrompt write FPrompt;
@@ -227,6 +270,7 @@ type
     property MaxCaptureBytes: integer read FMaxCaptureBytes write FMaxCaptureBytes default 65536;
     property AgentCommandTimeout: integer read FAgentCommandTimeout write FAgentCommandTimeout default 30000;
     property UsePrefixes: boolean read FUsePrefixes write FUsePrefixes default True;
+    property ShellHistory: TAgentShellHistory read FShellHistory write SetShellHistory;
     property SearchPath: boolean read FSearchPath write FSearchPath default True;
     property LastExitCode: integer read FLastExitCode;
     property History: TStringList read FHistory write SetHistory;
@@ -274,6 +318,8 @@ type
     property AgentCommandTimeout;
     // Enable ! and ? prefixes to force command or agent routing respectively
     property UsePrefixes;
+    // Pass recent shell commands to the agent, expand to adjust log limits
+    property ShellHistory;
     // Also detect PATH executables and known shell builtins when classifying input
     property SearchPath;
     // Fires before routing each input, host can approve, reject or reclassify it
@@ -388,6 +434,33 @@ begin
   end;
   SetLength(Filtered, J);
   Result := UTF8Encode(Filtered);
+end;
+
+{ TAgentShellHistory }
+
+constructor TAgentShellHistory.Create;
+begin
+  inherited Create;
+  FEnabled := False;
+  FMaxEntries := 10;
+  FMaxOutputBytes := 2048;
+  FClearOnAgentRun := True;
+end;
+
+procedure TAgentShellHistory.Assign(Source: TPersistent);
+var
+  Src: TAgentShellHistory;
+begin
+  if Source is TAgentShellHistory then
+  begin
+    Src := TAgentShellHistory(Source);
+    FEnabled := Src.FEnabled;
+    FMaxEntries := Src.FMaxEntries;
+    FMaxOutputBytes := Src.FMaxOutputBytes;
+    FClearOnAgentRun := Src.FClearOnAgentRun;
+  end
+  else
+    inherited Assign(Source);
 end;
 
 { TConsoleColorPair }
@@ -532,6 +605,7 @@ begin
   FBuiltinCommands.Add('config');
   FBuiltinCommands.Add('settings');
   FBuiltinCommands.Add('models');
+  FBuiltinCommands.Add('term');
   FHistory := TStringList.Create;
   FHistoryMax := 200;
   FShellExec := 'cmd.exe';
@@ -540,6 +614,12 @@ begin
   FAgentCommandTimeout := 30000;
   FUsePrefixes := True;
   FSearchPath := True;
+  FShellHistory := TAgentShellHistory.Create;
+  FShellLog := TStringList.Create;
+  FCapturing := False;
+  FCaptureCommand := '';
+  FCaptureOutput := '';
+  FCaptureError := False;
   FRunning := False;
   FLastExitCode := 0;
 end;
@@ -547,6 +627,8 @@ end;
 destructor TCustomTermManager.Destroy;
 begin
   SetAgent(nil);
+  FShellHistory.Free;
+  FShellLog.Free;
   FColors.Free;
   FHistory.Free;
   FBuiltinCommands.Free;
@@ -627,6 +709,12 @@ procedure TCustomTermManager.SetColors(const AValue: TTermColorScheme);
 begin
   if Assigned(AValue) and (AValue <> FColors) then
     FColors.Assign(AValue);
+end;
+
+procedure TCustomTermManager.SetShellHistory(const AValue: TAgentShellHistory);
+begin
+  if Assigned(AValue) and (AValue <> FShellHistory) then
+    FShellHistory.Assign(AValue);
 end;
 
 procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
@@ -782,6 +870,85 @@ begin
   WriteLine('', False);
   if Assigned(FPrevAgentOnFinish) then
     FPrevAgentOnFinish(Sender, AReason, AAnswer, AErrorMsg);
+end;
+
+procedure TCustomTermManager.RecordShellOperation(const ACommand, AOutput: string; AIsError: boolean);
+var
+  Truncated, Line: string;
+begin
+  if not FShellHistory.Enabled then
+    Exit;
+  if Trim(ACommand) = '' then
+    Exit;
+  Truncated := AOutput;
+  if Length(Truncated) > FShellHistory.MaxOutputBytes then
+    Truncated := Copy(Truncated, 1, FShellHistory.MaxOutputBytes) + #10 + '[output truncated at ' +
+      IntToStr(FShellHistory.MaxOutputBytes) + ' bytes]';
+  if AIsError then
+    Line := 'E' + #1 + ACommand + #1 + Truncated
+  else
+    Line := 'C' + #1 + ACommand + #1 + Truncated;
+  FShellLog.Add(Line);
+  while FShellLog.Count > FShellHistory.MaxEntries do
+    FShellLog.Delete(0);
+end;
+
+function TCustomTermManager.IsMetaCommand(const ACommand: string): boolean;
+var
+  Cmd: string;
+  P: integer;
+begin
+  P := Pos(' ', ACommand);
+  if P > 0 then
+    Cmd := LowerCase(Copy(ACommand, 1, P - 1))
+  else
+    Cmd := LowerCase(ACommand);
+  Result := (Cmd = 'cls') or (Cmd = 'clear') or (Cmd = 'exit') or (Cmd = 'quit') or (Cmd = 'help') or
+    (Cmd = 'h') or (Cmd = '?') or (Cmd = 'config') or (Cmd = 'settings') or (Cmd = 'get') or (Cmd = 'history');
+end;
+
+function TCustomTermManager.BuildShellContext: string;
+var
+  Buf: TStringList;
+  I, P: integer;
+  Line, Rest, Cmd, OutText: string;
+  IsErr, HasErr: boolean;
+begin
+  Result := '';
+  if not FShellHistory.Enabled or (FShellLog.Count = 0) then
+    Exit;
+  Buf := TStringList.Create;
+  try
+    Buf.Add('Recent shell activity in the workspace:');
+    Buf.Add('');
+    HasErr := False;
+    for I := 0 to FShellLog.Count - 1 do
+    begin
+      Line := FShellLog[I];
+      if Length(Line) < 3 then
+        Continue;
+      IsErr := Line[1] = 'E';
+      if IsErr then
+        HasErr := True;
+      Rest := Copy(Line, 3, MaxInt);
+      P := Pos(#1, Rest);
+      if P = 0 then
+        Continue;
+      Cmd := Copy(Rest, 1, P - 1);
+      OutText := Copy(Rest, P + 1, MaxInt);
+      Buf.Add('$ ' + Cmd);
+      while (Length(OutText) > 0) and (OutText[Length(OutText)] in [#10, #13]) do
+        Delete(OutText, Length(OutText), 1);
+      if OutText <> '' then
+        Buf.Add(OutText);
+      Buf.Add('');
+    end;
+    if HasErr then
+      Buf.Add('(some of the commands above produced error output)');
+    Result := Buf.Text;
+  finally
+    Buf.Free;
+  end;
 end;
 
 procedure TCustomTermManager.HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
@@ -947,6 +1114,14 @@ end;
 
 procedure TCustomTermManager.DoOutput(const AText: string; AIsStderr: boolean);
 begin
+  // Accumulate output of the currently running command for the shell log
+  if FCapturing and FShellHistory.Enabled then
+  begin
+    if Length(FCaptureOutput) < FShellHistory.MaxOutputBytes * 2 then
+      FCaptureOutput := FCaptureOutput + AText;
+    if AIsStderr then
+      FCaptureError := True;
+  end;
   WriteText(AText, AIsStderr);
 end;
 
@@ -1110,12 +1285,13 @@ begin
     DoOutput(GetEffectivePath + LineEnding, False)
   else if (Cmd = 'cls') or (Cmd = 'clear') then
   begin
-    // Clear agent conversation history and usage counters together with the screen
+    // Clear agent conversation history, usage counters and shell log together with the screen
     if Assigned(FAgent) then
     begin
       FAgent.ClearHistory;
       FAgent.ResetUsage;
     end;
+    FShellLog.Clear;
     ClearScreen;
   end
   else if Cmd = 'history' then
@@ -1130,7 +1306,14 @@ begin
   else if Cmd = 'get' then
     HandleGetCommand(Arg)
   else if (Cmd = 'config') or (Cmd = 'settings') then
-    DoOutput(FormatAgentConfig(FAgent) + LineEnding, False)
+  begin
+    DoOutput(FormatAgentConfig(FAgent) + LineEnding, False);
+    DoOutput(Format('Terminal Settings' + LineEnding + '  term.path             : %s' + LineEnding +
+      '  term.shell            : %s' + LineEnding + '  term.showthinking     : %s' + LineEnding +
+      '  term.commandtimeout   : %d' + LineEnding + '  term.maxcapturebytes  : %d' + LineEnding +
+      '  term.agentcommandtimeout : %d' + LineEnding, [GetEffectivePath, FShellExec, BoolToStr(FShowThinking, 'on', 'off'),
+      FCommandTimeout, FMaxCaptureBytes, FAgentCommandTimeout]) + LineEnding, False);
+  end
   else if Cmd = 'models' then
     HandleModelsCommand(Arg)
   else
@@ -1157,13 +1340,21 @@ var
   function BuildToolsList(AFeatures: TAgentFeatures): string;
   var
     Parts: TStringList;
-    F: TAgentFeature;
   begin
     Parts := TStringList.Create;
     try
-      for F := Low(TAgentFeature) to High(TAgentFeature) do
-        if F in AFeatures then
-          Parts.Add(LowerCase(Copy(GetEnumName(TypeInfo(TAgentFeature), Ord(F)), 3, MaxInt)));
+      if afFileTools in AFeatures then
+        Parts.Add('filetools');
+      if afExecCommand in AFeatures then
+        Parts.Add('exec');
+      if afGit in AFeatures then
+        Parts.Add('git');
+      if afInteractive in AFeatures then
+        Parts.Add('interactive');
+      if afFinish in AFeatures then
+        Parts.Add('finish');
+      if afWebTools in AFeatures then
+        Parts.Add('web');
       if Parts.Count = 0 then
         Result := 'none'
       else
@@ -1177,6 +1368,8 @@ begin
   Topic := LowerCase(Trim(AArg));
   if (Topic = 'agent') or (Topic = 'set') or (Topic = 'get') or (Topic = 'config') then
     DoOutput(FormatAgentHelp + LineEnding, False)
+  else if (Topic = 'term') or (Topic = 'terminal') then
+    DoOutput(FormatTermHelp + LineEnding, False)
   else
   begin
     // Add a space after commas for readability
@@ -1222,7 +1415,8 @@ begin
     end;
     DoOutput('' + LineEnding, False);
     DoOutput('Other commands: config (all settings), models (installed models), get/set <name>' + LineEnding, False);
-    DoOutput('Full property reference: help agent, or just "?"' + LineEnding, False);
+    DoOutput('Agent properties: help agent, or just "?"' + LineEnding, False);
+    DoOutput('Terminal properties: help term' + LineEnding, False);
     DoOutput('' + LineEnding, False);
   end;
 end;
@@ -1235,7 +1429,7 @@ begin
   if Trim(AArg) = '' then
   begin
     DoOutput('usage: set <name> <value>' + LineEnding, True);
-    DoOutput('use "help agent" for list of properties' + LineEnding, True);
+    DoOutput('use "help agent" or "help term" for property lists' + LineEnding, True);
     Exit;
   end;
   P := Pos(' ', AArg);
@@ -1249,7 +1443,10 @@ begin
     PropName := Trim(AArg);
     PropValue := '';
   end;
-  if SetAgentProperty(FAgent, PropName, PropValue, ErrMsg) then
+  // term.* properties are handled locally, everything else goes to the agent
+  if LowerCase(Copy(PropName, 1, 5)) = 'term.' then
+    HandleTermSet(Copy(PropName, 6, MaxInt), PropValue)
+  else if SetAgentProperty(FAgent, PropName, PropValue, ErrMsg) then
     DoOutput(PropName + ' = ' + PropValue + LineEnding, False)
   else
     DoOutput('error: ' + ErrMsg + LineEnding, True);
@@ -1264,7 +1461,13 @@ begin
   if Trim(AArg) = '' then
   begin
     DoOutput('usage: get <name>' + LineEnding, True);
-    DoOutput('use "help agent" for list of properties' + LineEnding, True);
+    DoOutput('use "help agent" or "help term" for property lists' + LineEnding, True);
+    Exit;
+  end;
+  // term.* properties are handled locally, everything else goes to the agent
+  if LowerCase(Copy(Trim(AArg), 1, 5)) = 'term.' then
+  begin
+    HandleTermGet(Copy(Trim(AArg), 6, MaxInt));
     Exit;
   end;
   if not GetAgentProperty(FAgent, Trim(AArg), Value, ErrMsg) then
@@ -1283,6 +1486,141 @@ begin
     Tail := ' ... [' + IntToStr(Length(Value)) + ' chars total, truncated]';
   end;
   DoOutput(AArg + ' = ' + Display + Tail + LineEnding, False);
+end;
+
+procedure TCustomTermManager.HandleTermSet(const AName, AValue: string);
+var
+  N: string;
+  IntVal: integer;
+  BoolVal: boolean;
+  V: string;
+begin
+  N := LowerCase(Trim(AName));
+  V := Trim(AValue);
+  // Strip surrounding quotes for string values
+  if (Length(V) >= 2) and (V[1] = '"') and (V[Length(V)] = '"') then
+    V := Copy(V, 2, Length(V) - 2);
+  if N = 'path' then
+  begin
+    if V = '' then
+    begin
+      DoOutput('error: term.path cannot be empty' + LineEnding, True);
+      Exit;
+    end;
+    SetPath(V);
+  end
+  else if N = 'shell' then
+  begin
+    if V = '' then
+    begin
+      DoOutput('error: term.shell cannot be empty' + LineEnding, True);
+      Exit;
+    end;
+    FShellExec := V;
+  end
+  else if N = 'showthinking' then
+  begin
+    case LowerCase(V) of
+      'on', 'true', 'yes', '1': BoolVal := True;
+      'off', 'false', 'no', '0': BoolVal := False;
+      else
+        DoOutput('error: term.showthinking must be on/off, true/false, yes/no' + LineEnding, True);
+        Exit;
+    end;
+    FShowThinking := BoolVal;
+  end
+  else if N = 'commandtimeout' then
+  begin
+    if not TryStrToInt(V, IntVal) or (IntVal < 0) then
+    begin
+      DoOutput('error: term.commandtimeout must be a non-negative integer' + LineEnding, True);
+      Exit;
+    end;
+    FCommandTimeout := IntVal;
+  end
+  else if N = 'maxcapturebytes' then
+  begin
+    if not TryStrToInt(V, IntVal) or (IntVal <= 0) then
+    begin
+      DoOutput('error: term.maxcapturebytes must be a positive integer' + LineEnding, True);
+      Exit;
+    end;
+    FMaxCaptureBytes := IntVal;
+  end
+  else if N = 'agentcommandtimeout' then
+  begin
+    if not TryStrToInt(V, IntVal) or (IntVal < 0) then
+    begin
+      DoOutput('error: term.agentcommandtimeout must be a non-negative integer' + LineEnding, True);
+      Exit;
+    end;
+    FAgentCommandTimeout := IntVal;
+  end
+  else
+  begin
+    DoOutput('error: unknown term property: ' + AName + ', use "help term"' + LineEnding, True);
+    Exit;
+  end;
+  DoOutput('term.' + N + ' = ' + V + LineEnding, False);
+end;
+
+procedure TCustomTermManager.HandleTermGet(const AName: string);
+var
+  N: string;
+  Val: string;
+begin
+  N := LowerCase(Trim(AName));
+  if N = 'path' then
+    Val := GetEffectivePath
+  else if N = 'shell' then
+    Val := FShellExec
+  else if N = 'showthinking' then
+  begin
+    if FShowThinking then
+      Val := 'on'
+    else
+      Val := 'off';
+  end
+  else if N = 'commandtimeout' then
+    Val := IntToStr(FCommandTimeout)
+  else if N = 'maxcapturebytes' then
+    Val := IntToStr(FMaxCaptureBytes)
+  else if N = 'agentcommandtimeout' then
+    Val := IntToStr(FAgentCommandTimeout)
+  else
+  begin
+    DoOutput('error: unknown term property: ' + AName + ', use "help term"' + LineEnding, True);
+    Exit;
+  end;
+  DoOutput('term.' + N + ' = ' + Val + LineEnding, False);
+end;
+
+function TCustomTermManager.FormatTermHelp: string;
+var
+  T: TStringList;
+begin
+  T := TStringList.Create;
+  try
+    T.Add('Terminal configuration, prefix all names with "term."');
+    T.Add('');
+    T.Add('  set term.path <path>               Working directory');
+    T.Add('  set term.shell <exe>               Shell executable, e.g. cmd.exe');
+    T.Add('  set term.showthinking on|off       Show agent reasoning text');
+    T.Add('  set term.commandtimeout <ms>       Timeout for user-typed commands');
+    T.Add('  set term.maxcapturebytes <n>       Cap on captured output per command');
+    T.Add('  set term.agentcommandtimeout <ms>  Timeout for agent exec_command');
+    T.Add('  get term.<name>                    Show current value');
+    T.Add('  config                             Show all settings');
+    T.Add('');
+    T.Add('Examples:');
+    T.Add('  set term.shell pwsh.exe');
+    T.Add('  set term.showthinking off');
+    T.Add('  set term.agentcommandtimeout 60000');
+    T.Add('  get term.shell');
+    Result := T.Text;
+  finally
+    T.Free;
+  end;
 end;
 
 procedure TCustomTermManager.HandleModelsCommand(const AArg: string);
@@ -1623,11 +1961,47 @@ begin
       if not Allow then
         Continue;
       case Kind of
-        tikBuiltin: HandleBuiltin(Payload);
-        tikCommand: FLastExitCode := ExecuteCommand(Payload);
+        tikBuiltin:
+        begin
+          FCaptureCommand := Payload;
+          FCaptureOutput := '';
+          FCaptureError := False;
+          FCapturing := True;
+          try
+            HandleBuiltin(Payload);
+          finally
+            FCapturing := False;
+            // Meta commands like cls and exit are not relevant to the model
+            if not IsMetaCommand(FCaptureCommand) then
+              RecordShellOperation(FCaptureCommand, FCaptureOutput, FCaptureError);
+          end;
+        end;
+        tikCommand:
+        begin
+          FCaptureCommand := Payload;
+          FCaptureOutput := '';
+          FCaptureError := False;
+          FCapturing := True;
+          try
+            FLastExitCode := ExecuteCommand(Payload);
+          finally
+            FCapturing := False;
+            RecordShellOperation(FCaptureCommand, FCaptureOutput, FCaptureError);
+          end;
+        end;
         tikAgent:
           if Assigned(FAgent) then
           begin
+            // Pass shell history to the agent as prelude context
+            if FShellHistory.Enabled and (FShellLog.Count > 0) then
+            begin
+              if FAgent.ContextPrelude <> '' then
+                FAgent.ContextPrelude := FAgent.ContextPrelude + #10#10 + BuildShellContext
+              else
+                FAgent.ContextPrelude := BuildShellContext;
+              if FShellHistory.ClearOnAgentRun then
+                FShellLog.Clear;
+            end;
             // Save user handlers, install our own for the duration of the run
             FPrevAgentOnChunk := FAgent.OnChunk;
             FPrevAgentOnThinking := FAgent.OnThinking;
