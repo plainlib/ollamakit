@@ -1945,24 +1945,43 @@ var
   PrevRefreshed: TModelsRefreshedEvent;
   PrevError: TOllamaErrorEvent;
   I: integer;
-  ModelName, Json, ExpiresAt, SizeStr, Processor, AUntil: string;
+  ModelName, Json, ModelId, Digest, Runner, SizeStr, Processor, UntilText: string;
   Data: TJSONData;
   Obj: TJSONObject;
-  Size, SizeVram: int64;
-  VramPct, CpuPct: integer;
+  Size, SizeVram, CtxLen: int64;
+  CpuPct, GpuPct: integer;
 
-// Human readable time until the model is unloaded, e.g. "4 minutes"
-  function FormatUntil(const AExpiresAt: string): string;
+// Decimal SI units with one decimal place, matches Ollama CLI HumanBytes2
+  function HumanBytes2(const ABytes: int64): string;
+  const
+    UNITS: array[0..4] of string = ('B', 'KB', 'MB', 'GB', 'TB');
+  var
+    V: double;
+    E: integer;
+  begin
+    if ABytes < 1000 then
+      Exit(IntToStr(ABytes) + ' B');
+    V := ABytes;
+    E := 0;
+    while (V >= 1000) and (E < 4) do
+    begin
+      V := V / 1000;
+      Inc(E);
+    end;
+    Result := FormatFloat('0.0', V) + ' ' + UNITS[E];
+  end;
+
+  // Matches Ollama CLI HumanTime: Forever, Stopping..., N days/hours/minutes/seconds
+  function HumanTime(const AExpiresAt: string): string;
   var
     Y, M, D, H, Mn, S: integer;
     ExpiresDate: TDateTime;
+    DiffSec: int64;
     DiffDays: double;
   begin
     if AExpiresAt = '' then
       Exit('unknown');
-    // Ollama emits YYYY-MM-DDTHH:MM:SS.nnnnnnnnn+HH:MM, ISO8601ToDate in FPC
-    // does not accept 9 fractional digits or numeric timezone offsets,
-    // so parse the fixed-width prefix manually and ignore fractional part
+    // Ollama emits YYYY-MM-DDTHH:MM:SS.nnnnnnnnn+HH:MM, parse fixed prefix only
     if Length(AExpiresAt) < 19 then
       Exit(AExpiresAt);
     Y := StrToIntDef(Copy(AExpiresAt, 1, 4), -1);
@@ -1979,21 +1998,22 @@ var
     except
       Exit(AExpiresAt);
     end;
+    // keep_alive of -1 makes Ollama report a year far in the future
+    if Y > 2100 then
+      Exit('Forever');
     // Ollama returns UTC, Now is local, compare in UTC to stay consistent
     DiffDays := ExpiresDate - LocalTimeToUniversal(Now);
-    // keep_alive of -1 makes Ollama report a date far in the future
-    if DiffDays > 365 then
-      Exit('never');
-    if DiffDays <= 0 then
-      Exit('expiring');
-    if DiffDays < 1 / 24 / 60 then
-      Result := '< 1 minute'
-    else if DiffDays < 1 / 24 then
-      Result := Format('%d minutes', [Round(DiffDays * 24 * 60)])
-    else if DiffDays < 1 then
-      Result := Format('%d hours', [Round(DiffDays * 24)])
+    if DiffDays < 0 then
+      Exit('Stopping...');
+    DiffSec := Round(DiffDays * 24 * 60 * 60);
+    if DiffSec >= 86400 then
+      Result := Format('%d days', [DiffSec div 86400])
+    else if DiffSec >= 3600 then
+      Result := Format('%d hours', [DiffSec div 3600])
+    else if DiffSec >= 60 then
+      Result := Format('%d minutes', [DiffSec div 60])
     else
-      Result := Format('%d days', [Round(DiffDays)]);
+      Result := Format('%d seconds', [DiffSec]);
   end;
 
 begin
@@ -2033,18 +2053,19 @@ begin
     DoOutput('(no running models)' + LineEnding, False);
     Exit;
   end;
-  // Header aligned with the CLI: NAME SIZE PROCESSOR UNTIL
-  DoOutput(Format('%-28s %-10s %-16s %s', ['NAME', 'SIZE', 'PROCESSOR', 'UNTIL']) + LineEnding, False);
+  // Columns match the ollama CLI: NAME ID SIZE PROCESSOR CONTEXT RUNNER UNTIL
+  DoOutput(Format('%-20s %-15s %-10s %-20s %-10s %-12s %s', ['NAME', 'ID', 'SIZE', 'PROCESSOR', 'CONTEXT', 'RUNNER', 'UNTIL']) +
+    LineEnding, False);
   for I := 0 to Mgr.RunningModels.Count - 1 do
   begin
     ModelName := Mgr.RunningModels[I];
     Json := Mgr.GetRunningModelJson(ModelName);
-    Size := 0;
-    SizeVram := 0;
-    ExpiresAt := '';
+    ModelId := '-';
     SizeStr := 'unknown';
     Processor := 'unknown';
-    AUntil := 'unknown';
+    Runner := '-';
+    UntilText := 'unknown';
+    CtxLen := 0;
     if Json <> '' then
     begin
       Data := nil;
@@ -2057,30 +2078,44 @@ begin
         if (Data <> nil) and (Data.JSONType = jtObject) then
         begin
           Obj := TJSONObject(Data);
+          // Digest is "sha256:hex", CLI shows first 12 chars after the colon
+          Digest := Obj.Get('digest', '');
+          if Pos(':', Digest) > 0 then
+            Digest := Copy(Digest, Pos(':', Digest) + 1, MaxInt);
+          if Length(Digest) >= 12 then
+            ModelId := Copy(Digest, 1, 12)
+          else if Digest <> '' then
+            ModelId := Digest;
           Size := Obj.Get('size', int64(0));
           SizeVram := Obj.Get('size_vram', int64(0));
-          ExpiresAt := Obj.Get('expires_at', '');
+          CtxLen := Obj.Get('context_length', int64(0));
+          // Runner is present in newer Ollama versions, '-' otherwise
+          Runner := Obj.Get('runner', '-');
+          if Runner = '' then
+            Runner := '-';
           if Size > 0 then
           begin
-            SizeStr := BytesToHumanText(Size);
-            if SizeVram >= Size then
-              Processor := '100% GPU'
-            else if SizeVram <= 0 then
+            SizeStr := HumanBytes2(Size);
+            // CLI shows CPU/GPU order, not GPU/CPU
+            if SizeVram <= 0 then
               Processor := '100% CPU'
+            else if SizeVram >= Size then
+              Processor := '100% GPU'
             else
             begin
-              VramPct := Round(SizeVram * 100 / Size);
-              CpuPct := 100 - VramPct;
-              Processor := Format('%d%%/%d%% GPU/CPU', [VramPct, CpuPct]);
+              CpuPct := Round((Size - SizeVram) * 100 / Size);
+              GpuPct := 100 - CpuPct;
+              Processor := Format('%d%%/%d%% CPU/GPU', [CpuPct, GpuPct]);
             end;
           end;
-          AUntil := FormatUntil(ExpiresAt);
+          UntilText := HumanTime(Obj.Get('expires_at', ''));
         end;
       finally
         Data.Free;
       end;
     end;
-    DoOutput(Format('%-28s %-10s %-16s %s', [ModelName, SizeStr, Processor, AUntil]) + LineEnding, False);
+    DoOutput(Format('%-20s %-15s %-10s %-20s %-10d %-12s %s', [ModelName, ModelId, SizeStr, Processor, CtxLen, Runner, UntilText]) +
+      LineEnding, False);
   end;
 end;
 
