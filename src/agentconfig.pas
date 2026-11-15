@@ -38,50 +38,75 @@ type
     Aliases: string;
     Kind: TAgentPropertyKind;
     Description: string;
+    // True when the property is not stored in the settings file
+    Runtime: boolean;
   end;
 
 const
-  PROPERTIES: array[0..19] of TAgentPropertyInfo = (
+  // Short display names for tool features, index must match TAgentFeature
+  FEATURE_SHORT: array[TAgentFeature] of string = (
+    'filetools', 'exec', 'git', 'interactive', 'finish', 'web'
+    );
+  // Comma separated aliases for each tool, empty when no alias exists
+  FEATURE_ALIASES: array[TAgentFeature] of string = (
+    'file,files', 'execcommand,shell,command', '', 'ask', '', 'webtools'
+    );
+
+  PROPERTIES: array[0..24] of TAgentPropertyInfo = (
+    // OllamaManager settings, saved
     (Name: 'baseurl'; Aliases: 'url,ollama.url'; Kind: apkString;
-    Description: 'Ollama server URL (example: http://localhost:11434)'),
+    Description: 'Ollama server URL (example: http://localhost:11434)'; Runtime: False),
+    (Name: 'keepalive'; Aliases: 'ollama.keepalive'; Kind: apkInteger;
+    Description: 'How long to keep model loaded, -1 forever, 0 unload'; Runtime: False),
+    (Name: 'autorefresh'; Aliases: 'ollama.autorefresh'; Kind: apkBoolean;
+    Description: 'Refresh model list on popup menu'; Runtime: False),
+    (Name: 'connectiontimeout'; Aliases: 'ollama.connectiontimeout'; Kind: apkInteger;
+    Description: 'Connection timeout in ms'; Runtime: False),
+    (Name: 'manager.timeout'; Aliases: 'ollama.timeout,manager.timeout'; Kind: apkInteger;
+    Description: 'OllamaManager default request timeout in ms'; Runtime: False),
+    (Name: 'pulltimeout'; Aliases: 'ollama.pulltimeout'; Kind: apkInteger;
+    Description: 'Pull operation timeout in ms, 0 means no limit'; Runtime: False),
+    // OllamaManager runtime-only
     (Name: 'numctx'; Aliases: 'ollama.numctx'; Kind: apkInteger;
-    Description: 'Context window override, 0 means use model default'),
+    Description: 'Context window override, 0 means use model default'; Runtime: True),
     (Name: 'active'; Aliases: 'ollama.active'; Kind: apkBoolean;
-    Description: 'Enable background refresh and connection'),
+    Description: 'Enable background refresh and connection'; Runtime: True),
+    // OllamaAgent settings, saved
     (Name: 'model'; Aliases: 'modelname'; Kind: apkString;
-    Description: 'Ollama model name (example: flint:40b)'),
+    Description: 'Ollama model name (example: flint:40b)'; Runtime: False),
     (Name: 'systemprompt'; Aliases: 'prompt,sysprompt'; Kind: apkText;
-    Description: 'System message, use "set systemprompt from <file>" for multiline'),
+    Description: 'System message, use "set systemprompt from <file>" for multiline'; Runtime: False),
     (Name: 'maxsteps'; Aliases: 'steps'; Kind: apkInteger;
-    Description: 'Maximum iterations per run, 0 for unlimited'),
-    (Name: 'timeout'; Aliases: 'requesttimeout'; Kind: apkInteger;
-    Description: 'Per-request timeout in ms, 0 means use manager default'),
+    Description: 'Maximum iterations per run, 0 for unlimited'; Runtime: False),
+    (Name: 'timeout'; Aliases: 'agent.timeout,requesttimeout'; Kind: apkInteger;
+    Description: 'Per-request timeout in ms, 0 means use manager default'; Runtime: False),
     (Name: 'streaming'; Aliases: ''; Kind: apkBoolean;
-    Description: 'Stream content and thinking in real time'),
+    Description: 'Stream content and thinking in real time'; Runtime: False),
     (Name: 'tools'; Aliases: 'enabledtools'; Kind: apkFeatureSet;
-    Description: 'Comma separated: filetools,exec,git,interactive,finish,web,all,none'),
+    Description: 'Comma separated: filetools, exec, git, interactive, finish, web, all, none'; Runtime: False),
     (Name: 'rootpath'; Aliases: 'root'; Kind: apkString;
-    Description: 'Sandbox directory for file tools'),
-    (Name: 'keephistory'; Aliases: 'history'; Kind: apkBoolean;
-    Description: 'Persist messages between runs'),
+    Description: 'Sandbox directory for file tools'; Runtime: False),
+    (Name: 'keephistory'; Aliases: 'persist'; Kind: apkBoolean;
+    Description: 'Persist messages between runs'; Runtime: False),
     (Name: 'log'; Aliases: ''; Kind: apkBoolean;
-    Description: 'Log every step to stderr'),
+    Description: 'Log every step to stderr'; Runtime: False),
+    // Web options, saved
     (Name: 'web.searchurl'; Aliases: 'searchurl'; Kind: apkString;
-    Description: 'URL template for web_search, use {query} placeholder'),
+    Description: 'URL template for web_search, use {query} placeholder'; Runtime: False),
     (Name: 'web.useragent'; Aliases: 'useragent'; Kind: apkString;
-    Description: 'User-Agent header for web requests'),
+    Description: 'User-Agent header for web requests'; Runtime: False),
     (Name: 'web.timeout'; Aliases: 'web.requesttimeout'; Kind: apkInteger;
-    Description: 'Timeout for web requests in ms'),
+    Description: 'Timeout for web requests in ms'; Runtime: False),
     (Name: 'web.maxbytes'; Aliases: 'web.maxresponsebytes'; Kind: apkInteger;
-    Description: 'Maximum response body size for web tools'),
+    Description: 'Maximum response body size for web tools'; Runtime: False),
     (Name: 'web.striphtml'; Aliases: ''; Kind: apkBoolean;
-    Description: 'Strip HTML tags from web responses'),
+    Description: 'Strip HTML tags from web responses'; Runtime: False),
     (Name: 'web.blocklocalhost'; Aliases: ''; Kind: apkBoolean;
-    Description: 'Block localhost in web tools'),
+    Description: 'Block localhost in web tools'; Runtime: False),
     (Name: 'web.blockprivateips'; Aliases: ''; Kind: apkBoolean;
-    Description: 'Block private IPs in web tools'),
+    Description: 'Block private IPs in web tools'; Runtime: False),
     (Name: 'web.allowedhosts'; Aliases: 'allowedhosts'; Kind: apkHostList;
-    Description: 'Comma separated host whitelist, empty or "none" allows any host')
+    Description: 'Comma separated host whitelist, empty or "none" allows any host'; Runtime: False)
     );
 
 type
@@ -171,29 +196,48 @@ begin
     Result := 'off';
 end;
 
+// Resolves a short tool name or alias to a feature, False when unknown
+function FindFeature(const AName: string; out AFeature: TAgentFeature): boolean;
+var
+  F: TAgentFeature;
+  Alias: string;
+begin
+  Result := False;
+  AFeature := afFileTools;
+  for F := Low(TAgentFeature) to High(TAgentFeature) do
+  begin
+    if FEATURE_SHORT[F] = AName then
+    begin
+      AFeature := F;
+      Exit(True);
+    end;
+    if FEATURE_ALIASES[F] <> '' then
+    begin
+      Alias := ',' + FEATURE_ALIASES[F] + ',';
+      if Pos(',' + AName + ',', Alias) > 0 then
+      begin
+        AFeature := F;
+        Exit(True);
+      end;
+    end;
+  end;
+end;
+
 // Formats tool feature set as comma separated short names
 function FormatFeatures(AFeatures: TAgentFeatures): string;
 var
   Parts: TStringList;
+  F: TAgentFeature;
 begin
   Parts := TStringList.Create;
   try
-    if afFileTools in AFeatures then
-      Parts.Add('filetools');
-    if afExecCommand in AFeatures then
-      Parts.Add('exec');
-    if afGit in AFeatures then
-      Parts.Add('git');
-    if afInteractive in AFeatures then
-      Parts.Add('interactive');
-    if afFinish in AFeatures then
-      Parts.Add('finish');
-    if afWebTools in AFeatures then
-      Parts.Add('web');
+    for F := Low(TAgentFeature) to High(TAgentFeature) do
+      if F in AFeatures then
+        Parts.Add(FEATURE_SHORT[F]);
     if Parts.Count = 0 then
       Result := 'none'
     else
-      Result := Parts.CommaText;
+      Result := StringReplace(Parts.CommaText, ',', ', ', [rfReplaceAll]);
   finally
     Parts.Free;
   end;
@@ -206,6 +250,7 @@ var
   I: integer;
   Name: string;
   HasNone, HasAll: boolean;
+  F: TAgentFeature;
 begin
   Result := False;
   AError := '';
@@ -226,31 +271,27 @@ begin
         HasNone := True
       else if Name = 'all' then
         HasAll := True
-      else if (Name = 'filetools') or (Name = 'file') or (Name = 'files') then
-        Include(AFeatures, afFileTools)
-      else if (Name = 'exec') or (Name = 'execcommand') or (Name = 'shell') or (Name = 'command') then
-        Include(AFeatures, afExecCommand)
-      else if Name = 'git' then
-        Include(AFeatures, afGit)
-      else if (Name = 'interactive') or (Name = 'ask') then
-        Include(AFeatures, afInteractive)
-      else if Name = 'finish' then
-        Include(AFeatures, afFinish)
-      else if (Name = 'web') or (Name = 'webtools') then
-        Include(AFeatures, afWebTools)
-      else
+      else if not FindFeature(Name, F) then
       begin
         AError := 'unknown tool: ' + Name;
         Exit;
-      end;
+      end
+      else
+        Include(AFeatures, F);
     end;
     if HasNone and HasAll then
     begin
       AError := 'cannot mix "none" and "all"';
       Exit;
     end;
+    if HasNone and (AFeatures <> []) then
+    begin
+      AError := '"none" cannot be combined with other tools';
+      Exit;
+    end;
     if HasAll then
-      AFeatures := [afFileTools, afExecCommand, afGit, afInteractive, afFinish, afWebTools];
+      for F := Low(TAgentFeature) to High(TAgentFeature) do
+        Include(AFeatures, F);
     if HasNone then
       AFeatures := [];
     Result := True;
@@ -262,33 +303,39 @@ end;
 function FormatAgentHelp: string;
 var
   I: integer;
-  NameCol: string;
+  NameCol, Marker: string;
 begin
   Result :=
     'Agent configuration:' + LineEnding + '  set <name> <value>     Set an agent property' + LineEnding +
     '  get <name>             Show current value of a property' + LineEnding +
-    '  config                 Show all current agent settings' + LineEnding +
+    '  config                 Show saved settings (excludes runtime-only)' + LineEnding +
+    '  models                 Query Ollama server and list installed models' + LineEnding +
     '  help agent             Show this help (also just "?")' + LineEnding + LineEnding + 'Value formats:' +
     LineEnding + '  string    free text, use quotes if it contains spaces' + LineEnding +
     '  integer   whole number, 0 has special meaning where noted' + LineEnding + '  boolean   on, off, true, false, yes, no, 1, 0' +
-    LineEnding + '  set       comma separated names, for example "filetools,exec,git"' + LineEnding +
+    LineEnding + '  set       comma separated names, for example "filetools, exec, git"' + LineEnding +
     '  text      single line, or "from <file>" to load multiline file' + LineEnding +
-    '  list      comma separated entries, "none" clears the list' + LineEnding + LineEnding + 'Properties:' + LineEnding;
+    '  list      comma separated entries, "none" clears the list' + LineEnding + LineEnding +
+    'Properties (marked * are runtime-only and not saved between runs):' + LineEnding;
   for I := Low(PROPERTIES) to High(PROPERTIES) do
   begin
-    NameCol := '  ' + PROPERTIES[I].Name;
-    while Length(NameCol) < 24 do
+    if PROPERTIES[I].Runtime then
+      Marker := ' * '
+    else
+      Marker := '   ';
+    NameCol := '  ' + Marker + PROPERTIES[I].Name;
+    while Length(NameCol) < 26 do
       NameCol := NameCol + ' ';
     Result := Result + NameCol + PROPERTIES[I].Description + LineEnding;
     if PROPERTIES[I].Aliases <> '' then
-      Result := Result + '    aliases: ' + PROPERTIES[I].Aliases + LineEnding;
+      Result := Result + '      aliases: ' + PROPERTIES[I].Aliases + LineEnding;
   end;
   Result := Result + LineEnding + 'Examples:' + LineEnding + '  set baseurl http://192.168.1.10:11434' +
-    LineEnding + '  set numctx 8192' + LineEnding + '  set active on' + LineEnding + '  models' +
-    LineEnding + '  set model qwen2.5:7b' + LineEnding + '  set maxsteps 40' + LineEnding +
-    '  set streaming on' + LineEnding + '  set tools filetools,exec,web' + LineEnding + '  set tools all' +
-    LineEnding + '  set systemprompt from prompt.txt' + LineEnding + '  set web.timeout 8000' + LineEnding +
-    '  get tools' + LineEnding + '  config';
+    LineEnding + '  set keepalive -1' + LineEnding + '  set numctx 8192' + LineEnding + '  set active on' +
+    LineEnding + '  models' + LineEnding + '  set model qwen2.5:7b' + LineEnding + '  set maxsteps 40' +
+    LineEnding + '  set streaming on' + LineEnding + '  set tools filetools, exec, web' + LineEnding +
+    '  set tools all' + LineEnding + '  set systemprompt from prompt.txt' + LineEnding + '  set web.timeout 8000' +
+    LineEnding + '  get tools' + LineEnding + '  config';
 end;
 
 function FormatAgentConfig(AAgent: TCustomOllamaAgent): string;
@@ -317,12 +364,18 @@ begin
       Result := T.Text;
       Exit;
     end;
-    // Manager block first so the connection target is visible at the top
+    // OllamaManager block, only fields that are saved to disk
     if Assigned(AAgent.OllamaManager) then
     begin
-      Add('baseurl', AAgent.OllamaManager.BaseURL);
-      Add('numctx', IntToStr(AAgent.OllamaManager.NumCtx));
-      Add('active', BoolToStrValue(AAgent.OllamaManager.Active));
+      if AAgent.OllamaManager.BaseURL = '' then
+        Add('baseurl', '(empty)')
+      else
+        Add('baseurl', AAgent.OllamaManager.BaseURL);
+      Add('keepalive', IntToStr(AAgent.OllamaManager.KeepAlive));
+      Add('autorefresh', BoolToStrValue(AAgent.OllamaManager.AutoRefresh));
+      Add('connectiontimeout', IntToStr(AAgent.OllamaManager.ConnectionTimeout));
+      Add('manager.timeout', IntToStr(AAgent.OllamaManager.RequestTimeout));
+      Add('pulltimeout', IntToStr(AAgent.OllamaManager.PullTimeout));
       T.Add('');
     end
     else
@@ -330,6 +383,7 @@ begin
       Add('baseurl', '(no OllamaManager)');
       T.Add('');
     end;
+    // OllamaAgent block
     Add('model', AAgent.ModelName);
     SysPreview := string(AAgent.SystemPrompt);
     if Length(SysPreview) > 80 then
@@ -362,10 +416,12 @@ begin
     Add('web.striphtml', BoolToStrValue(AAgent.WebOptions.StripHtml));
     Add('web.blocklocalhost', BoolToStrValue(AAgent.WebOptions.BlockLocalhost));
     Add('web.blockprivateips', BoolToStrValue(AAgent.WebOptions.BlockPrivateIPs));
-    if AAgent.WebOptions.AllowedHosts.Count > 0 then
-      Add('web.allowedhosts', AAgent.WebOptions.AllowedHosts.CommaText)
+    if AAgent.WebOptions.AllowedHosts.Count = 0 then
+      Add('web.allowedhosts', '(any host)')
+    else if AAgent.WebOptions.AllowedHosts.Count > 5 then
+      Add('web.allowedhosts', IntToStr(AAgent.WebOptions.AllowedHosts.Count) + ' hosts, use "get web.allowedhosts" to list')
     else
-      Add('web.allowedhosts', '(any host)');
+      Add('web.allowedhosts', StringReplace(AAgent.WebOptions.AllowedHosts.CommaText, ',', ', ', [rfReplaceAll]));
     Result := T.Text;
   finally
     T.Free;
@@ -389,33 +445,34 @@ begin
     AError := 'unknown property: ' + AName + ', use "help agent" for list';
     Exit;
   end;
-  if Canonical = 'baseurl' then
+  // Manager-owned properties
+  if (Canonical = 'baseurl') or (Canonical = 'keepalive') or (Canonical = 'autorefresh') or
+    (Canonical = 'connectiontimeout') or (Canonical = 'manager.timeout') or (Canonical = 'pulltimeout') or
+    (Canonical = 'numctx') or (Canonical = 'active') then
   begin
     if not Assigned(AAgent.OllamaManager) then
     begin
       AError := 'agent has no OllamaManager';
       Exit;
     end;
-    AValue := AAgent.OllamaManager.BaseURL;
+    if Canonical = 'baseurl' then
+      AValue := AAgent.OllamaManager.BaseURL
+    else if Canonical = 'keepalive' then
+      AValue := IntToStr(AAgent.OllamaManager.KeepAlive)
+    else if Canonical = 'autorefresh' then
+      AValue := BoolToStrValue(AAgent.OllamaManager.AutoRefresh)
+    else if Canonical = 'connectiontimeout' then
+      AValue := IntToStr(AAgent.OllamaManager.ConnectionTimeout)
+    else if Canonical = 'manager.timeout' then
+      AValue := IntToStr(AAgent.OllamaManager.RequestTimeout)
+    else if Canonical = 'pulltimeout' then
+      AValue := IntToStr(AAgent.OllamaManager.PullTimeout)
+    else if Canonical = 'numctx' then
+      AValue := IntToStr(AAgent.OllamaManager.NumCtx)
+    else if Canonical = 'active' then
+      AValue := BoolToStrValue(AAgent.OllamaManager.Active);
   end
-  else if Canonical = 'numctx' then
-  begin
-    if not Assigned(AAgent.OllamaManager) then
-    begin
-      AError := 'agent has no OllamaManager';
-      Exit;
-    end;
-    AValue := IntToStr(AAgent.OllamaManager.NumCtx);
-  end
-  else if Canonical = 'active' then
-  begin
-    if not Assigned(AAgent.OllamaManager) then
-    begin
-      AError := 'agent has no OllamaManager';
-      Exit;
-    end;
-    AValue := BoolToStrValue(AAgent.OllamaManager.Active);
-  end
+  // Agent-owned properties
   else if Canonical = 'model' then
     AValue := AAgent.ModelName
   else if Canonical = 'systemprompt' then
@@ -488,48 +545,90 @@ begin
   if (Length(Value) >= 2) and (Value[1] = '"') and (Value[Length(Value)] = '"') then
     Value := Copy(Value, 2, Length(Value) - 2);
 
-  if Canonical = 'baseurl' then
+  // Manager-owned properties
+  if (Canonical = 'baseurl') or (Canonical = 'keepalive') or (Canonical = 'autorefresh') or
+    (Canonical = 'connectiontimeout') or (Canonical = 'manager.timeout') or (Canonical = 'pulltimeout') or
+    (Canonical = 'numctx') or (Canonical = 'active') then
   begin
     if not Assigned(AAgent.OllamaManager) then
     begin
       AError := 'agent has no OllamaManager';
       Exit;
     end;
-    if Trim(Value) = '' then
+    if Canonical = 'baseurl' then
     begin
-      AError := 'baseurl cannot be empty';
-      Exit;
+      if Trim(Value) = '' then
+      begin
+        AError := 'baseurl cannot be empty';
+        Exit;
+      end;
+      AAgent.OllamaManager.BaseURL := Value;
+    end
+    else if Canonical = 'keepalive' then
+    begin
+      if not TryStrToInt(Value, IntVal) then
+      begin
+        AError := 'keepalive must be an integer';
+        Exit;
+      end;
+      AAgent.OllamaManager.KeepAlive := IntVal;
+    end
+    else if Canonical = 'autorefresh' then
+    begin
+      if not ParseBoolValue(Value, BoolVal) then
+      begin
+        AError := 'autorefresh must be on/off, true/false, yes/no';
+        Exit;
+      end;
+      AAgent.OllamaManager.AutoRefresh := BoolVal;
+    end
+    else if Canonical = 'connectiontimeout' then
+    begin
+      if not TryStrToInt(Value, IntVal) or (IntVal < 0) then
+      begin
+        AError := 'connectiontimeout must be a non-negative integer';
+        Exit;
+      end;
+      AAgent.OllamaManager.ConnectionTimeout := IntVal;
+    end
+    else if Canonical = 'manager.timeout' then
+    begin
+      if not TryStrToInt(Value, IntVal) or (IntVal < 0) then
+      begin
+        AError := 'manager.timeout must be a non-negative integer';
+        Exit;
+      end;
+      AAgent.OllamaManager.RequestTimeout := IntVal;
+    end
+    else if Canonical = 'pulltimeout' then
+    begin
+      if not TryStrToInt(Value, IntVal) or (IntVal < 0) then
+      begin
+        AError := 'pulltimeout must be a non-negative integer';
+        Exit;
+      end;
+      AAgent.OllamaManager.PullTimeout := IntVal;
+    end
+    else if Canonical = 'numctx' then
+    begin
+      if not TryStrToInt(Value, IntVal) or (IntVal < 0) then
+      begin
+        AError := 'numctx must be a non-negative integer';
+        Exit;
+      end;
+      AAgent.OllamaManager.NumCtx := IntVal;
+    end
+    else if Canonical = 'active' then
+    begin
+      if not ParseBoolValue(Value, BoolVal) then
+      begin
+        AError := 'active must be on/off, true/false, yes/no';
+        Exit;
+      end;
+      AAgent.OllamaManager.Active := BoolVal;
     end;
-    AAgent.OllamaManager.BaseURL := Value;
   end
-  else if Canonical = 'numctx' then
-  begin
-    if not Assigned(AAgent.OllamaManager) then
-    begin
-      AError := 'agent has no OllamaManager';
-      Exit;
-    end;
-    if not TryStrToInt(Value, IntVal) or (IntVal < 0) then
-    begin
-      AError := 'numctx must be a non-negative integer';
-      Exit;
-    end;
-    AAgent.OllamaManager.NumCtx := IntVal;
-  end
-  else if Canonical = 'active' then
-  begin
-    if not Assigned(AAgent.OllamaManager) then
-    begin
-      AError := 'agent has no OllamaManager';
-      Exit;
-    end;
-    if not ParseBoolValue(Value, BoolVal) then
-    begin
-      AError := 'active must be on/off, true/false, yes/no';
-      Exit;
-    end;
-    AAgent.OllamaManager.Active := BoolVal;
-  end
+  // Agent-owned properties
   else if Canonical = 'model' then
     AAgent.ModelName := Value
   else if Canonical = 'systemprompt' then
@@ -548,7 +647,6 @@ begin
     end;
     if FirstWord = 'from' then
     begin
-      // Strip quotes around the filename
       if (Length(RestValue) >= 2) and (RestValue[1] = '"') and (RestValue[Length(RestValue)] = '"') then
         RestValue := Copy(RestValue, 2, Length(RestValue) - 2);
       if RestValue = '' then
@@ -744,23 +842,37 @@ begin
     Collector.Success := False;
     Collector.ErrorMsg := '';
 
-    // Save existing handlers so host callbacks are not lost
-    OldModelsHandler := AAgent.OllamaManager.OnModelsRefreshed;
-    OldErrorHandler := AAgent.OllamaManager.OnError;
-    AAgent.OllamaManager.OnModelsRefreshed := @Collector.OnModels;
-    AAgent.OllamaManager.OnError := @Collector.OnError;
-    try
-      AAgent.OllamaManager.RefreshModels;
-      Timeout := AAgent.OllamaManager.RequestTimeout;
-      if Timeout <= 0 then
-        Timeout := 15000;
-      StartTime := GetTickCount64;
-      // Pump the sync queue until event arrives or timeout expires
-      while (not Collector.Done) and (GetTickCount64 - StartTime < QWord(Timeout)) do
-        CheckSynchronize(50);
-    finally
-      AAgent.OllamaManager.OnModelsRefreshed := OldModelsHandler;
-      AAgent.OllamaManager.OnError := OldErrorHandler;
+    // Fast path: manager already connected, use cached list without HTTP
+    if AAgent.OllamaManager.IsConnected and not AAgent.OllamaManager.IsConnecting then
+    begin
+      Collector.Models.Assign(AAgent.OllamaManager.InstalledModels);
+      Collector.Success := True;
+      Collector.Done := True;
+    end
+    else
+    begin
+      OldModelsHandler := AAgent.OllamaManager.OnModelsRefreshed;
+      OldErrorHandler := AAgent.OllamaManager.OnError;
+      AAgent.OllamaManager.OnModelsRefreshed := @Collector.OnModels;
+      AAgent.OllamaManager.OnError := @Collector.OnError;
+      try
+        AAgent.OllamaManager.RefreshModels;
+        Timeout := AAgent.OllamaManager.RequestTimeout;
+        if Timeout <= 0 then
+          Timeout := 15000;
+        StartTime := GetTickCount64;
+        while (not Collector.Done) and (GetTickCount64 - StartTime < QWord(Timeout)) do
+          CheckSynchronize(50);
+        if (not Collector.Done) and AAgent.OllamaManager.IsConnected then
+        begin
+          Collector.Models.Assign(AAgent.OllamaManager.InstalledModels);
+          Collector.Success := True;
+          Collector.Done := True;
+        end;
+      finally
+        AAgent.OllamaManager.OnModelsRefreshed := OldModelsHandler;
+        AAgent.OllamaManager.OnError := OldErrorHandler;
+      end;
     end;
 
     if not Collector.Done then
@@ -785,7 +897,6 @@ begin
       else
         for I := 0 to Collector.Models.Count - 1 do
         begin
-          // Mark the currently selected model
           if Collector.Models[I] = AAgent.ModelName then
             T.Add('  * ' + Collector.Models[I])
           else

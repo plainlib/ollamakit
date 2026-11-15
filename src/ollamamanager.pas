@@ -203,6 +203,8 @@ type
     // Returns context length of a loaded model from last refresh, 0 if unknown
     function GetModelContextLength(const ModelName: string): int64;
 
+    // Currently installed models as reported by the last refresh
+    property InstalledModels: TStringList read FInstalledModels;
     property BaseURL: string read FBaseURL write SetBaseURL;
     property PopupMenu: TPopupMenu read FPopupMenu write SetPopupMenu;
     property Active: boolean read FActive write SetActive default True;
