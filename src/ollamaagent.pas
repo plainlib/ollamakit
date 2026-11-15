@@ -8,6 +8,10 @@ unit OllamaAgent;
 
 {$mode objfpc}{$H+}
 
+{$IFDEF DEBUG}
+{$R+}{$Q+}
+{$ENDIF}
+
 interface
 
 uses
@@ -292,7 +296,7 @@ type
 implementation
 
 uses
-  FileUtil, Math, RegExpr, httpsend, blcksock;
+  FileUtil, Math, RegExpr;
 
 // Returns display name for an agent operation kind
 function AgentOpName(AOp: TAgentOperation): string;
@@ -551,6 +555,37 @@ begin
   Result := StringReplace(Result, '&nbsp;', ' ', [rfReplaceAll]);
 end;
 
+// Converts git-style globs like **/*.md and [Aa] classes to Windows patterns
+function NormalizeGlobPattern(const APattern: string): string;
+var
+  I, BracketEnd: integer;
+begin
+  Result := APattern;
+  // Strip git-style **/ prefix, FindAllFiles is already recursive
+  if (Copy(Result, 1, 3) = '**/') or (Copy(Result, 1, 3) = '**\') then
+    Delete(Result, 1, 3)
+  else if Copy(Result, 1, 2) = '**' then
+    Result := '*' + Copy(Result, 3, MaxInt);
+  // Replace [Xy] classes with first character, Windows FS is case-insensitive
+  I := 1;
+  while I <= Length(Result) do
+  begin
+    if Result[I] = '[' then
+    begin
+      BracketEnd := Pos(']', Result, I);
+      if BracketEnd > I + 1 then
+      begin
+        Result := Copy(Result, 1, I - 1) + Result[I + 1] + Copy(Result, BracketEnd + 1, MaxInt);
+        Inc(I);
+        Continue;
+      end;
+    end;
+    Inc(I);
+  end;
+  // Normalize slashes to platform delimiters
+  Result := StringReplace(Result, '/', PathDelim, [rfReplaceAll]);
+end;
+
 { TAgentWebOptions }
 
 constructor TAgentWebOptions.Create;
@@ -596,49 +631,6 @@ begin
   end
   else
     inherited Assign(Source);
-end;
-
-type
-  // Closes the HTTP socket after a hard deadline to abort blocked requests
-  TWebAbortWatchdog = class(TThread)
-  private
-    FSock: TTCPBlockSocket;
-    FTimeoutMs: integer;
-    FAborted: boolean;
-  protected
-    procedure Execute; override;
-  public
-    constructor Create(ASock: TTCPBlockSocket; ATimeoutMs: integer);
-    property Aborted: boolean read FAborted;
-  end;
-
-constructor TWebAbortWatchdog.Create(ASock: TTCPBlockSocket; ATimeoutMs: integer);
-begin
-  inherited Create(True);
-  FreeOnTerminate := False;
-  FSock := ASock;
-  FTimeoutMs := ATimeoutMs;
-  FAborted := False;
-end;
-
-procedure TWebAbortWatchdog.Execute;
-var
-  Elapsed: integer;
-begin
-  Elapsed := 0;
-  while (not Terminated) and (Elapsed < FTimeoutMs) do
-  begin
-    Sleep(100);
-    Inc(Elapsed, 100);
-  end;
-  if Terminated then
-    Exit;
-  FAborted := True;
-  try
-    FSock.CloseSocket;
-  except
-    ;
-  end;
 end;
 
 type
@@ -1233,6 +1225,38 @@ begin
     if FAgent.KeepHistory then
     begin
       try
+        // Close the cancelled turn so the next user message does not
+        // appear as two user messages in a row and lose the current request
+        if Reason = afrCancelled then
+        begin
+          // Resolve orphaned tool calls that were never executed
+          if (MessagesArr.Count > 0) and (MessagesArr.Items[MessagesArr.Count - 1].JSONType = jtObject) then
+          begin
+            Data := TJSONObject(MessagesArr.Items[MessagesArr.Count - 1]).Find('tool_calls');
+            if (Data <> nil) and (Data.JSONType = jtArray) then
+            begin
+              for I := 0 to TJSONArray(Data).Count - 1 do
+              begin
+                MsgObj := TJSONObject.Create;
+                MsgObj.Add('role', 'tool');
+                MsgObj.Add('content', '{"error": "cancelled by user before execution"}');
+                MessagesArr.Add(MsgObj);
+              end;
+            end;
+            // Do not free Data, it is owned by the parent message object
+            Data := nil;
+          end;
+          // Close the turn with partial content and a cancel marker
+          MsgObj := TJSONObject.Create;
+          MsgObj.Add('role', 'assistant');
+          if FinalContent <> '' then
+            MsgObj.Add('content', FinalContent + #10#10 +
+              '[cancelled by user, partial answer above may be incomplete, user may refer to it]')
+          else
+            MsgObj.Add('content', '[cancelled by user before any answer was produced, user may refer to this request]');
+          MessagesArr.Add(MsgObj);
+        end;
+        // Strip leading system message, it is rebuilt on each run
         if (MessagesArr.Count > 0) and (MessagesArr.Items[0].JSONType = jtObject) and
           (TJSONObject(MessagesArr.Items[0]).Get('role', '') = 'system') then
           MessagesArr.Delete(0);
@@ -1399,24 +1423,48 @@ end;
 
 function TCustomOllamaAgent.BuildSystemPrompt: string;
 var
-  ToolList: string;
+  ToolList, PlatformName, EnvironmentBlock: string;
 begin
+  // Resolve user-provided placeholders first
   Result := string(FSystemPrompt);
   Result := StringReplace(Result, '{path}', GetEffectiveRootPath, [rfReplaceAll]);
   Result := StringReplace(Result, '{model}', FModelName, [rfReplaceAll]);
-  // Resolve {tools} with the actual tool list or 'none'
   ToolList := BuildToolsNames;
   if ToolList = '' then
     ToolList := 'none';
   Result := StringReplace(Result, '{tools}', ToolList, [rfReplaceAll]);
-  // Append authoritative tool state so the model cannot claim disabled tools
-  if BuildToolsNames = '' then
-    Result := Result + #10#10 + 'IMPORTANT: no tools are currently enabled. You cannot run shell commands, ' +
+
+  // Platform identity is compiled in, not guessed at runtime
+  {$IFDEF WINDOWS}
+  PlatformName := 'Windows';
+  {$ELSE}
+  {$IFDEF LINUX}
+    PlatformName := 'Linux';
+  {$ELSE}
+  {$IFDEF DARWIN}
+      PlatformName := 'macOS';
+  {$ELSE}
+  PlatformName := 'Unix-like';
+  {$ENDIF}
+  {$ENDIF}
+  {$ENDIF}
+
+  // Append environment facts the model can rely on, host-neutral wording
+  EnvironmentBlock :=
+    'Environment facts:' + LineEnding + '- Platform: ' + PlatformName + LineEnding + '- Path delimiter: "' +
+    PathDelim + '"' + LineEnding + '- Workspace root: ' + GetEffectiveRootPath + LineEnding +
+    '- The workspace root may change during the session. Always re-check file ' +
+    'existence after any directory change with a fresh tool call, results from ' + 'previous locations may be stale.' + LineEnding;
+  Result := Result + #10#10 + EnvironmentBlock;
+
+  // Append authoritative tool list so the model cannot claim disabled tools
+  if ToolList = 'none' then
+    Result := Result + #10 + 'IMPORTANT: no tools are currently enabled. You cannot run shell commands, ' +
       'read or write files, list directories, search the workspace, access the ' +
       'internet, or call any other external function. If the user asks for such ' +
       'actions, explain that no tools are enabled and ask them to enable the ' + 'corresponding feature in the agent settings.'
   else
-    Result := Result + #10#10 + 'IMPORTANT: the only tools currently enabled are: ' + ToolList + '. ' +
+    Result := Result + #10 + 'IMPORTANT: the only tools currently enabled are: ' + ToolList + '. ' +
       'You must not claim access to any tool that is not in this list. ' +
       'If the user asks for an action that requires an unavailable tool, ' + 'explain that the tool is not enabled.';
 end;
@@ -1594,14 +1642,22 @@ begin
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
       AddTool(Arr, 'create_directory', 'Create a directory and all parent directories',
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
-      AddTool(Arr, 'find_files', 'Find files by glob pattern, recursive by default, capped at 2000 results',
+      AddTool(Arr, 'find_files',
+        'Find files by name using shell wildcards: * matches any characters, ? matches one character. ' +
+        'Examples: "*.md" finds all markdown files, "src/*.pas" finds pascal files in src, ' +
+        '"config.*" finds config with any extension. Search is recursive by default, do NOT ' +
+        'add a ** prefix. Character classes like [abc] are not supported. Capped at 2000 results.',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
       AddTool(Arr, 'grep', 'Search files by regex or literal pattern, capped at 500 matches',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"},"literal":{"type":"boolean"}},"required":["pattern"]}');
     end;
 
     if afExecCommand in FFeatures then
-      AddTool(Arr, 'exec_command', 'Execute a shell command and return combined stdout and stderr',
+      AddTool(Arr, 'exec_command',
+        'Execute a shell command in the current workspace and return combined stdout and stderr. ' +
+        'The command runs in the host shell (see the environment description for the exact shell ' +
+        'and its rules). Redirect with > and >>. Prefer portable commands where possible. ' +
+        'See the environment description for OS-specific notes, path syntax and forbidden utilities.',
         '{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}');
 
     if afGit in FFeatures then
@@ -1725,32 +1781,48 @@ begin
 end;
 
 function TCustomOllamaAgent.DoWriteFile(AArgs: TJSONObject): string;
+const
+  MAX_WRITE_BYTES = 16 * 1024 * 1024;
 var
   RelPath, FullPath, Content: string;
   Stream: TFileStream;
-  Bytes: TBytes;
+  Bytes: TBytes = ();
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
     Exit;
   RelPath := AArgs.Get('path', '');
   Content := AArgs.Get('content', '');
+  if Length(Content) > MAX_WRITE_BYTES then
+  begin
+    Result := '{"error": "content too large: ' + IntToStr(Length(Content)) + ' bytes, maximum is ' + IntToStr(MAX_WRITE_BYTES) + '"}';
+    Exit;
+  end;
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
     Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
     Exit;
   end;
-  ForceDirectories(ExtractFileDir(FullPath));
-  Stream := TFileStream.Create(FullPath, fmCreate);
   try
-    Bytes := TBytes(Content);
-    if Length(Bytes) > 0 then
-      Stream.Write(Bytes[0], Length(Bytes));
-  finally
-    Stream.Free;
+    ForceDirectories(ExtractFileDir(FullPath));
+    Stream := TFileStream.Create(FullPath, fmCreate);
+    try
+      if Length(Content) > 0 then
+      begin
+        // Explicit copy avoids TBytes(string) cast edge cases
+        SetLength(Bytes, Length(Content));
+        Move(Content[1], Bytes[0], Length(Content));
+        Stream.Write(Bytes[0], Length(Bytes));
+      end;
+    finally
+      Stream.Free;
+    end;
+    Result := '{"ok": true, "bytes": ' + IntToStr(Length(Content)) + '}';
+  except
+    on E: Exception do
+      Result := '{"error": "write failed: ' + StringReplace(E.Message, '"', '\"', [rfReplaceAll]) + '"}';
   end;
-  Result := '{"ok": true, "bytes": ' + IntToStr(Length(Content)) + '}';
 end;
 
 function TCustomOllamaAgent.DoListFiles(AArgs: TJSONObject): string;
@@ -2207,6 +2279,8 @@ begin
   Recursive := AArgs.Get('recursive', True);
   if Pattern = '' then
     Pattern := '*';
+  // Accept git-style globs and character classes from the model
+  Pattern := NormalizeGlobPattern(Pattern);
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -2473,8 +2547,6 @@ var
   Headers, Cookies, ResponseHeaders: TStringList;
   Err: boolean;
   Tm: TTimeout;
-  HTTP: THTTPSend;
-  Watchdog: TWebAbortWatchdog;
 begin
   Result := False;
   AContent := '';
@@ -2482,24 +2554,14 @@ begin
   Headers := TStringList.Create;
   Cookies := TStringList.Create;
   ResponseHeaders := nil;
-  HTTP := THTTPSend.Create;
-  Watchdog := nil;
   try
     try
-      // Hard deadline enforced by a watchdog that closes the socket
-      Watchdog := TWebAbortWatchdog.Create(HTTP.Sock, FWebOptions.RequestTimeout);
-      Watchdog.Start;
+      // Synapse timeouts apply to each send and recv operation, no external abort
       Tm.Connection := FWebOptions.RequestTimeout;
       Tm.Request := FWebOptions.RequestTimeout;
       AContent := TNetwork.WebRequest(wmGet, AUrl, '', Headers, FWebOptions.UserAgent, '',
         'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', False, Default(TProxy), Tm,
-        Cookies, ResponseHeaders, Err, HTTP);
-      if Watchdog.Aborted then
-      begin
-        AErrorMsg := 'request aborted after ' + IntToStr(FWebOptions.RequestTimeout) + ' ms';
-        AContent := '';
-        Exit;
-      end;
+        Cookies, ResponseHeaders, Err);
       if Err then
       begin
         AErrorMsg := 'http request failed: ' + Copy(AContent, 1, 300);
@@ -2516,13 +2578,6 @@ begin
       end;
     end;
   finally
-    if Watchdog <> nil then
-    begin
-      Watchdog.Terminate;
-      Watchdog.WaitFor;
-      Watchdog.Free;
-    end;
-    HTTP.Free;
     Headers.Free;
     Cookies.Free;
     ResponseHeaders.Free;
