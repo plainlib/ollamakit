@@ -12,7 +12,7 @@ interface
 
 uses
   Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser,
-  OllamaAgent{$IFDEF WINDOWS}, Windows{$ENDIF};
+  OllamaAgent, AgentConfig{$IFDEF WINDOWS}, Windows{$ENDIF};
 
 type
   // Classification of a single input line
@@ -69,6 +69,16 @@ type
     FOnExit: TTermExitEvent;
     procedure SetPath(const AValue: string);
     procedure SetAgent(const AValue: TCustomOllamaAgent);
+    procedure SetHistory(const AValue: TStringList);
+    function BuildToolsList(AFeatures: TAgentFeatures): string;
+    // Handles help, help agent, and ? alias
+    procedure HandleHelpCommand(const AArg: string);
+    // Handles set <name> <value>
+    procedure HandleSetCommand(const AArg: string);
+    // Handles get <name>
+    procedure HandleGetCommand(const AArg: string);
+    // Handles models, queries OllamaManager for available models
+    procedure HandleModelsCommand(const AArg: string);
   protected
     // Clears agent reference when it is removed at runtime
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -144,6 +154,7 @@ type
     property UsePrefixes: boolean read FUsePrefixes write FUsePrefixes default True;
     property SearchPath: boolean read FSearchPath write FSearchPath default True;
     property LastExitCode: integer read FLastExitCode;
+    property History: TStringList read FHistory write SetHistory;
     property Running: boolean read FRunning;
     property OnRoute: TTermRouteEvent read FOnRoute write FOnRoute;
     property OnOutput: TTermOutputEvent read FOnOutput write FOnOutput;
@@ -327,9 +338,15 @@ begin
   FBuiltinCommands.Add('cls');
   FBuiltinCommands.Add('clear');
   FBuiltinCommands.Add('help');
+  FBuiltinCommands.Add('h');
   FBuiltinCommands.Add('history');
   FBuiltinCommands.Add('exit');
   FBuiltinCommands.Add('quit');
+  FBuiltinCommands.Add('set');
+  FBuiltinCommands.Add('get');
+  FBuiltinCommands.Add('config');
+  FBuiltinCommands.Add('settings');
+  FBuiltinCommands.Add('models');
   FHistory := TStringList.Create;
   FHistoryMax := 200;
   FShellExec := 'cmd.exe';
@@ -406,6 +423,18 @@ begin
     if not (csDesigning in ComponentState) and (FAgent.RootPath = '') then
       FAgent.RootPath := GetEffectivePath;
   end;
+end;
+
+procedure TCustomTermManager.SetHistory(const AValue: TStringList);
+begin
+  if not Assigned(AValue) or (AValue = FHistory) then
+  begin
+    // Assigning nil clears the buffer, self-assignment is a no-op
+    if not Assigned(AValue) then
+      FHistory.Clear;
+    Exit;
+  end;
+  FHistory.Assign(AValue);
 end;
 
 procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
@@ -513,7 +542,7 @@ var
   Streamed: boolean;
 begin
   CloseThinking;
-  Streamed := Assigned(FAgent) and (afStreaming in FAgent.Features);
+  Streamed := Assigned(FAgent) and FAgent.Streaming;
   case AReason of
     afrSuccess:
     begin
@@ -738,6 +767,13 @@ begin
   if S = '' then
     Exit(tikEmpty);
 
+  // Special case: bare "?" shows agent help, "? text" still routes to agent
+  if FUsePrefixes and (S = '?') then
+  begin
+    APayload := S;
+    Exit(tikBuiltin);
+  end;
+
   // Prefixes force routing and are stripped from payload
   if FUsePrefixes then
   begin
@@ -853,10 +889,199 @@ begin
     for I := 0 to FHistory.Count - 1 do
       DoOutput(Format('%4d  %s%s', [I + 1, FHistory[I], LineEnding]), False);
   end
-  else if Cmd = 'help' then
-    DoOutput('Built-in: ' + FBuiltinCommands.CommaText + LineEnding, False)
+  else if (Cmd = 'help') or (Cmd = 'h') or (Cmd = '?') then
+    HandleHelpCommand(Arg)
+  else if Cmd = 'set' then
+    HandleSetCommand(Arg)
+  else if Cmd = 'get' then
+    HandleGetCommand(Arg)
+  else if (Cmd = 'config') or (Cmd = 'settings') then
+    DoOutput(FormatAgentConfig(FAgent) + LineEnding, False)
+  else if Cmd = 'models' then
+    HandleModelsCommand(Arg)
   else
     DoOutput('Unknown builtin: ' + Cmd + LineEnding, True);
+end;
+
+// Returns comma separated short tool names for display in help
+function TCustomTermManager.BuildToolsList(AFeatures: TAgentFeatures): string;
+var
+  Parts: TStringList;
+begin
+  Parts := TStringList.Create;
+  try
+    if afFileTools in AFeatures then
+      Parts.Add('filetools');
+    if afExecCommand in AFeatures then
+      Parts.Add('exec');
+    if afGit in AFeatures then
+      Parts.Add('git');
+    if afInteractive in AFeatures then
+      Parts.Add('interactive');
+    if afFinish in AFeatures then
+      Parts.Add('finish');
+    if afWebTools in AFeatures then
+      Parts.Add('web');
+    if Parts.Count = 0 then
+      Result := 'none'
+    else
+      Result := StringReplace(Parts.CommaText, ',', ', ', [rfReplaceAll]);
+  finally
+    Parts.Free;
+  end;
+end;
+
+procedure TCustomTermManager.HandleHelpCommand(const AArg: string);
+var
+  Topic, CommandsList: string;
+  BaseUrl, ModelName, MaxSteps, Streaming, Tools: string;
+
+// Adds a labeled line with aligned description
+  procedure Line(const ALabel, AValue, ADesc: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + ALabel;
+    while Length(Pad) < 38 do
+      Pad := Pad + ' ';
+    DoOutput(Pad + AValue + '  (' + ADesc + ')' + LineEnding, False);
+  end;
+
+begin
+  Topic := LowerCase(Trim(AArg));
+  if (Topic = 'agent') or (Topic = 'set') or (Topic = 'get') or (Topic = 'config') then
+    DoOutput(FormatAgentHelp + LineEnding, False)
+  else
+  begin
+    // Add a space after commas for readability
+    CommandsList := StringReplace(FBuiltinCommands.CommaText, ',', ', ', [rfReplaceAll]);
+    DoOutput('Built-in commands: ' + CommandsList + LineEnding, False);
+    DoOutput('' + LineEnding, False);
+    if Assigned(FAgent) then
+    begin
+      DoOutput('Current agent state:' + LineEnding, False);
+      if Assigned(FAgent.OllamaManager) then
+      begin
+        BaseUrl := FAgent.OllamaManager.BaseURL;
+        if BaseUrl = '' then
+          BaseUrl := '(empty)';
+      end
+      else
+        BaseUrl := '(no OllamaManager)';
+      ModelName := FAgent.ModelName;
+      if ModelName = '' then
+        ModelName := '(not selected)';
+      MaxSteps := IntToStr(FAgent.MaxSteps);
+      if FAgent.MaxSteps = 0 then
+        MaxSteps := '0 (unlimited)';
+      if FAgent.Streaming then
+        Streaming := 'on'
+      else
+        Streaming := 'off';
+      Tools := BuildToolsList(FAgent.EnabledTools);
+      Line('baseurl', BaseUrl, 'set baseurl <url> to change');
+      Line('model', ModelName, 'set model <name>, or "models" to list');
+      Line('maxsteps', MaxSteps, 'set maxsteps <n>, 0 for unlimited');
+      Line('streaming', Streaming, 'set streaming on|off');
+      Line('tools', Tools, 'set tools <list>, "set tools all" or "none"');
+    end
+    else
+    begin
+      DoOutput('No agent attached, showing examples:' + LineEnding, False);
+      Line('baseurl', 'http://localhost:11434', 'Set Ollama server URL');
+      Line('model', 'qwen2.5:7b', 'Select a model for the agent');
+      Line('maxsteps', '20', 'Iteration limit, 0 for unlimited');
+      Line('streaming', 'on', 'Real time output');
+      Line('tools', 'filetools, exec, web', 'Enabled tool groups');
+    end;
+    DoOutput('' + LineEnding, False);
+    DoOutput('Other commands: config (all settings), models (installed models), get/set <name>' + LineEnding, False);
+    DoOutput('Full property reference: help agent, or just "?"' + LineEnding, False);
+    DoOutput('' + LineEnding, False);
+  end;
+end;
+
+procedure TCustomTermManager.HandleSetCommand(const AArg: string);
+var
+  P: integer;
+  AName, Value, ErrMsg: string;
+begin
+  if Trim(AArg) = '' then
+  begin
+    DoOutput('usage: set <name> <value>' + LineEnding, True);
+    DoOutput('use "help agent" for list of properties' + LineEnding, True);
+    Exit;
+  end;
+  P := Pos(' ', AArg);
+  if P > 0 then
+  begin
+    AName := Copy(AArg, 1, P - 1);
+    Value := Trim(Copy(AArg, P + 1, MaxInt));
+  end
+  else
+  begin
+    AName := Trim(AArg);
+    Value := '';
+  end;
+  if SetAgentProperty(FAgent, AName, Value, ErrMsg) then
+    DoOutput(AName + ' = ' + Value + LineEnding, False)
+  else
+    DoOutput('error: ' + ErrMsg + LineEnding, True);
+end;
+
+procedure TCustomTermManager.HandleGetCommand(const AArg: string);
+const
+  MAX_PREVIEW = 500;
+var
+  Value, ErrMsg, Display, Tail: string;
+begin
+  if Trim(AArg) = '' then
+  begin
+    DoOutput('usage: get <name>' + LineEnding, True);
+    DoOutput('use "help agent" for list of properties' + LineEnding, True);
+    Exit;
+  end;
+  if not GetAgentProperty(FAgent, Trim(AArg), Value, ErrMsg) then
+  begin
+    DoOutput('error: ' + ErrMsg + LineEnding, True);
+    Exit;
+  end;
+  // Collapse newlines and truncate long values for display
+  Display := StringReplace(Value, #13#10, ' ', [rfReplaceAll]);
+  Display := StringReplace(Display, #10, ' ', [rfReplaceAll]);
+  Display := StringReplace(Display, #13, ' ', [rfReplaceAll]);
+  Tail := '';
+  if Length(Display) > MAX_PREVIEW then
+  begin
+    Display := Copy(Display, 1, MAX_PREVIEW);
+    Tail := ' ... [' + IntToStr(Length(Value)) + ' chars total, truncated]';
+  end;
+  DoOutput(AArg + ' = ' + Display + Tail + LineEnding, False);
+end;
+
+procedure TCustomTermManager.HandleModelsCommand(const AArg: string);
+var
+  ListText, ErrMsg: string;
+begin
+  if not Assigned(FAgent) then
+  begin
+    DoOutput('error: no agent attached' + LineEnding, True);
+    Exit;
+  end;
+  if not Assigned(FAgent.OllamaManager) then
+  begin
+    DoOutput('error: agent has no OllamaManager' + LineEnding, True);
+    Exit;
+  end;
+  // "models" refreshes from the server, "models cached" would use /api/ps only
+  if LowerCase(Trim(AArg)) <> '' then
+    DoOutput('tip: models always refreshes from ' + FAgent.OllamaManager.BaseURL + LineEnding, True);
+  DoOutput('Querying ' + FAgent.OllamaManager.BaseURL + ' ...' + LineEnding, False);
+  ListText := FormatModelsList(FAgent, ErrMsg);
+  if ErrMsg <> '' then
+    DoOutput('error: ' + ErrMsg + LineEnding, True)
+  else
+    DoOutput(ListText, False);
 end;
 
 procedure TCustomTermManager.PumpOutput(const AData: rawbytestring; AIsStderr: boolean);

@@ -55,11 +55,15 @@ SOFTWARE.
       </Item>
       <Item>
         <Filename Value="src\ollamaagent.pas"/>
-        <UnitName Value="ollamaagent"/>
+        <UnitName Value="OllamaAgent"/>
       </Item>
       <Item>
         <Filename Value="src\termmanager.pas"/>
         <UnitName Value="TermManager"/>
+      </Item>
+      <Item>
+        <Filename Value="src\agentconfig.pas"/>
+        <UnitName Value="agentconfig"/>
       </Item>
       <Item>
         <Filename Value="ollamakitregister.pas"/>

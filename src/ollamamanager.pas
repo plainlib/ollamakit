@@ -520,27 +520,86 @@ function TCustomOllamaManager.GetModelContextLength(const ModelName: string): in
 var
   Idx: integer;
   PsJson: string;
-  PsData: TJSONData;
+  PsData, ModelsData, Item: TJSONData;
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+
+  ItemName: string;
+  Kind: TOllamaErrorKind;
+  ErrMsg: string;
+
+// Extracts context_length of one model from /api/ps JSON array
+  function ParseFromPs(const AJson: string): int64;
+  var
+    I: integer;
+  begin
+    Result := 0;
+    ModelsData := nil;
+    try
+      try
+        ModelsData := GetJSON(AJson);
+        if (ModelsData = nil) or (ModelsData.JSONType <> jtObject) then
+          Exit;
+        Arr := TJSONObject(ModelsData).Arrays['models'];
+        if not Assigned(Arr) then
+          Exit;
+        for I := 0 to Arr.Count - 1 do
+        begin
+          Obj := Arr.Objects[I];
+          ItemName := Obj.Get('name', '');
+          if ItemName = '' then
+            ItemName := Obj.Get('model', '');
+          if ItemName = ModelName then
+          begin
+            Item := Obj.Find('context_length');
+            if Item <> nil then
+              Result := Item.AsInt64;
+            Exit;
+          end;
+        end;
+      except
+        Result := 0;
+      end;
+    finally
+      ModelsData.Free;
+    end;
+  end;
+
 begin
   Result := 0;
-  if not Assigned(FRunningDetails) then
-    Exit;
-  Idx := FRunningDetails.IndexOfName(ModelName);
-  if Idx < 0 then
-    Exit;
-  PsJson := FRunningDetails.ValueFromIndex[Idx];
-  PsData := nil;
-  try
-    try
-      PsData := GetJSON(PsJson);
-      if (PsData <> nil) and (PsData.JSONType = jtObject) then
-        Result := TJSONObject(PsData).Get('context_length', int64(0));
-    except
-      Result := 0;
+  // Fast path: use cached running details from last refresh
+  if Assigned(FRunningDetails) then
+  begin
+    Idx := FRunningDetails.IndexOfName(ModelName);
+    if Idx >= 0 then
+    begin
+      PsJson := FRunningDetails.ValueFromIndex[Idx];
+      PsData := nil;
+      try
+        try
+          PsData := GetJSON(PsJson);
+          if (PsData <> nil) and (PsData.JSONType = jtObject) then
+            Result := TJSONObject(PsData).Get('context_length', int64(0));
+        except
+          Result := 0;
+        end;
+      finally
+        PsData.Free;
+      end;
+      if Result > 0 then
+        Exit;
     end;
-  finally
-    PsData.Free;
   end;
+  // Slow path: query /api/ps synchronously when cache miss
+  if FShutdown then
+    Exit;
+  PsJson := ApiGet('/api/ps', Kind, ErrMsg);
+  if Kind <> oekNone then
+    Exit;
+  Result := ParseFromPs(PsJson);
+  // Cache for next callers
+  if (Result > 0) and Assigned(FRunningDetails) then
+    FRunningDetails.Values[ModelName] := '{"context_length":' + IntToStr(Result) + '}';
 end;
 
 procedure TCustomOllamaManager.DoError(Kind: TOllamaErrorKind; const ModelName, Msg: string);

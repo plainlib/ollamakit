@@ -16,8 +16,6 @@ uses
 type
   // Feature toggles controlled by the Features set property
   TAgentFeature = (
-    // Stream content and thinking chunks to OnChunk and OnThinking in real time
-    afStreaming,
     // Enable built-in file tools: read, write, edit, delete, move, copy, list, find, grep
     afFileTools,
     // Enable exec_command tool, host runs the shell command via OnExecCommand
@@ -128,6 +126,7 @@ type
     FMaxSteps: integer;
     FRequestTimeout: integer;
     FFeatures: TAgentFeatures;
+    FStreaming: boolean;
     FRootPath: string;
     FTools: TAgentTools;
     FWebOptions: TAgentWebOptions;
@@ -228,7 +227,8 @@ type
     property SystemPrompt: TCaption read FSystemPrompt write FSystemPrompt;
     property MaxSteps: integer read FMaxSteps write FMaxSteps default 20;
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 0;
-    property Features: TAgentFeatures read FFeatures write FFeatures default [afStreaming, afFileTools];
+    property EnabledTools: TAgentFeatures read FFeatures write FFeatures default [afFileTools];
+    property Streaming: boolean read FStreaming write FStreaming default True;
     property RootPath: string read GetRootPath write SetRootPath;
     property Tools: TAgentTools read FTools write SetTools;
     property WebOptions: TAgentWebOptions read FWebOptions write SetWebOptions;
@@ -257,8 +257,10 @@ type
     property MaxSteps;
     // Per-request timeout in ms, 0 means use OllamaManager default
     property RequestTimeout;
-    // Feature toggles for streaming, file tools, shell, git, web and interactive tools
-    property Features;
+    // Enable streaming of content and thinking chunks in real time
+    property Streaming;
+    // Tool groups enabled for this agent, empty means chat only
+    property EnabledTools;
     // Sandbox directory for file tools, empty means process cwd
     property RootPath;
     // Collection of user-defined tools
@@ -841,7 +843,7 @@ begin
     Exit;
   end;
   FCurrentContent := FCurrentContent + AContent;
-  if afStreaming in FAgent.FFeatures then
+  if FAgent.FStreaming then
     QueueChunk(AContent);
 end;
 
@@ -1022,8 +1024,8 @@ begin
       MessagesArr.Add(MsgObj);
 
       ToolsJson := FAgent.BuildToolsSchemaJson;
-      FAgent.LogLine(Format('Features: streaming=%s fileTools=%s exec=%s git=%s interactive=%s finish=%s web=%s',
-        [BoolToStr(afStreaming in FAgent.FFeatures, 'on', 'off'), BoolToStr(afFileTools in FAgent.FFeatures, 'on', 'off'),
+      FAgent.LogLine(Format('Streaming=%s tools: fileTools=%s exec=%s git=%s interactive=%s finish=%s web=%s',
+        [BoolToStr(FAgent.FStreaming, 'on', 'off'), BoolToStr(afFileTools in FAgent.FFeatures, 'on', 'off'),
         BoolToStr(afExecCommand in FAgent.FFeatures, 'on', 'off'), BoolToStr(afGit in FAgent.FFeatures, 'on', 'off'),
         BoolToStr(afInteractive in FAgent.FFeatures, 'on', 'off'), BoolToStr(afFinish in FAgent.FFeatures, 'on', 'off'),
         BoolToStr(afWebTools in FAgent.FFeatures, 'on', 'off')]));
@@ -1061,7 +1063,7 @@ begin
           FAgent.OllamaManager.RequestTimeout := FAgent.FRequestTimeout;
         try
           // Always stream, tool_calls are accumulated by the helper
-          if afStreaming in FAgent.FFeatures then
+          if FAgent.FStreaming then
             FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
               @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg)
           else
@@ -1094,10 +1096,10 @@ begin
           FAgent.FContextTotal := FAgent.OllamaManager.NumCtx
         else if FAgent.FContextTotal = 0 then
         begin
+          // First step: model may not be loaded yet, GetModelContextLength
+          // falls back to a synchronous /api/ps query when cache is empty
           FAgent.FContextTotal := FAgent.OllamaManager.GetModelContextLength(FAgent.ModelName);
-          // Model may have just been loaded, trigger a refresh for next step
-          if (FAgent.FContextTotal = 0) and (Step = 1) then
-            FAgent.OllamaManager.RefreshModels;
+          FAgent.LogLine(Format('Resolved context_length=%d for "%s"', [FAgent.FContextTotal, FAgent.ModelName]));
         end;
 
         FAgent.LogLine(Format('Chat done raw_len=%d usage=%d/%d', [Length(FinalJson), FAgent.FContextUsed,
@@ -1282,7 +1284,8 @@ begin
   FSystemPrompt := '';
   FMaxSteps := 20;
   FRequestTimeout := 0;
-  FFeatures := [afStreaming, afFileTools];
+  FFeatures := [afFileTools];
+  FStreaming := True;
   FRootPath := '';
   FKeepHistory := False;
   FHistory := '';
@@ -1367,14 +1370,9 @@ begin
   FCancelled := False;
   FFinalAnswer := '';
   FContextUsed := 0;
-  if Assigned(FOllamaManager) then
-  begin
-    // Explicit NumCtx wins, otherwise use loaded model context from /api/ps
-    if FOllamaManager.NumCtx > 0 then
-      FContextTotal := FOllamaManager.NumCtx
-    else
-      FContextTotal := FOllamaManager.GetModelContextLength(FModelName);
-  end
+  // Only apply explicit override here, model query happens in worker thread
+  if Assigned(FOllamaManager) and (FOllamaManager.NumCtx > 0) then
+    FContextTotal := FOllamaManager.NumCtx
   else
     FContextTotal := 0;
   TOllamaAgentThread.Create(Self, AText);
@@ -2494,8 +2492,8 @@ begin
       Tm.Connection := FWebOptions.RequestTimeout;
       Tm.Request := FWebOptions.RequestTimeout;
       AContent := TNetwork.WebRequest(wmGet, AUrl, '', Headers, FWebOptions.UserAgent, '',
-        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', False, Default(TProxy),
-        Tm, Cookies, ResponseHeaders, Err, HTTP);
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', False, Default(TProxy), Tm,
+        Cookies, ResponseHeaders, Err, HTTP);
       if Watchdog.Aborted then
       begin
         AErrorMsg := 'request aborted after ' + IntToStr(FWebOptions.RequestTimeout) + ' ms';
