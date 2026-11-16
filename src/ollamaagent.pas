@@ -1865,57 +1865,45 @@ begin
     if afFileTools in FFeatures then
     begin
       AddTool(Arr, 'read_file',
-        'Read contents of a file inside the workspace. By default reads up to 50000 bytes. ' +
-        'Set max_bytes to a larger number to read more, or 0 to read the whole file. ' +
-        'WARNING: only use max_bytes=0 (whole file) as a last resort and only when the file ' +
-        'is known to be small, otherwise prefer read_file_preview or read_file_lines.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Maximum bytes to read, default 50000, set 0 to read the whole file (use only for small files)"}},"required":["path"]}');
+        'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
+        'prefer read_file_preview or read_file_lines for large ones.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"}},"required":["path"]}');
       AddTool(Arr, 'read_file_preview',
-        'Show a quick preview of a text file: first N lines, last N lines and total size. ' +
-        'Language-agnostic, works for source code, markdown, configs, logs. ' +
-        'Use this FIRST when exploring an unknown file or a file larger than 50 KB, ' +
-        'before deciding whether to read the whole file with read_file or specific ranges ' + 'with read_file_lines.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"head":{"type":"integer","description":"Number of first lines to show, default 30, max 500"},"tail":{"type":"integer","description":"Number of last lines to show, default 30, max 500"}},"required":["path"]}');
-      AddTool(Arr, 'write_file', 'Write contents to a file inside the workspace, creates parent directories',
+        'Preview a text file: first and last N lines plus total size. ' +
+        'Call FIRST on unknown or large (>50KB) files before read_file.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"head":{"type":"integer","description":"First lines, default 30, max 500"},"tail":{"type":"integer","description":"Last lines, default 30, max 500"}},"required":["path"]}');
+      AddTool(Arr, 'write_file', 'Write contents to a file, creates parent directories',
         '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
-      AddTool(Arr, 'list_files', 'List files in a directory inside the workspace, non-recursive',
+      AddTool(Arr, 'list_files', 'List files in a directory, non-recursive',
         '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative directory"}}}');
-      AddTool(Arr, 'search_text', 'Search for a literal text pattern in files, returns file and line',
+      AddTool(Arr, 'search_text', 'Search for a literal text pattern, returns file and line',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
       AddTool(Arr, 'read_file_lines',
-        'Read a specific line range from a file. Use this instead of read_file when the file ' +
-        'is larger than 50 KB or when read_file returned a truncation notice. Each call reads ' +
-        'up to 5000 lines. To read a whole large file, call repeatedly with increasing start_line. ' +
-        'Example: path="src/mainform.pas", start_line=1, end_line=500 for the first 500 lines.',
-        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line to read, 1-based"},"end_line":{"type":"integer","description":"Last line to read, inclusive"}},"required":["path"]}');
+        'Read a line range. Use for files >50KB or after read_file truncation. ' +
+        'Up to 5000 lines per call, use increasing start_line for large files.',
+        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"}},"required":["path"]}');
       AddTool(Arr, 'edit_file',
-        'Replace an exact string in a file. By default the old string must occur exactly once, set replace_all=true to replace all occurrences',
+        'Replace exact string in a file. old_string must occur exactly once unless replace_all=true',
         '{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}');
-      AddTool(Arr, 'delete_file', 'Delete a file inside the workspace',
+      AddTool(Arr, 'delete_file', 'Delete a file',
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
-      AddTool(Arr, 'move_file', 'Move or rename a file inside the workspace',
+      AddTool(Arr, 'move_file', 'Move or rename a file',
         '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
-      AddTool(Arr, 'copy_file', 'Copy a file inside the workspace',
+      AddTool(Arr, 'copy_file', 'Copy a file',
         '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
-      AddTool(Arr, 'file_info', 'Get size, modification time and type of a file or directory',
+      AddTool(Arr, 'file_info', 'Size, modification time and type of a file or directory',
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
       AddTool(Arr, 'create_directory', 'Create a directory and all parent directories',
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
       AddTool(Arr, 'find_files',
-        'Find files by name using shell wildcards: * matches any characters, ? matches one character. ' +
-        'Examples: "*.md" finds all markdown files, "src/*.pas" finds pascal files in src, ' +
-        '"config.*" finds config with any extension. Search is recursive by default, do NOT ' +
-        'add a ** prefix. Character classes like [abc] are not supported. Capped at 2000 results.',
+        'Find files by glob (* and ?). Recursive by default, do NOT add ** prefix. ' +
+        '[abc] classes unsupported. Capped at 2000 results.',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
       AddTool(Arr, 'grep',
-        'Search text in files using a regex or literal pattern, capped at 500 matches. ' +
-        'path can be a single file (searches only that file, like Unix grep file.txt) ' +
-        'or a directory (searches all files in it recursively). ' +
-        'When scanning a directory, up to 2000 files are checked and common junk ' +
-        'directories like .git, node_modules, bin, obj are skipped automatically. ' +
-        'If scan_limited is true in the response, narrow the path and try again. ' +
-        'Returns JSON with file, line and text for each match.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory to search, default is workspace root"},"pattern":{"type":"string"},"recursive":{"type":"boolean","description":"Recurse into subdirectories when path is a directory, default true"},"literal":{"type":"boolean","description":"Literal substring match, default true, set false for regex"}},"required":["pattern"]}');
+        'Search with regex or literal, capped at 500 matches. ' +
+        'path may be a file or directory, recurses directories, skips .git/node_modules/bin/obj. ' +
+        'If scan_limited=true, narrow the path. Returns file, line, text per match.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Literal match, default true, false=regex"}},"required":["pattern"]}');
     end;
 
     if afExecCommand in FFeatures then
