@@ -1643,8 +1643,12 @@ begin
 
     if afFileTools in FFeatures then
     begin
-      AddTool(Arr, 'read_file', 'Read contents of a file inside the workspace',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"}},"required":["path"]}');
+      AddTool(Arr, 'read_file',
+        'Read contents of a file inside the workspace. By default reads up to 50000 bytes. ' +
+        'Set max_bytes to a larger number to read more, or 0 to read the whole file. ' +
+        'WARNING: only use max_bytes=0 (whole file) as a last resort and only when the file ' +
+        'is known to be small, otherwise prefer read_file_preview or read_file_lines.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Maximum bytes to read, default 50000, set 0 to read the whole file (use only for small files)"}},"required":["path"]}');
       AddTool(Arr, 'read_file_preview',
         'Show a quick preview of a text file: first N lines, last N lines and total size. ' +
         'Language-agnostic, works for source code, markdown, configs, logs. ' +
@@ -1788,13 +1792,16 @@ end;
 
 function TCustomOllamaAgent.DoReadFile(AArgs: TJSONObject): string;
 const
-  MAX_READ_BYTES = 50000;
+  DEFAULT_MAX_BYTES = 50000;
+  // Hard cap for max_bytes=0 to protect memory on accidental huge files
+  HARD_LIMIT_BYTES = 16 * 1024 * 1024;
 var
   RelPath, FullPath, Content: string;
   Stream: TFileStream;
   Buf: TBytes = ();
   ReadCount: int64;
   FullSize: int64;
+  MaxBytes: int64;
   I, LinesShown: integer;
 begin
   Result := '{"error": "invalid arguments"}';
@@ -1812,10 +1819,16 @@ begin
     Result := '{"error": "file not found"}';
     Exit;
   end;
+  MaxBytes := AArgs.Get('max_bytes', DEFAULT_MAX_BYTES);
+  // Negative values fall back to default, 0 means whole file up to the hard cap
+  if MaxBytes < 0 then
+    MaxBytes := DEFAULT_MAX_BYTES;
+  if (MaxBytes = 0) or (MaxBytes > HARD_LIMIT_BYTES) then
+    MaxBytes := HARD_LIMIT_BYTES;
   Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
   try
     FullSize := Stream.Size;
-    SetLength(Buf, Min(FullSize, MAX_READ_BYTES));
+    SetLength(Buf, Min(FullSize, MaxBytes));
     if Length(Buf) > 0 then
       ReadCount := Stream.Read(Buf[0], Length(Buf))
     else
@@ -1834,7 +1847,8 @@ begin
         Inc(LinesShown);
     Content := Content + #10#10 + '[file truncated: showed ' + IntToStr(ReadCount) + ' of ' + IntToStr(FullSize) +
       ' bytes (' + IntToStr(LinesShown) + ' lines). ' + 'Use read_file_lines with start_line=' +
-      IntToStr(LinesShown + 1) + ' to continue reading from where this message left off]';
+      IntToStr(LinesShown + 1) + ' to continue reading from where this message left off, ' +
+      'or call read_file again with a larger max_bytes value if the file is small]';
   end;
   Result := TJSONString.Create(Content).AsJSON;
 end;
