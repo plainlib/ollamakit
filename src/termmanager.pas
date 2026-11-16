@@ -3161,6 +3161,7 @@ var
   N: DWORD = 0;
   Line, PromptText: RawByteString;
   CursorPos, HistIndex, PromptRow: Integer;
+  LastCursorRow: Integer;
   C: WideChar;
   Wide: UnicodeString;
   LastRedrawRows: Integer;
@@ -3591,6 +3592,7 @@ var
 
     ConGotoXY(CurCol, CurRow);
     ShowConsoleCursor;
+    LastCursorRow := CurRow;
   end;
 
     // Returns byte offset of the start of the logical line containing APos
@@ -3642,11 +3644,17 @@ begin
   Handle := GetStdHandle(STD_INPUT_HANDLE);
   // Drop input events accumulated while the agent was streaming, a paste
   // sent to a busy console would otherwise flood Line on the next read
-  FlushConsoleInputBuffer(Handle);
+  if (Handle <> 0) and (Handle <> INVALID_HANDLE_VALUE) then
+  try
+    FlushConsoleInputBuffer(Handle);
+  except
+    ; // Console may be detached
+  end;
   ConWriteUtf8(PromptText);
   FLastCharWasNewLine := False;
   PromptRow := ConWhereY;
   LastRedrawRows := 1;
+  LastCursorRow := PromptRow;
 
   while FRunning do
   begin
@@ -3731,16 +3739,16 @@ begin
           end;
         end;
       VK_DELETE:
-        begin
-          if HasSelection then
           begin
-            Delete(Line, SelStart + 1, SelEnd - SelStart);
-            CursorPos := SelStart;
-            ClearSelection;
-          end
-          else if (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
-          begin
-            FHistory.Delete(HistIndex);
+            if HasSelection then
+            begin
+              Delete(Line, SelStart + 1, SelEnd - SelStart);
+              CursorPos := SelStart;
+              ClearSelection;
+            end
+            else if CtrlPressed and (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
+            begin
+              FHistory.Delete(HistIndex);
             if HistIndex > 0 then
               Dec(HistIndex);
             if FHistory.Count = 0 then
@@ -3815,8 +3823,12 @@ begin
       VK_UP:
         begin
           ClearSelection;
+          // When a single logical line is wrapped by the console, first jump
+          // to the start of that line so typed text is not lost to history
+          if (Length(Line) > 0) and (Pos(LineEnding, Line) = 0) and (LastCursorRow > PromptRow) then
+            CursorPos := FindLineStart(CursorPos)
           // Move within multiline input first, fall back to history at top
-          if not MoveCursorVertical(-1) then
+          else if not MoveCursorVertical(-1) then
           begin
             if HistIndex = FHistory.Count then
             begin
@@ -3915,7 +3927,11 @@ begin
         InsertTypedChar(WideCharToUtf8(C));
     end;
 
-    Redraw;
+    try
+      Redraw;
+    except
+      ; // Console may be detached mid-redraw, keep the input loop alive
+    end;
   end;
 
   Result := Line;

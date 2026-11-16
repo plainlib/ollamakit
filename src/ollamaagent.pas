@@ -850,6 +850,69 @@ begin
   end;
 end;
 
+// Reads an integer argument, accepting number or string forms like "102400.0"
+function GetIntArg(AArgs: TJSONObject; const AName: string; ADefault: int64): int64;
+var
+  Data: TJSONData;
+  S: string;
+  F: double;
+begin
+  Result := ADefault;
+  if AArgs = nil then
+    Exit;
+  Data := AArgs.Find(AName);
+  if Data = nil then
+    Exit;
+  case Data.JSONType of
+    jtNumber:
+      Result := Data.AsInt64;
+    jtBoolean:
+      if Data.AsBoolean then
+        Result := 1
+      else
+        Result := 0;
+    jtString:
+    begin
+      S := Trim(Data.AsString);
+      if TryStrToInt64(S, Result) then
+        Exit;
+      // Some models send "102400.0", accept and round
+      if TryStrToFloat(S, F) then
+        Result := Round(F)
+      else
+        Result := ADefault;
+    end;
+  end;
+end;
+
+// Reads a boolean argument, accepting bool, number or string forms
+function GetBoolArg(AArgs: TJSONObject; const AName: string; ADefault: boolean): boolean;
+var
+  Data: TJSONData;
+  S: string;
+begin
+  Result := ADefault;
+  if AArgs = nil then
+    Exit;
+  Data := AArgs.Find(AName);
+  if Data = nil then
+    Exit;
+  case Data.JSONType of
+    jtBoolean:
+      Result := Data.AsBoolean;
+    jtNumber:
+      Result := Data.AsInt64 <> 0;
+    jtString:
+    begin
+      S := LowerCase(Trim(Data.AsString));
+      if (S = 'true') or (S = '1') or (S = 'yes') or (S = 'on') then
+        Result := True
+      else if (S = 'false') or (S = '0') or (S = 'no') or (S = 'off') then
+        Result := False;
+    end;
+  end;
+end;
+
 { TAgentWebOptions }
 
 constructor TAgentWebOptions.Create;
@@ -2394,7 +2457,7 @@ begin
     Result := '{"error": "file not found"}';
     Exit;
   end;
-  MaxBytes := AArgs.Get('max_bytes', DEFAULT_MAX_BYTES);
+  MaxBytes := GetIntArg(AArgs, 'max_bytes', DEFAULT_MAX_BYTES);
   // Negative values fall back to default, 0 means whole file up to the hard cap
   if MaxBytes < 0 then
     MaxBytes := DEFAULT_MAX_BYTES;
@@ -2423,8 +2486,8 @@ begin
       if Content[I] = #10 then
         Inc(LinesShown);
     Suffix := #10#10 + '[file truncated: showed ' + IntToStr(ReadCount) + ' of ' + IntToStr(FullSize) +
-      ' bytes (' + IntToStr(LinesShown) + ' lines). ' + 'Use read_file_lines with start_line=' +
-      IntToStr(LinesShown + 1) + ' to continue reading from where this message left off, ' +
+      ' bytes (' + IntToStr(LinesShown) + ' lines, applied max_bytes=' + IntToStr(MaxBytes) + '). ' +
+      'Use read_file_lines with start_line=' + IntToStr(LinesShown + 1) + ' to continue reading from where this message left off, ' +
       'or call read_file again with a larger max_bytes value if the file is small]';
     SetCodePage(Suffix, CP_UTF8, False);
     Content := Content + Suffix;
@@ -2495,8 +2558,8 @@ begin
       Result := '{"error": "binary file detected (null bytes found), use exec_command for this file type"}';
       Exit;
     end;
-  HeadCount := AArgs.Get('head', DEFAULT_HEAD);
-  TailCount := AArgs.Get('tail', DEFAULT_TAIL);
+  HeadCount := integer(GetIntArg(AArgs, 'head', DEFAULT_HEAD));
+  TailCount := integer(GetIntArg(AArgs, 'tail', DEFAULT_TAIL));
   if HeadCount < 1 then
     HeadCount := DEFAULT_HEAD;
   if HeadCount > MAX_LINES_PER_EDGE then
@@ -2678,7 +2741,7 @@ begin
     Exit;
   RelPath := AArgs.Get('path', '');
   Pattern := AArgs.Get('pattern', '');
-  Recursive := AArgs.Get('recursive', True);
+  Recursive := GetBoolArg(AArgs, 'recursive', True);
   if Pattern = '' then
   begin
     Result := '{"error": "pattern required"}';
@@ -2755,8 +2818,8 @@ begin
     Result := '{"error": "file not found"}';
     Exit;
   end;
-  StartLine := AArgs.Get('start_line', 1);
-  EndLine := AArgs.Get('end_line', -1);
+  StartLine := integer(GetIntArg(AArgs, 'start_line', 1));
+  EndLine := integer(GetIntArg(AArgs, 'end_line', -1));
   if StartLine < 1 then
     StartLine := 1;
   Lines := TStringList.Create;
@@ -2805,7 +2868,7 @@ begin
   RelPath := AArgs.Get('path', '');
   OldStr := AArgs.Get('old_string', '');
   NewStr := AArgs.Get('new_string', '');
-  ReplaceAll := AArgs.Get('replace_all', False);
+  ReplaceAll := GetBoolArg(AArgs, 'replace_all', False);
   if OldStr = '' then
   begin
     Result := '{"error": "old_string is required"}';
@@ -3062,7 +3125,7 @@ begin
     Exit;
   RelPath := AArgs.Get('path', '');
   Pattern := AArgs.Get('pattern', '*');
-  Recursive := AArgs.Get('recursive', True);
+  Recursive := GetBoolArg(AArgs, 'recursive', True);
   if Pattern = '' then
     Pattern := '*';
   FullPath := SafePath(RelPath);
@@ -3228,8 +3291,8 @@ begin
     Exit;
   end;
   RelPath := AArgs.Get('path', '');
-  Recursive := AArgs.Get('recursive', True);
-  Literal := AArgs.Get('literal', True);
+  Recursive := GetBoolArg(AArgs, 'recursive', True);
+  Literal := GetBoolArg(AArgs, 'literal', True);
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -3360,9 +3423,7 @@ var
   Limit: integer;
   Cmd: string;
 begin
-  Limit := 20;
-  if AArgs <> nil then
-    Limit := AArgs.Get('limit', 20);
+  Limit := integer(GetIntArg(AArgs, 'limit', 20));
   if Limit < 1 then
     Limit := 1;
   if Limit > 200 then
