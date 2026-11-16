@@ -164,6 +164,10 @@ type
     FCapabilitiesCache: TStringList;
     // Shell executable that runs exec_command, empty falls back to platform default
     FExecShellInfo: string;
+    // Load workspace root AGENTS.md into the system prompt
+    FLoadAgentsMd: boolean;
+    // File name for project instruction files, standard is AGENTS.md
+    FAgentsFileName: string;
     procedure SetOllamaManager(const AValue: TOllamaManager);
     procedure SetTools(const AValue: TAgentTools);
     procedure SetWebOptions(const AValue: TAgentWebOptions);
@@ -196,6 +200,8 @@ type
     function DoCreateDirectory(AArgs: TJSONObject): string; virtual;
     function DoFindFiles(AArgs: TJSONObject): string; virtual;
     function DoGrep(AArgs: TJSONObject): string; virtual;
+    // Reads the nearest AGENTS.md walking up from the given path
+    function DoReadAgentsMd(AArgs: TJSONObject): string; virtual;
     // Git tools delegate to OnExecCommand, host runs git in its own shell
     function DoGitCommand(const AFullCommand: string): string; virtual;
     function DoGitStatus(AArgs: TJSONObject): string; virtual;
@@ -248,6 +254,10 @@ type
     property ContextPrelude: string read FContextPrelude write FContextPrelude;
     // Shell executable name for exec_command, injected into the system prompt
     property ExecShellInfo: string read FExecShellInfo write FExecShellInfo;
+    // Load workspace root AGENTS.md into the system prompt
+    property LoadAgentsMd: boolean read FLoadAgentsMd write FLoadAgentsMd default True;
+    // Instruction file name, looked up in the root and in subdirectories
+    property AgentsFileName: string read FAgentsFileName write FAgentsFileName;
     property History: string read GetHistory write SetHistory;
     property ContextUsed: integer read FContextUsed;
     property ContextTotal: integer read FContextTotal;
@@ -303,6 +313,10 @@ type
     property WebOptions;
     // When True, messages persist between RunAsync calls
     property KeepHistory;
+    // Load workspace root AGENTS.md into the system prompt
+    property LoadAgentsMd;
+    // Instruction file name, looked up in the root and in subdirectories
+    property AgentsFileName;
     // When True, the agent logs every step and event to stderr
     property Log;
     // Emit tool result previews through the log channel, truncated to 500 chars
@@ -362,7 +376,7 @@ function IsParallelSafeTool(const AName: string): boolean;
 begin
   Result := (AName = 'read_file') or (AName = 'read_file_preview') or (AName = 'read_file_lines') or
     (AName = 'list_files') or (AName = 'find_files') or (AName = 'grep') or (AName = 'search_text') or
-    (AName = 'file_info') or (AName = 'web_fetch') or (AName = 'web_search');
+    (AName = 'file_info') or (AName = 'read_agents_md') or (AName = 'web_fetch') or (AName = 'web_search');
 end;
 
 // Returns path relative to ARoot for display, or full path when outside root
@@ -1989,6 +2003,8 @@ begin
   FContextTotal := 0;
   FOnAskUser := nil;
   FExecShellInfo := '';
+  FLoadAgentsMd := True;
+  FAgentsFileName := 'AGENTS.md';
   FCapabilitiesCache := TStringList.Create;
   FCapabilitiesCache.NameValueSeparator := '=';
   FTools := TAgentTools.Create(Self);
@@ -2094,8 +2110,11 @@ begin
 end;
 
 function TCustomOllamaAgent.BuildSystemPrompt: string;
+const
+  MAX_AGENTS_BYTES = 16384;
 var
   ToolList, PlatformName, EnvironmentBlock, ShellDesc: string;
+  AgentsPath, AgentsContent: string;
 begin
   // Resolve user-provided placeholders first
   Result := string(FSystemPrompt);
@@ -2148,6 +2167,29 @@ begin
   EnvironmentBlock := EnvironmentBlock + '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding;
 
   Result := Result + #10#10 + EnvironmentBlock;
+
+  // Append the workspace root instruction file when present
+  if FLoadAgentsMd then
+  begin
+    AgentsPath := IncludeTrailingPathDelimiter(GetEffectiveRootPath) + FAgentsFileName;
+    if FileExists(AgentsPath) then
+    begin
+      if ReadTextFileSafe(AgentsPath, AgentsContent) then
+      begin
+        AgentsContent := TrimRight(AgentsContent);
+        if Length(AgentsContent) > MAX_AGENTS_BYTES then
+          AgentsContent := Copy(AgentsContent, 1, MAX_AGENTS_BYTES) + LineEnding + '[... truncated at ' +
+            IntToStr(MAX_AGENTS_BYTES) + ' bytes]';
+        if AgentsContent <> '' then
+        begin
+          Result := Result + #10#10 + 'Project instructions from ' + FAgentsFileName + ':' + LineEnding + AgentsContent;
+          LogLine(Format('Loaded %s, %d bytes', [FAgentsFileName, Length(AgentsContent)]));
+        end;
+      end;
+    end;
+    Result := Result + #10 + 'Subdirectories may have their own ' + FAgentsFileName +
+      '. Use read_agents_md with a path to load the local rules before editing files there.';
+  end;
 
   // Append authoritative tool list so the model cannot claim disabled tools
   if ToolList = 'none' then
@@ -2483,7 +2525,9 @@ begin
         '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"}},"required":["path"]}');
       AddTool(Arr, 'write_file', 'Write contents to a file, creates parent directories',
         '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
-      AddTool(Arr, 'list_files', 'List files in a directory, non-recursive',
+      AddTool(Arr, 'list_files',
+        'List files in a directory, non-recursive. Returns {files: [...], agents_md?: "name"} ' +
+        'when a local ' + FAgentsFileName + ' exists in that directory.',
         '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative directory"}}}');
       AddTool(Arr, 'search_text', 'Search for a literal text pattern, returns file and line',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
@@ -2509,6 +2553,10 @@ begin
         'path may be a file or directory, recurses directories, skips .git/node_modules/bin/obj. ' +
         'If scan_limited=true, narrow the path. Returns file, line, text per match.',
         '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Literal match, default true, false=regex"}},"required":["pattern"]}');
+      AddTool(Arr, 'read_agents_md',
+        'Read the nearest ' + FAgentsFileName + ' for the given path, walking up to the workspace root. ' +
+        'Returns {found, path, content}. Use before editing files to learn local conventions.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"}}}');
     end;
 
     if afExecCommand in FFeatures then
@@ -2579,6 +2627,7 @@ begin
       Names.Add('create_directory');
       Names.Add('find_files');
       Names.Add('grep');
+      Names.Add('read_agents_md');
     end;
     if afExecCommand in FFeatures then
       Names.Add('exec_command');
@@ -2897,7 +2946,11 @@ begin
     try
       for I := 0 to Items.Count - 1 do
         Arr.Add(Items[I]);
-      Result := Arr.AsJSON;
+      // Report local instruction file so the model can load it explicitly
+      if FLoadAgentsMd and FileExists(IncludeTrailingPathDelimiter(FullPath) + FAgentsFileName) then
+        Result := '{"files": ' + Arr.AsJSON + ', "agents_md": ' + TJSONString.Create(FAgentsFileName).AsJSON + '}'
+      else
+        Result := '{"files": ' + Arr.AsJSON + '}';
     finally
       Arr.Free;
     end;
@@ -3589,6 +3642,73 @@ begin
   end;
 end;
 
+function TCustomOllamaAgent.DoReadAgentsMd(AArgs: TJSONObject): string;
+const
+  MAX_AGENTS_BYTES = 16384;
+  MAX_SEARCH_DEPTH = 8;
+var
+  RelPath, SearchPath, FilePath, Content, Root: string;
+  Depth: integer;
+  FoundPath: string;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+  RelPath := AArgs.Get('path', '');
+  Root := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
+  // Normalize input to a directory, treat files as their parent directory
+  SearchPath := StringReplace(Trim(RelPath), '/', PathDelim, [rfReplaceAll]);
+  if SearchPath = '' then
+    SearchPath := Root
+  else
+  begin
+    if IsPathAbsolute(SearchPath) then
+      SearchPath := ExpandFileName(SearchPath)
+    else
+      SearchPath := ExpandFileName(Root + SearchPath);
+    if FileExists(SearchPath) then
+      SearchPath := ExtractFileDir(SearchPath);
+  end;
+  // Refuse paths outside the workspace
+  if Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(SearchPath))) <> 1 then
+  begin
+    Result := '{"error": "path outside workspace"}';
+    Exit;
+  end;
+  // Walk up the tree for the nearest AGENTS.md within the workspace
+  FoundPath := '';
+  for Depth := 0 to MAX_SEARCH_DEPTH do
+  begin
+    FilePath := IncludeTrailingPathDelimiter(SearchPath) + FAgentsFileName;
+    if FileExists(FilePath) then
+    begin
+      FoundPath := FilePath;
+      Break;
+    end;
+    if SameText(ExcludeTrailingPathDelimiter(SearchPath), ExcludeTrailingPathDelimiter(Root)) then
+      Break;
+    SearchPath := ExcludeTrailingPathDelimiter(ExtractFileDir(SearchPath));
+    if (SearchPath = '') or not DirectoryExists(SearchPath) then
+      Break;
+  end;
+  if FoundPath = '' then
+  begin
+    Result := '{"found": false, "note": "no ' + FAgentsFileName + ' found for "' + RelPath + '" within the workspace"}';
+    Exit;
+  end;
+  if not ReadTextFileSafe(FoundPath, Content) then
+  begin
+    Result := '{"found": true, "path": ' + TJSONString.Create(RelativeToRoot(Root, FoundPath)).AsJSON +
+      ', "error": "cannot read file"}';
+    Exit;
+  end;
+  Content := TrimRight(Content);
+  if Length(Content) > MAX_AGENTS_BYTES then
+    Content := Copy(Content, 1, MAX_AGENTS_BYTES) + LineEnding + '[... truncated at ' + IntToStr(MAX_AGENTS_BYTES) + ' bytes]';
+  Result := '{"found": true, "path": ' + TJSONString.Create(RelativeToRoot(Root, FoundPath)).AsJSON +
+    ', "content": ' + TJSONString.Create(Content).AsJSON + '}';
+end;
+
 function TCustomOllamaAgent.DoGitCommand(const AFullCommand: string): string;
 var
   Call: TExecCommandCall;
@@ -3903,7 +4023,9 @@ begin
       else if AName = 'find_files' then
         Exit(DoFindFiles(Args))
       else if AName = 'grep' then
-        Exit(DoGrep(Args));
+        Exit(DoGrep(Args))
+      else if AName = 'read_agents_md' then
+        Exit(DoReadAgentsMd(Args));
     end;
 
     if (AName = 'exec_command') and (afExecCommand in FFeatures) then
