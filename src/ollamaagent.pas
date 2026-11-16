@@ -2839,6 +2839,9 @@ begin
   if AArgs = nil then
     Exit;
   RelPath := AArgs.Get('path', '');
+  // Model may emit {"": "path"} or {"filename": "path"} when confused
+  if (RelPath = '') and (AArgs.Count = 1) and (AArgs.Names[0] = '') then
+    RelPath := AArgs.Items[0].AsString;
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -2912,6 +2915,9 @@ begin
   if AArgs = nil then
     Exit;
   RelPath := AArgs.Get('path', '');
+  // Model may emit {"": "path"} or {"filename": "path"} when confused
+  if (RelPath = '') and (AArgs.Count = 1) and (AArgs.Names[0] = '') then
+    RelPath := AArgs.Items[0].AsString;
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -3260,6 +3266,9 @@ begin
   if AArgs = nil then
     Exit;
   RelPath := AArgs.Get('path', '');
+  // Model may emit {"": "path"} or {"filename": "path"} when confused
+  if (RelPath = '') and (AArgs.Count = 1) and (AArgs.Names[0] = '') then
+    RelPath := AArgs.Items[0].AsString;
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -3329,6 +3338,9 @@ begin
   if AArgs = nil then
     Exit;
   RelPath := AArgs.Get('path', '');
+  // Model may emit {"": "path"} or {"filename": "path"} when confused
+  if (RelPath = '') and (AArgs.Count = 1) and (AArgs.Names[0] = '') then
+    RelPath := AArgs.Items[0].AsString;
   OldStr := AArgs.Get('old_string', '');
   NewStr := AArgs.Get('new_string', '');
   ReplaceAll := GetBoolArg(AArgs, 'replace_all', False);
@@ -4321,8 +4333,10 @@ end;
 
 function TCustomOllamaAgent.BuildUnknownToolError(const AName: string): string;
 var
-  Available, Hint: string;
+  Available, Hint, BestName: string;
   LowName: string;
+  Names: TStringList;
+  I, Dist, BestDist: integer;
 
 // Returns a replacement hint for known aliases from other agent frameworks
   function SuggestFor(const AName: string): string;
@@ -4352,10 +4366,52 @@ begin
     Available := 'none';
   LowName := LowerCase(AName);
   Hint := SuggestFor(LowName);
+  BestName := '';
+
+  // Fall back to fuzzy matching against the actual tool list
+  if (Hint = '') and (Available <> 'none') then
+  begin
+    Names := TStringList.Create;
+    try
+      Names.CommaText := Available;
+      // First check for hallucinated suffixes, read_file_xxx for read_file
+      for I := 0 to Names.Count - 1 do
+      begin
+        if (Length(Names[I]) >= 4) and (Length(LowName) > Length(Names[I])) and
+          (Copy(LowName, 1, Length(Names[I])) = LowerCase(Names[I])) then
+        begin
+          BestName := Names[I];
+          Break;
+        end;
+      end;
+      // Then fall back to small edit distance for typos
+      if BestName = '' then
+      begin
+        BestDist := MaxInt;
+        for I := 0 to Names.Count - 1 do
+        begin
+          Dist := LevenshteinDistance(LowName, LowerCase(Names[I]));
+          if Dist < BestDist then
+          begin
+            BestDist := Dist;
+            BestName := Names[I];
+          end;
+        end;
+        if BestDist > 3 then
+          BestName := '';
+      end;
+    finally
+      Names.Free;
+    end;
+    if BestName <> '' then
+      Hint := 'the tool is named "' + BestName + '", not "' + AName + '". ' +
+        'Tool names must match exactly, do not append suffixes or variations. ' + 'Retry with name="' + BestName + '".';
+  end;
+
   Result := '{"error": "unknown tool: ' + AName + '", ';
   if Hint <> '' then
-    Result := Result + '"hint": "' + Hint + '", ';
-  Result := Result + '"available_tools": "' + Available + '"}';
+    Result := Result + '"hint": ' + TJSONString.Create(Hint).AsJSON + ', ';
+  Result := Result + '"available_tools": ' + TJSONString.Create(Available).AsJSON + '}';
 end;
 
 end.
