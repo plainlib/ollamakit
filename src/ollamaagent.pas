@@ -955,6 +955,34 @@ begin
   Result := (Pos('/.git/', Low) > 0) or (Pos('/.svn/', Low) > 0) or (Pos('/.hg/', Low) > 0);
 end;
 
+// Returns True when the pattern contains regex syntax that almost never
+// appears in a literal search term (anchors, word classes, alternation)
+function PatternLooksLikeRegex(const APattern: string): boolean;
+var
+  I: integer;
+begin
+  Result := False;
+  if APattern = '' then
+    Exit;
+  // Line anchors at boundaries
+  if (APattern[1] = '^') or (APattern[Length(APattern)] = '$') then
+    Exit(True);
+  // Escaped character classes or escaped metacharacters
+  for I := 1 to Length(APattern) - 1 do
+  begin
+    if APattern[I] = '\' then
+    begin
+      if APattern[I + 1] in ['w', 'W', 'd', 'D', 's', 'S', 'b', 'B', '.', '(', ')', '[', ']', '{', '}',
+        '+', '*', '?', '^', '$', '|', '\'] then
+        Exit(True);
+    end;
+  end;
+  // Alternation with no surrounding spaces
+  for I := 2 to Length(APattern) - 1 do
+    if (APattern[I] = '|') and (APattern[I - 1] <> ' ') and (APattern[I + 1] <> ' ') then
+      Exit(True);
+end;
+
 { TAgentWebOptions }
 
 constructor TAgentWebOptions.Create;
@@ -2332,6 +2360,10 @@ begin
   Root := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
   // Normalize forward slashes so absolute detection works on Windows
   Normalized := StringReplace(Trim(ARelPath), '/', PathDelim, [rfReplaceAll]);
+  // Collapse duplicate separators for local paths, preserve UNC prefix
+  if (Length(Normalized) >= 2) and ((Normalized[1] <> PathDelim) or (Normalized[2] <> PathDelim)) then
+    while Pos(PathDelim + PathDelim, Normalized) > 0 do
+      Normalized := StringReplace(Normalized, PathDelim + PathDelim, PathDelim, [rfReplaceAll]);
   if Normalized = '' then
     Exit(Root);
   // Absolute paths are resolved as-is, not prefixed with Root
@@ -2566,10 +2598,10 @@ begin
         '[abc] classes unsupported. Capped at 2000 results.',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
       AddTool(Arr, 'grep',
-        'Search with regex or literal, capped at 500 matches. ' +
-        'path may be a file or directory, recurses directories, skips .git/node_modules/bin/obj. ' +
-        'If scan_limited=true, narrow the path. Returns file, line, text per match.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Literal match, default true, false=regex"}},"required":["pattern"]}');
+        'Search file contents, capped at 500 matches. Literal by default, but patterns ' +
+        'starting with ^ or ending with $ or containing \\w, \\d or | (alternation) are ' +
+        'automatically treated as regex. Skips .git/node_modules/bin/obj. ' + 'Returns file, line, text per match.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Force literal match, bypassing auto-regex detection"}},"required":["pattern"]}');
       AddTool(Arr, 'read_agents_md',
         'Read the nearest ' + FAgentsFileName + ' for the given path, walking up to the workspace root. ' +
         'Returns {found, path, content}. Use before editing files to learn local conventions.',
@@ -3505,7 +3537,7 @@ const
   MAX_MATCH_LINE_CHARS = 500;
 var
   RelPath, FullPath, Pattern: string;
-  Recursive, Literal, SingleFile, ScanLimited: boolean;
+  Recursive, Literal, LiteralExplicit, AutoRegex, SingleFile, ScanLimited: boolean;
   Files: TStringList;
   Matches: TJSONArray;
   I, FilesScanned: integer;
@@ -3600,7 +3632,15 @@ begin
   end;
   RelPath := AArgs.Get('path', '');
   Recursive := GetBoolArg(AArgs, 'recursive', True);
+  // Auto-enable regex mode when pattern clearly uses regex syntax
+  LiteralExplicit := AArgs.Find('literal') <> nil;
   Literal := GetBoolArg(AArgs, 'literal', True);
+  AutoRegex := False;
+  if Literal and not LiteralExplicit and PatternLooksLikeRegex(Pattern) then
+  begin
+    Literal := False;
+    AutoRegex := True;
+  end;
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -3616,9 +3656,20 @@ begin
   Regex := nil;
   if not Literal then
   begin
-    // Compile once, reuse for every line
     Regex := TRegExpr.Create;
-    Regex.Expression := Pattern;
+    try
+      Regex.Expression := Pattern;
+      // Trigger compilation on empty string to surface syntax errors early
+      Regex.Exec('');
+    except
+      on E: Exception do
+      begin
+        Regex.Free;
+        Result := '{"error": "invalid regex: ' + TJSONString.Create(E.Message).AsJSON +
+          '", "hint": "set literal=true to search for the exact string"}';
+        Exit;
+      end;
+    end;
   end;
   Files := TStringList.Create;
   Matches := TJSONArray.Create;
@@ -3671,7 +3722,10 @@ begin
     end;
     Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >= MAX_MATCHES, 'true', 'false') +
       ', "scanned_files": ' + IntToStr(FilesScanned) + ', "scan_limited": ' + BoolToStr(ScanLimited, 'true', 'false') +
-      ', "timed_out": ' + BoolToStr(TimedOut, 'true', 'false') + ', "matches": ' + Matches.AsJSON + '}';
+      ', "timed_out": ' + BoolToStr(TimedOut, 'true', 'false');
+    if AutoRegex then
+      Result := Result + ', "auto_regex": true';
+    Result := Result + ', "matches": ' + Matches.AsJSON + '}';
   finally
     Matches.Free;
     Files.Free;
