@@ -302,7 +302,7 @@ type
 implementation
 
 uses
-  FileUtil, Math, RegExpr;
+  FileUtil, Math, RegExpr, Masks;
 
 // Returns display name for an agent operation kind
 function AgentOpName(AOp: TAgentOperation): string;
@@ -590,6 +590,84 @@ begin
   end;
   // Normalize slashes to platform delimiters
   Result := StringReplace(Result, '/', PathDelim, [rfReplaceAll]);
+end;
+
+// Loads simple .gitignore rules from ARootPath, skips comments and negations
+function LoadGitignorePatterns(const ARootPath: string): TStringList;
+var
+  GitignorePath: string;
+  Lines: TStringList;
+  I: integer;
+  S: string;
+begin
+  Result := TStringList.Create;
+  GitignorePath := IncludeTrailingPathDelimiter(ARootPath) + '.gitignore';
+  if not FileExists(GitignorePath) then
+    Exit;
+  Lines := TStringList.Create;
+  try
+    try
+      Lines.LoadFromFile(GitignorePath);
+    except
+      Exit;
+    end;
+    for I := 0 to Lines.Count - 1 do
+    begin
+      S := Trim(Lines[I]);
+      if (S = '') or (S[1] = '#') or (S[1] = '!') then
+        Continue;
+      Result.Add(LowerCase(StringReplace(S, '\', '/', [rfReplaceAll])));
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+// Returns True when the relative path matches any .gitignore rule
+function IsIgnoredByGitignore(const ARelPath: string; APatterns: TStringList): boolean;
+var
+  I: integer;
+  P, LowPath, LowName: string;
+  SlashPos: integer;
+begin
+  Result := False;
+  if (APatterns = nil) or (APatterns.Count = 0) then
+    Exit;
+  LowPath := '/' + LowerCase(StringReplace(ARelPath, '\', '/', [rfReplaceAll]));
+  SlashPos := LastDelimiter('/', LowPath);
+  if SlashPos > 0 then
+    LowName := Copy(LowPath, SlashPos + 1, MaxInt)
+  else
+    LowName := LowPath;
+  for I := 0 to APatterns.Count - 1 do
+  begin
+    P := APatterns[I];
+    // Directory pattern with trailing slash matches any /dir/ segment
+    if (Length(P) > 0) and (P[Length(P)] = '/') then
+    begin
+      Delete(P, Length(P), 1);
+      if Pos('/' + P + '/', LowPath) > 0 then
+        Exit(True);
+    end
+    // Root-anchored pattern matches from the root only
+    else if (Length(P) > 0) and (P[1] = '/') then
+    begin
+      Delete(P, 1, 1);
+      if Copy(LowPath, 2, Length(P) + 1) = P + '/' then
+        Exit(True)
+      else if LowPath = '/' + P then
+        Exit(True);
+    end
+    // Pattern with a slash matches as a path suffix
+    else if Pos('/', P) > 0 then
+    begin
+      if Pos('/' + P + '/', LowPath) > 0 then
+        Exit(True);
+    end
+    // Simple name or glob matches the basename only
+    else if MatchesMask(LowName, P) then
+      Exit(True);
+  end;
 end;
 
 { TAgentWebOptions }
@@ -956,6 +1034,13 @@ begin
 end;
 
 procedure TOllamaAgentThread.Execute;
+const
+  // Tool results older than the most recent N are truncated to save context
+  KEEP_RECENT_TOOL_RESULTS = 3;
+  // Maximum size of a truncated tool result in bytes
+  TRUNCATE_TOOL_BYTES = 1000;
+  // Retry limit for the chat call on transport timeout
+  CHAT_MAX_ATTEMPTS = 3;
 var
   Step, I, SavedTimeout, EffectiveMaxSteps: integer;
   MessagesArr: TJSONArray;
@@ -967,6 +1052,9 @@ var
   ToolCallsArr: TJSONArray;
   ToolCallObj, FuncObj, MsgObj: TJSONObject;
   ToolName, ToolArgs, ToolResult, FinalContent: string;
+  Attempt, TruncIdx, TruncSeen, TruncTotalTool: integer;
+  TruncContent: string;
+  ResolvedCtx: int64;
 begin
   Reason := afrError;
   ErrMsg := '';
@@ -1054,6 +1142,32 @@ begin
         end;
 
         FCurrentContent := '';
+        // Keep only the most recent tool results intact, older ones are truncated
+        TruncTotalTool := 0;
+        for TruncIdx := 0 to MessagesArr.Count - 1 do
+          if (MessagesArr.Items[TruncIdx].JSONType = jtObject) and
+            (TJSONObject(MessagesArr.Items[TruncIdx]).Get('role', '') = 'tool') then
+            Inc(TruncTotalTool);
+        TruncSeen := 0;
+        for TruncIdx := 0 to MessagesArr.Count - 1 do
+        begin
+          if MessagesArr.Items[TruncIdx].JSONType <> jtObject then
+            Continue;
+          MsgObj := TJSONObject(MessagesArr.Items[TruncIdx]);
+          if MsgObj.Get('role', '') <> 'tool' then
+            Continue;
+          Inc(TruncSeen);
+          if TruncSeen > TruncTotalTool - KEEP_RECENT_TOOL_RESULTS then
+            Continue;
+          TruncContent := MsgObj.Get('content', '');
+          if Length(TruncContent) > TRUNCATE_TOOL_BYTES then
+          begin
+            TruncContent := Copy(TruncContent, 1, TRUNCATE_TOOL_BYTES) + '...[truncated, original ' +
+              IntToStr(Length(TruncContent)) + ' bytes]';
+            MsgObj.Strings['content'] := TruncContent;
+          end;
+        end;
+
         MessagesJson := MessagesArr.AsJSON;
         FAgent.LogLine(Format('Step %d messages=%d timeout=%d', [Step, MessagesArr.Count, FAgent.OllamaManager.RequestTimeout]));
 
@@ -1062,14 +1176,24 @@ begin
         if FAgent.FRequestTimeout > 0 then
           FAgent.OllamaManager.RequestTimeout := FAgent.FRequestTimeout;
         try
-          // Always stream, tool_calls are accumulated by the helper
-          if FAgent.FStreaming then
-            FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
-              @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg)
-          else
-            // Streaming disabled, use non-streaming with full content chunk
-            FinalJson := FAgent.OllamaManager.ChatWithTools(FAgent.ModelName, MessagesJson, ToolsJson,
-              @HandleFullContent, @HandleThinkingChunk, Kind, ErrMsg);
+          // Retry the chat call on transport timeout when nothing was streamed yet
+          for Attempt := 1 to CHAT_MAX_ATTEMPTS do
+          begin
+            FCurrentContent := '';
+            if FAgent.FStreaming then
+              FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
+                @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg)
+            else
+              FinalJson := FAgent.OllamaManager.ChatWithTools(FAgent.ModelName, MessagesJson, ToolsJson,
+                @HandleFullContent, @HandleThinkingChunk, Kind, ErrMsg);
+
+            if (Kind = oekNone) or FAgent.FCancelled or (Kind = oekCancelled) then
+              Break;
+            if (Kind <> oekTimeout) or (FCurrentContent <> '') or (Attempt = CHAT_MAX_ATTEMPTS) then
+              Break;
+            FAgent.LogLine(Format('Chat timeout, retrying (attempt %d of %d)', [Attempt + 1, CHAT_MAX_ATTEMPTS]));
+            Sleep(500 * Attempt);
+          end;
         finally
           FAgent.OllamaManager.RequestTimeout := SavedTimeout;
         end;
@@ -1097,11 +1221,15 @@ begin
         // Resolve context total from NumCtx or from loaded model info
         if FAgent.OllamaManager.NumCtx > 0 then
           FAgent.FContextTotal := FAgent.OllamaManager.NumCtx
-        else if FAgent.FContextTotal = 0 then
+        else
         begin
-          // First step: model may not be loaded yet, GetModelContextLength
-          // falls back to a synchronous /api/ps query when cache is empty
-          FAgent.FContextTotal := FAgent.OllamaManager.GetModelContextLength(FAgent.ModelName);
+          // Try the real value first, then fall back to a safe estimate
+          ResolvedCtx := FAgent.OllamaManager.GetModelContextLength(FAgent.ModelName);
+          if ResolvedCtx > 0 then
+            FAgent.FContextTotal := ResolvedCtx
+          else if FAgent.FContextTotal = 0 then
+            // Model not loaded yet, assume a common 8K window so percent is meaningful
+            FAgent.FContextTotal := 8192;
           FAgent.LogLine(Format('Resolved context_length=%d for "%s"', [FAgent.FContextTotal, FAgent.ModelName]));
         end;
 
@@ -1866,6 +1994,7 @@ var
   Size: int64;
   Buf: TStringBuilder;
   Stream: TFileStream;
+  RawBuf: TBytes = ();
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -1895,6 +2024,26 @@ begin
       ' bytes), use read_file_lines with start_line and end_line"}';
     Exit;
   end;
+  // Detect binary files by scanning the first 512 bytes for null bytes
+  HeadCount := 0;
+  try
+    Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(RawBuf, Min(Size, 512));
+      if Length(RawBuf) > 0 then
+        HeadCount := Stream.Read(RawBuf[0], Length(RawBuf));
+    finally
+      Stream.Free;
+    end;
+  except
+    HeadCount := 0;
+  end;
+  for I := 0 to HeadCount - 1 do
+    if RawBuf[I] = 0 then
+    begin
+      Result := '{"error": "binary file detected (null bytes found), use exec_command for this file type"}';
+      Exit;
+    end;
   HeadCount := AArgs.Get('head', DEFAULT_HEAD);
   TailCount := AArgs.Get('tail', DEFAULT_TAIL);
   if HeadCount < 1 then
@@ -2499,6 +2648,8 @@ const
   MAX_MATCHES = 500;
   MAX_FILE_SIZE = 1024 * 1024;
   MAX_FILES_SCANNED = 2000;
+  // Wall-clock budget for a single grep call to protect the agent loop
+  MAX_GREP_MS = 10000;
 var
   RelPath, FullPath, Pattern: string;
   Recursive, Literal, SingleFile, ScanLimited: boolean;
@@ -2507,6 +2658,9 @@ var
   I, FilesScanned: integer;
   BaseRoot: string;
   Regex: TRegExpr;
+  GitPatterns: TStringList;
+  StartTick: QWord;
+  TimedOut: boolean;
 
 // Returns True for VCS, build output and package caches to skip
   function IsJunkPath(const ARelPath: string): boolean;
@@ -2609,8 +2763,11 @@ begin
   end;
   Files := TStringList.Create;
   Matches := TJSONArray.Create;
+  GitPatterns := LoadGitignorePatterns(GetEffectiveRootPath);
   ScanLimited := False;
   FilesScanned := 0;
+  TimedOut := False;
+  StartTick := GetTickCount64;
   try
     // A path to a file searches only that file, like Unix grep file.txt
     SingleFile := FileExists(FullPath) and not DirectoryExists(FullPath);
@@ -2630,20 +2787,29 @@ begin
           ScanLimited := True;
           Break;
         end;
-        if IsJunkPath(RelativeToRoot(BaseRoot, Files[I])) then
+        // Abort the whole scan when the time budget is exhausted
+        if GetTickCount64 - StartTick >= MAX_GREP_MS then
+        begin
+          ScanLimited := True;
+          TimedOut := True;
+          Break;
+        end;
+        RelPath := RelativeToRoot(BaseRoot, Files[I]);
+        if IsJunkPath(RelPath) or IsIgnoredByGitignore(RelPath, GitPatterns) then
           Continue;
         Inc(FilesScanned);
-        ScanFile(Files[I], RelativeToRoot(BaseRoot, Files[I]));
+        ScanFile(Files[I], RelPath);
       end;
-      if FilesScanned >= MAX_FILES_SCANNED then
+      if (not TimedOut) and (FilesScanned >= MAX_FILES_SCANNED) then
         ScanLimited := True;
     end;
     Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >= MAX_MATCHES, 'true', 'false') +
       ', "scanned_files": ' + IntToStr(FilesScanned) + ', "scan_limited": ' + BoolToStr(ScanLimited, 'true', 'false') +
-      ', "matches": ' + Matches.AsJSON + '}';
+      ', "timed_out": ' + BoolToStr(TimedOut, 'true', 'false') + ', "matches": ' + Matches.AsJSON + '}';
   finally
     Matches.Free;
     Files.Free;
+    GitPatterns.Free;
     if Regex <> nil then
       Regex.Free;
   end;

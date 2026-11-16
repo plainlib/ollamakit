@@ -1639,6 +1639,9 @@ end;
 
 function TCustomOllamaManager.DoRequest(AMethod: TWebMethod; const Endpoint, JsonBody: string;
   out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+const
+  // Connection and timeout failures are retried, HTTP errors are not
+  MAX_ATTEMPTS = 3;
 var
   Headers: TStringList;
   ResponseHeaders: TStringList;
@@ -1650,6 +1653,8 @@ var
   ContentType: string;
   ErrJSON: TJSONData;
   ErrTxt: string;
+  Attempt: integer;
+  Success: boolean;
 begin
   Kind := oekNone;
   ErrorMsg := '';
@@ -1676,14 +1681,26 @@ begin
     ContentType := '';
 
   try
-    try
-      Result := TNetwork.WebRequest(AMethod, FBaseURL + Endpoint, JsonBody, Headers, 'OllamaManager/1.0',
-        ContentType, 'application/json', False, Default(TProxy), Tm, Cookies, ResponseHeaders, Err, HTTP);
+    for Attempt := 1 to MAX_ATTEMPTS do
+    begin
+      // Reset resources from the previous attempt before retrying
+      FreeAndNil(HTTP);
+      FreeAndNil(ResponseHeaders);
+      Kind := oekNone;
+      ErrorMsg := '';
+      Result := '';
+      Success := False;
+      try
+        Result := TNetwork.WebRequest(AMethod, FBaseURL + Endpoint, JsonBody, Headers, 'OllamaManager/1.0',
+          ContentType, 'application/json', False, Default(TProxy), Tm, Cookies, ResponseHeaders, Err, HTTP);
 
-      if Err then
-      begin
-        // Socket-level errors take priority: a failed connect can leave a
-        // synthetic non-zero ResultCode (e.g. 5xx) that would be misclassified
+        if not Err then
+        begin
+          Success := True;
+          Break;
+        end;
+
+        // Socket errors take priority over HTTP code classification
         SockErr := (HTTP <> nil) and (HTTP.Sock <> nil) and (HTTP.Sock.LastError <> 0);
         if SockErr then
           Kind := oekConnection
@@ -1692,7 +1709,7 @@ begin
         else
           Kind := oekConnection;
 
-        // Try to extract the "error" field from a JSON error body, if any
+        // Try to extract the "error" field from a JSON error body
         if Result.IsJson then
         begin
           ErrJSON := nil;
@@ -1710,7 +1727,6 @@ begin
               else
                 ErrorMsg := Result;
             except
-              // Body looks like JSON but failed to parse; keep it as is
               ErrorMsg := Result;
             end;
           finally
@@ -1720,7 +1736,6 @@ begin
         else
           ErrorMsg := Result;
 
-        // Trim whitespace-only descriptions, they carry no information
         ErrorMsg := Trim(ErrorMsg);
         if ErrorMsg = '' then
         begin
@@ -1734,14 +1749,32 @@ begin
             ErrorMsg := 'Empty error response from server';
         end;
         Result := '';
+
+        // Retry only connection and timeout failures, HTTP errors are final
+        if not (Kind in [oekConnection, oekTimeout]) then
+          Break;
+        if Attempt = MAX_ATTEMPTS then
+          Break;
+        Sleep(200 * Attempt);
+      except
+        on E: Exception do
+        begin
+          Kind := oekConnection;
+          ErrorMsg := E.Message;
+          Result := '';
+          if Attempt = MAX_ATTEMPTS then
+            Break;
+          Sleep(200 * Attempt);
+        end;
       end;
-    except
-      on E: Exception do
-      begin
-        Kind := oekConnection;
-        ErrorMsg := E.Message;
-        Result := '';
-      end;
+    end;
+
+    // Defensive net in case the loop finished without an explicit error
+    if (not Success) and (Kind = oekNone) then
+    begin
+      Kind := oekConnection;
+      if ErrorMsg = '' then
+        ErrorMsg := rsConnectionError;
     end;
   finally
     Headers.Free;
@@ -2239,8 +2272,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2308,8 +2341,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
