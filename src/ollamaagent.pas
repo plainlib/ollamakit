@@ -1014,7 +1014,7 @@ procedure TOllamaAgentThread.QueueThinking(const AText: string);
 var
   Call: TThinkingCall;
 begin
-  FAgent.LogLine(Format('Thinking chunk len=%d', [Length(AText)]));
+  // No per-chunk log here, it would close the thinking block on every chunk
   if not Assigned(FAgent.FOnThinking) then
     Exit;
   Call := TThinkingCall.Create;
