@@ -1077,6 +1077,7 @@ var
   ExitCode, I: integer;
   Hint, FoundCmd: string;
   Family: TShellFamily;
+  EffectiveCmd: string;
 begin
   // When host provided own handler, let it run and skip default execution
   if Assigned(FPrevAgentOnExecCommand) then
@@ -1086,7 +1087,14 @@ begin
   end;
   AAllow := True;
   ExitCode := 0;
-  AResult := ExecuteCommandCapture(ACommand, ExitCode, FAgentCommandTimeout);
+  // Auto-translate Unix null device to Windows nul when using cmd.exe
+  EffectiveCmd := ACommand;
+  if SameText(ExtractFileName(FShellExec), 'cmd.exe') or (FShellExec = '') then
+  begin
+    EffectiveCmd := StringReplace(EffectiveCmd, '/dev/null', 'nul', [rfReplaceAll]);
+    EffectiveCmd := StringReplace(EffectiveCmd, '/dev/zero', 'nul', [rfReplaceAll]);
+  end;
+  AResult := ExecuteCommandCapture(EffectiveCmd, ExitCode, FAgentCommandTimeout);
 
   Hint := '';
   Family := DetectShellFamily(FShellExec);
@@ -4026,6 +4034,7 @@ end;
 procedure TCustomTermManager.SetColor(AColor: TTermColor);
 begin
   // No-op on non-Windows, override to emit ANSI escape sequences
+  ;
 end;
 
 procedure ConGotoXY(X, Y: integer);

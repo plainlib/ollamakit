@@ -357,11 +357,19 @@ begin
   end;
 end;
 
+// Returns True when the named tool is read-only and safe to run concurrently
+function IsParallelSafeTool(const AName: string): boolean;
+begin
+  Result := (AName = 'read_file') or (AName = 'read_file_preview') or (AName = 'read_file_lines') or
+    (AName = 'list_files') or (AName = 'find_files') or (AName = 'grep') or (AName = 'search_text') or
+    (AName = 'file_info') or (AName = 'web_fetch') or (AName = 'web_search');
+end;
+
 // Returns path relative to ARoot for display, or full path when outside root
 function RelativeToRoot(const ARoot, APath: string): string;
 begin
   if Pos(LowerCase(IncludeTrailingPathDelimiter(ARoot)), LowerCase(APath)) = 1 then
-    Result := Copy(APath, Length(ARoot) + 2, MaxInt)
+    Result := Copy(APath, Length(ARoot) + 1, MaxInt)
   else
     Result := APath;
 end;
@@ -370,22 +378,24 @@ end;
 function ReadTextFileSafe(const APath: string; out AContent: string): boolean;
 var
   Stream: TFileStream;
-  Buf: TBytes = ();
+  Raw: rawbytestring;
   ReadCount: int64;
 begin
   Result := False;
   AContent := '';
+  Raw := '';
   if not FileExists(APath) then
     Exit;
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
-    SetLength(Buf, Stream.Size);
-    if Length(Buf) > 0 then
-      ReadCount := Stream.Read(Buf[0], Length(Buf))
+    SetLength(Raw, Stream.Size);
+    if Length(Raw) > 0 then
+      ReadCount := Stream.Read(Raw[1], Length(Raw))
     else
       ReadCount := 0;
-    SetLength(Buf, ReadCount);
-    AContent := string(Buf);
+    SetLength(Raw, ReadCount);
+    SetCodePage(Raw, CP_UTF8, False);
+    AContent := string(Raw);
     Result := True;
   finally
     Stream.Free;
@@ -856,6 +866,7 @@ var
   Data: TJSONData;
   S: string;
   F: double;
+  FS: TFormatSettings;
 begin
   Result := ADefault;
   if AArgs = nil then
@@ -876,12 +887,18 @@ begin
       S := Trim(Data.AsString);
       if TryStrToInt64(S, Result) then
         Exit;
-      // Some models send "102400.0", accept and round
-      if TryStrToFloat(S, F) then
+      // Some models send "102400.0", accept and round with a fixed
+      // dot separator so the value parses on any locale
+      FS := DefaultFormatSettings;
+      FS.DecimalSeparator := '.';
+      FS.ThousandSeparator := #0;
+      if TryStrToFloat(S, F, FS) then
         Result := Round(F)
       else
         Result := ADefault;
     end;
+    else
+      ;
   end;
 end;
 
@@ -910,6 +927,8 @@ begin
       else if (S = 'false') or (S = '0') or (S = 'no') or (S = 'off') then
         Result := False;
     end;
+    else
+      ;
   end;
 end;
 
@@ -1029,11 +1048,49 @@ type
     procedure Invoke; override;
   end;
 
+  // Worker thread that runs one tool call in parallel with others
+  TToolExecThread = class(TThread)
+  private
+    FAgent: TCustomOllamaAgent;
+    FToolName: string;
+    FToolArgs: string;
+    FResult: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AAgent: TCustomOllamaAgent; const AName, AArgs: string);
+    property ToolResult: string read FResult;
+  end;
+
+constructor TToolExecThread.Create(AAgent: TCustomOllamaAgent; const AName, AArgs: string);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FAgent := AAgent;
+  FToolName := AName;
+  FToolArgs := AArgs;
+  FResult := '';
+  Start;
+end;
+
+procedure TToolExecThread.Execute;
+begin
+  try
+    FResult := FAgent.DispatchTool(FToolName, FToolArgs);
+  except
+    on E: Exception do
+      FResult := '{"error": ' + TJSONString.Create(E.Message).AsJSON + '}';
+  end;
+end;
+
 procedure TRouteCall.Invoke;
 begin
-  // Caller frees the object after Synchronize returns
   if Assigned(Agent.FOnRoute) then
+  try
     Agent.FOnRoute(Agent, Op, Payload, Allow);
+  except
+    Allow := False;
+  end;
 end;
 
 procedure TChunkCall.Invoke;
@@ -1111,19 +1168,26 @@ end;
 
 procedure TExecCommandCall.Invoke;
 begin
-  // Caller frees the object after Synchronize returns
   Allow := True;
+  Result := '';
   if Assigned(Agent.FOnExecCommand) then
+  try
     Agent.FOnExecCommand(Agent, Command, Result, Allow);
+  except
+    ; // User handler raised, treat as no-op
+  end;
 end;
 
 procedure TAskUserCall.Invoke;
 begin
-  // Caller frees the object after Synchronize returns
   Allow := True;
   Answer := '';
   if Assigned(Agent.FOnAskUser) then
+  try
     Agent.FOnAskUser(Agent, Question, Answer, Allow);
+  except
+    Allow := False;
+  end;
 end;
 
 procedure TLogCall.Invoke;
@@ -1335,7 +1399,7 @@ var
   Data, MessageData, ToolCallsData, FuncData, ArgsData, FinishData: TJSONData;
   ToolCallsArr: TJSONArray;
   ToolCallObj, FuncObj, MsgObj: TJSONObject;
-  ToolName, ToolArgs, ToolResult, FinalContent: string;
+  FinalContent: string;
   Attempt, TruncIdx, TruncSeen, TruncTotalTool: integer;
   TruncContent: string;
   ResolvedCtx: int64;
@@ -1344,10 +1408,21 @@ var
   OldMsgsStr, MsgStr, Summary: string;
   NewArr: TJSONArray;
   SummObj: TJSONObject;
+  SendTools: boolean;
+  ToolCount, ToolIdx, CollectIdx: integer;
+  ToolNames, ToolArgArr, ToolResultArr: array of string;
+  ToolAllowArr: array of boolean;
+  AllParallelSafe: boolean;
+  Threads: TList;
 begin
   Reason := afrError;
   ErrMsg := '';
   FinalContent := '';
+  // Initialize managed array locals to silence compiler hints
+  ToolNames := nil;
+  ToolArgArr := nil;
+  ToolAllowArr := nil;
+  ToolResultArr := nil;
   MessagesArr := TJSONArray.Create;
   FAgent.LogLine(Format('Run start model="%s" text_len=%d', [FAgent.ModelName, Length(FUserText)]));
   try
@@ -1367,15 +1442,13 @@ begin
         Exit;
       end;
 
-      // Verify the model declares tool support before promising to use tools
-      if FAgent.FFeatures <> [] then
+      // Verify tool support, degrade to chat-only when unsupported
+      SendTools := FAgent.FFeatures <> [];
+      if SendTools and not FAgent.ModelSupportsTools(ErrMsg) then
       begin
-        if not FAgent.ModelSupportsTools(ErrMsg) then
-        begin
-          Reason := afrError;
-          FAgent.LogLine('Abort: ' + ErrMsg);
-          Exit;
-        end;
+        FAgent.LogLine('Warning: ' + ErrMsg + ', continuing without tools');
+        SendTools := False;
+        ErrMsg := '';
       end;
 
       // Always send the system message, BuildSystemPrompt adds platform,
@@ -1413,7 +1486,10 @@ begin
         MsgObj.Add('content', FUserText);
       MessagesArr.Add(MsgObj);
 
-      ToolsJson := FAgent.BuildToolsSchemaJson;
+      if SendTools then
+        ToolsJson := FAgent.BuildToolsSchemaJson
+      else
+        ToolsJson := '';
       FAgent.LogLine(Format('Streaming=%s tools: fileTools=%s exec=%s git=%s interactive=%s finish=%s web=%s',
         [BoolToStr(FAgent.FStreaming, 'on', 'off'), BoolToStr(afFileTools in FAgent.FFeatures, 'on', 'off'),
         BoolToStr(afExecCommand in FAgent.FFeatures, 'on', 'off'), BoolToStr(afGit in FAgent.FFeatures, 'on', 'off'),
@@ -1634,46 +1710,129 @@ begin
 
           FAgent.LogLine(Format('ToolCalls count=%d', [ToolCallsArr.Count]));
 
-          for I := 0 to ToolCallsArr.Count - 1 do
+          // Parse all tool calls first so they can be emitted and run as a batch
+          ToolCount := ToolCallsArr.Count;
+          SetLength(ToolNames, ToolCount);
+          SetLength(ToolArgArr, ToolCount);
+          SetLength(ToolAllowArr, ToolCount);
+          SetLength(ToolResultArr, ToolCount);
+          AllParallelSafe := ToolCount > 1;
+          for ToolIdx := 0 to ToolCount - 1 do
+          begin
+            ToolNames[ToolIdx] := '';
+            ToolArgArr[ToolIdx] := '{}';
+            ToolAllowArr[ToolIdx] := False;
+            ToolResultArr[ToolIdx] := '';
+
+            ToolCallObj := ToolCallsArr.Objects[ToolIdx];
+            if ToolCallObj = nil then
+            begin
+              AllParallelSafe := False;
+              Continue;
+            end;
+
+            FuncData := ToolCallObj.Find('function');
+            if (FuncData = nil) or (FuncData.JSONType <> jtObject) then
+            begin
+              AllParallelSafe := False;
+              Continue;
+            end;
+            FuncObj := TJSONObject(FuncData);
+
+            ToolNames[ToolIdx] := FuncObj.Get('name', '');
+            ArgsData := FuncObj.Find('arguments');
+            if ArgsData = nil then
+              ToolArgArr[ToolIdx] := '{}'
+            else if ArgsData.JSONType = jtString then
+              ToolArgArr[ToolIdx] := TJSONString(ArgsData).AsString
+            else
+              ToolArgArr[ToolIdx] := ArgsData.AsJSON;
+
+            QueueToolCall(ToolNames[ToolIdx], ToolArgArr[ToolIdx]);
+
+            // finish and non-safe tools break the parallel batch
+            if (ToolNames[ToolIdx] = 'finish') or not IsParallelSafeTool(ToolNames[ToolIdx]) then
+              AllParallelSafe := False;
+          end;
+
+          // Route checks are always sequential, host may deny per call
+          for ToolIdx := 0 to ToolCount - 1 do
+          begin
+            if ToolNames[ToolIdx] = '' then
+              Continue;
+            QueueRoute(aoToolCall, ToolNames[ToolIdx] + ' ' + ToolArgArr[ToolIdx], Allow);
+            ToolAllowArr[ToolIdx] := Allow;
+          end;
+
+          // Execute: parallel for safe batches, sequential otherwise
+          if AllParallelSafe then
           begin
             if FAgent.FCancelled then
             begin
               Reason := afrCancelled;
               Exit;
             end;
-
-            ToolCallObj := ToolCallsArr.Objects[I];
-            if ToolCallObj = nil then
-              Continue;
-
-            FuncData := ToolCallObj.Find('function');
-            if (FuncData = nil) or (FuncData.JSONType <> jtObject) then
-              Continue;
-            FuncObj := TJSONObject(FuncData);
-
-            ToolName := FuncObj.Get('name', '');
-
-            // Arguments can be a JSON object or a JSON string depending on server
-            ArgsData := FuncObj.Find('arguments');
-            if ArgsData = nil then
-              ToolArgs := '{}'
-            else if ArgsData.JSONType = jtString then
-              ToolArgs := TJSONString(ArgsData).AsString
-            else
-              ToolArgs := ArgsData.AsJSON;
-
-            QueueToolCall(ToolName, ToolArgs);
-
-            QueueRoute(aoToolCall, ToolName + ' ' + ToolArgs, Allow);
-            if Allow then
+            FAgent.LogLine(Format('Running %d tools in parallel', [ToolCount]));
+            Threads := TList.Create;
+            try
+              // Create worker threads for allowed and valid calls
+              for ToolIdx := 0 to ToolCount - 1 do
+              begin
+                if ToolNames[ToolIdx] = '' then
+                  Continue;
+                if not ToolAllowArr[ToolIdx] then
+                begin
+                  ToolResultArr[ToolIdx] := '{"error": "denied by host"}';
+                  Continue;
+                end;
+                Threads.Add(TToolExecThread.Create(FAgent, ToolNames[ToolIdx], ToolArgArr[ToolIdx]));
+              end;
+              for ToolIdx := 0 to Threads.Count - 1 do
+                TToolExecThread(Threads[ToolIdx]).WaitFor;
+              // Collect results in original order
+              CollectIdx := 0;
+              for ToolIdx := 0 to ToolCount - 1 do
+              begin
+                if ToolNames[ToolIdx] = '' then
+                  Continue;
+                if ToolAllowArr[ToolIdx] then
+                begin
+                  ToolResultArr[ToolIdx] := TToolExecThread(Threads[CollectIdx]).ToolResult;
+                  Inc(CollectIdx);
+                end;
+              end;
+            finally
+              // Free worker objects even when an exception interrupted the batch
+              for ToolIdx := 0 to Threads.Count - 1 do
+                TToolExecThread(Threads[ToolIdx]).Free;
+              Threads.Free;
+            end;
+          end
+          else
+          begin
+            for ToolIdx := 0 to ToolCount - 1 do
             begin
-              // finish tool terminates the run immediately with the given message
-              if (ToolName = 'finish') and (afFinish in FAgent.FFeatures) then
+              if FAgent.FCancelled then
+              begin
+                Reason := afrCancelled;
+                Exit;
+              end;
+              if ToolNames[ToolIdx] = '' then
+                Continue;
+
+              if not ToolAllowArr[ToolIdx] then
+              begin
+                ToolResultArr[ToolIdx] := '{"error": "denied by host"}';
+                Continue;
+              end;
+
+              // finish tool terminates the run with the given message
+              if (ToolNames[ToolIdx] = 'finish') and (afFinish in FAgent.FFeatures) then
               begin
                 FinishData := nil;
                 try
                   try
-                    FinishData := GetJSON(ToolArgs);
+                    FinishData := GetJSON(ToolArgArr[ToolIdx]);
                     if (FinishData <> nil) and (FinishData.JSONType = jtObject) then
                       FinalContent := TJSONObject(FinishData).Get('message', '');
                   except
@@ -1688,16 +1847,20 @@ begin
                 Reason := afrSuccess;
                 Exit;
               end;
-              ToolResult := FAgent.DispatchTool(ToolName, ToolArgs);
-            end
-            else
-              ToolResult := '{"error": "denied by host"}';
 
-            QueueToolResult(ToolName, ToolResult);
+              ToolResultArr[ToolIdx] := FAgent.DispatchTool(ToolNames[ToolIdx], ToolArgArr[ToolIdx]);
+            end;
+          end;
 
+          // Emit results in original order and append tool messages
+          for ToolIdx := 0 to ToolCount - 1 do
+          begin
+            if ToolNames[ToolIdx] = '' then
+              Continue;
+            QueueToolResult(ToolNames[ToolIdx], ToolResultArr[ToolIdx]);
             MsgObj := TJSONObject.Create;
             MsgObj.Add('role', 'tool');
-            MsgObj.Add('content', ToolResult);
+            MsgObj.Add('content', ToolResultArr[ToolIdx]);
             MessagesArr.Add(MsgObj);
           end;
         finally
@@ -1721,11 +1884,10 @@ begin
     if FAgent.KeepHistory then
     begin
       try
-        // Close the cancelled turn so the next user message does not
-        // appear as two user messages in a row and lose the current request
-        if Reason = afrCancelled then
+        // Resolve orphaned tool calls for both cancelled and error paths,
+        // otherwise the next run sends assistant tool_calls without replies
+        if (Reason = afrCancelled) or (Reason = afrError) then
         begin
-          // Resolve orphaned tool calls that were never executed
           if (MessagesArr.Count > 0) and (MessagesArr.Items[MessagesArr.Count - 1].JSONType = jtObject) then
           begin
             Data := TJSONObject(MessagesArr.Items[MessagesArr.Count - 1]).Find('tool_calls');
@@ -1735,14 +1897,20 @@ begin
               begin
                 MsgObj := TJSONObject.Create;
                 MsgObj.Add('role', 'tool');
-                MsgObj.Add('content', '{"error": "cancelled by user before execution"}');
+                if Reason = afrCancelled then
+                  MsgObj.Add('content', '{"error": "cancelled by user before execution"}')
+                else
+                  MsgObj.Add('content', '{"error": "aborted by error before execution"}');
                 MessagesArr.Add(MsgObj);
               end;
             end;
             // Do not free Data, it is owned by the parent message object
             Data := nil;
           end;
-          // Close the turn with partial content and a cancel marker
+        end;
+        // Close a cancelled turn with partial content and a cancel marker
+        if Reason = afrCancelled then
+        begin
           MsgObj := TJSONObject.Create;
           MsgObj.Add('role', 'assistant');
           if FinalContent <> '' then
@@ -2189,6 +2357,7 @@ var
   ErrMsg, SummJson: string;
   SummArr: TJSONArray;
   SysMsg, UserMsg: TJSONObject;
+  SavedTimeout: integer;
 begin
   Result := '';
   if not Assigned(FOllamaManager) then
@@ -2212,7 +2381,15 @@ begin
     SummArr.Free;
   end;
   LogLine(Format('Summarizing conversation, input_len=%d', [Length(AMessagesJson)]));
-  Result := FOllamaManager.ChatWithTools(FModelName, SummJson, '', Kind, ErrMsg);
+  // Apply the agent-level timeout override during summarization
+  SavedTimeout := FOllamaManager.RequestTimeout;
+  if FRequestTimeout > 0 then
+    FOllamaManager.RequestTimeout := FRequestTimeout;
+  try
+    Result := FOllamaManager.ChatWithTools(FModelName, SummJson, '', Kind, ErrMsg);
+  finally
+    FOllamaManager.RequestTimeout := SavedTimeout;
+  end;
   if Kind <> oekNone then
   begin
     LogLine('Summarize failed: ' + ErrMsg);
@@ -2296,6 +2473,10 @@ begin
         'Preview a text file: first and last N lines plus total size. ' +
         'Call FIRST on unknown or large (>50KB) files before read_file.',
         '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"head":{"type":"integer","description":"First lines, default 30, max 500"},"tail":{"type":"integer","description":"Last lines, default 30, max 500"}},"required":["path"]}');
+      AddTool(Arr, 'read_file_lines',
+        'Read a line range. Use for files >50KB or after read_file truncation. ' +
+        'Up to 5000 lines per call, use increasing start_line for large files.',
+        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"}},"required":["path"]}');
       AddTool(Arr, 'read_file',
         'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
         'prefer read_file_preview or read_file_lines for large ones.',
@@ -2306,10 +2487,6 @@ begin
         '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative directory"}}}');
       AddTool(Arr, 'search_text', 'Search for a literal text pattern, returns file and line',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
-      AddTool(Arr, 'read_file_lines',
-        'Read a line range. Use for files >50KB or after read_file truncation. ' +
-        'Up to 5000 lines per call, use increasing start_line for large files.',
-        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"}},"required":["path"]}');
       AddTool(Arr, 'edit_file',
         'Replace exact string in a file. old_string must occur exactly once unless replace_all=true',
         '{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}');
@@ -2388,12 +2565,12 @@ begin
       Names.Add(FTools[I].Name);
     if afFileTools in FFeatures then
     begin
-      Names.Add('read_file');
       Names.Add('read_file_preview');
+      Names.Add('read_file_lines');
+      Names.Add('read_file');
       Names.Add('write_file');
       Names.Add('list_files');
       Names.Add('search_text');
-      Names.Add('read_file_lines');
       Names.Add('edit_file');
       Names.Add('delete_file');
       Names.Add('move_file');
@@ -2571,10 +2748,15 @@ begin
   Lines := TStringList.Create;
   try
     try
-      Lines.LoadFromFile(FullPath);
+      Lines.LoadFromFile(FullPath, TEncoding.UTF8);
     except
-      Result := '{"error": "cannot read file"}';
-      Exit;
+      // Fall back to system codepage when the file is not valid UTF-8
+      try
+        Lines.LoadFromFile(FullPath);
+      except
+        Result := '{"error": "cannot read file"}';
+        Exit;
+      end;
     end;
     TotalLines := Lines.Count;
     Buf := TStringBuilder.Create;
@@ -2725,16 +2907,21 @@ begin
 end;
 
 function TCustomOllamaAgent.DoSearchText(AArgs: TJSONObject): string;
+const
+  MAX_MATCHES = 500;
+  MAX_TOTAL_BYTES = 50000;
+  MAX_MATCH_LINE_CHARS = 500;
 var
-  RelPath, FullPath, Pattern: string;
+  RelPath, FullPath, Pattern, LowPattern: string;
   Recursive: boolean;
   Files: TStringList;
   Matches: TJSONArray;
   FileLines: TStringList;
-  I, J: integer;
+  I, J, TotalBytes: integer;
   Line: string;
   MatchObj: TJSONObject;
   BaseRoot: string;
+  Truncated: boolean;
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -2758,38 +2945,68 @@ begin
     Result := '{"error": "directory not found"}';
     Exit;
   end;
-
   BaseRoot := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
+  LowPattern := LowerCase(Pattern);
   Files := TStringList.Create;
   Matches := TJSONArray.Create;
+  Truncated := False;
+  TotalBytes := 0;
   try
     FindAllFiles(Files, FullPath, '*.*', Recursive);
     for I := 0 to Files.Count - 1 do
     begin
+      if Matches.Count >= MAX_MATCHES then
+      begin
+        Truncated := True;
+        Break;
+      end;
+      if TotalBytes >= MAX_TOTAL_BYTES then
+      begin
+        Truncated := True;
+        Break;
+      end;
       FileLines := TStringList.Create;
       try
         try
-          FileLines.LoadFromFile(Files[I]);
+          FileLines.LoadFromFile(Files[I], TEncoding.UTF8);
         except
-          Continue;
+          try
+            FileLines.LoadFromFile(Files[I]);
+          except
+            Continue;
+          end;
         end;
         for J := 0 to FileLines.Count - 1 do
         begin
-          Line := FileLines[J];
-          if Pos(Pattern, Line) > 0 then
+          if Matches.Count >= MAX_MATCHES then
           begin
+            Truncated := True;
+            Break;
+          end;
+          if TotalBytes >= MAX_TOTAL_BYTES then
+          begin
+            Truncated := True;
+            Break;
+          end;
+          Line := FileLines[J];
+          if Pos(LowPattern, LowerCase(Line)) > 0 then
+          begin
+            if Length(Line) > MAX_MATCH_LINE_CHARS then
+              Line := Copy(Line, 1, MAX_MATCH_LINE_CHARS) + '...';
             MatchObj := TJSONObject.Create;
             MatchObj.Add('file', Copy(Files[I], Length(BaseRoot) + 1, MaxInt));
             MatchObj.Add('line', J + 1);
             MatchObj.Add('text', Line);
             Matches.Add(MatchObj);
+            Inc(TotalBytes, Length(Line) + 50);
           end;
         end;
       finally
         FileLines.Free;
       end;
     end;
-    Result := Matches.AsJSON;
+    Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Truncated, 'true', 'false') +
+      ', "matches": ' + Matches.AsJSON + '}';
   finally
     Matches.Free;
     Files.Free;
@@ -2825,10 +3042,15 @@ begin
   Lines := TStringList.Create;
   try
     try
-      Lines.LoadFromFile(FullPath);
+      Lines.LoadFromFile(FullPath, TEncoding.UTF8);
     except
-      Result := '{"error": "cannot read file"}';
-      Exit;
+      // Fall back to system codepage when the file is not valid UTF-8
+      try
+        Lines.LoadFromFile(FullPath);
+      except
+        Result := '{"error": "cannot read file"}';
+        Exit;
+      end;
     end;
     if EndLine < 0 then
       EndLine := Lines.Count
@@ -3114,7 +3336,6 @@ var
   Recursive: boolean;
   Files: TStringList;
   Patterns: TStringList;
-  GitPatterns: TStringList;
   Arr: TJSONArray;
   I, P, TotalBytes: integer;
   BaseRoot: string;
@@ -3144,7 +3365,6 @@ begin
   Files.Sorted := True;
   Files.Duplicates := dupIgnore;
   Arr := TJSONArray.Create;
-  GitPatterns := LoadGitignorePatterns(GetEffectiveRootPath);
   Patterns := ExpandBracePatterns(Pattern);
   try
     // Run FindAllFiles once per expanded pattern, Files dedupes results
@@ -3169,9 +3389,8 @@ begin
         Truncated := True;
         Break;
       end;
+      // Explicit find_files must see all files, gitignore filtering is for grep only
       RelPath := RelativeToRoot(BaseRoot, Files[I]);
-      if IsIgnoredByGitignore(RelPath, GitPatterns) then
-        Continue;
       Arr.Add(RelPath);
       Inc(TotalBytes, Length(RelPath) + 4);
     end;
@@ -3181,7 +3400,6 @@ begin
     Patterns.Free;
     Arr.Free;
     Files.Free;
-    GitPatterns.Free;
   end;
 end;
 
