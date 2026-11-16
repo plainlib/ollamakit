@@ -1041,9 +1041,10 @@ type
   TShellFamily = (sfCmd, sfUnix, sfPowerShell, sfUnknown);
 const
   // Unix utilities that cmd.exe does not have
-  UNIX_CMDS: array[0..15] of string = (
+  UNIX_CMDS: array[0..18] of string = (
     'ls', 'cat', 'grep', 'head', 'tail', 'rm', 'cp', 'mv',
-    'touch', 'which', 'chmod', 'chown', 'sudo', 'sed', 'awk', 'wc');
+    'touch', 'which', 'chmod', 'chown', 'sudo', 'sed', 'awk', 'wc',
+    'find', 'for', 'export');
   // Windows utilities that Unix shells do not have
   WIN_CMDS: array[0..3] of string = (
     'findstr', 'cls', 'where', 'powershell');
@@ -1131,8 +1132,12 @@ begin
   if Trim(AResult) = '' then
     AResult := '(command produced no output, exit code ' + IntToStr(ExitCode) + ')';
 
+  // Detect bash for-loop and other shell constructs that cmd.exe rejects
+  if (Pos('; do ', LowerCase(ACommand)) > 0) or (Pos('; done', LowerCase(ACommand)) > 0) then
+    Hint := 'Note: this shell is cmd.exe, not bash. "for ... do ... done" loops are not supported. ' +
+      'Use "for %I in (list) do command" syntax instead, or separate commands with &&.';
   if Hint <> '' then
-    AResult := AResult + #10 + Hint;
+    AResult := Hint + #10 + AResult;
 end;
 
 procedure TCustomTermManager.HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);

@@ -946,6 +946,15 @@ begin
   end;
 end;
 
+// Returns True for build artifacts and VCS metadata that clutter file listings
+function IsJunkFileForFind(const ARelPath: string): boolean;
+var
+  Low: string;
+begin
+  Low := '/' + LowerCase(StringReplace(ARelPath, '\', '/', [rfReplaceAll])) + '/';
+  Result := (Pos('/.git/', Low) > 0) or (Pos('/.svn/', Low) > 0) or (Pos('/.hg/', Low) > 0);
+end;
+
 { TAgentWebOptions }
 
 constructor TAgentWebOptions.Create;
@@ -2845,8 +2854,14 @@ begin
         end;
       end;
       Buf.Append(#10);
-      Buf.Append('To read a specific range use read_file_lines with start_line and end_line. ');
-      Buf.Append('To read the first 50 KB use read_file.');
+      if Size <= 50000 then
+        Buf.Append('This file is ' + IntToStr(Size) + ' bytes, it FITS ENTIRELY in a single ' +
+          'read_file call. Use read_file(path) now to load the whole file at once.')
+      else
+      begin
+        Buf.Append('This file is ' + IntToStr(Size) + ' bytes, larger than the 50 KB default. ');
+        Buf.Append('Use read_file for the first 50 KB, then read_file_lines with start_line/end_line for more.');
+      end;
       Result := TJSONString.Create(Buf.ToString).AsJSON;
     finally
       Buf.Free;
@@ -3402,6 +3417,18 @@ begin
   Recursive := GetBoolArg(AArgs, 'recursive', True);
   if Pattern = '' then
     Pattern := '*';
+  // Accept path-style patterns like "src/*.pas" by merging them into the search root
+  P := LastDelimiter('/' + PathDelim, Pattern);
+  if P > 0 then
+  begin
+    if RelPath <> '' then
+      RelPath := IncludeTrailingPathDelimiter(RelPath) + Copy(Pattern, 1, P - 1)
+    else
+      RelPath := Copy(Pattern, 1, P - 1);
+    Pattern := Copy(Pattern, P + 1, MaxInt);
+    if Pattern = '' then
+      Pattern := '*';
+  end;
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -3444,6 +3471,8 @@ begin
       end;
       // Explicit find_files must see all files, gitignore filtering is for grep only
       RelPath := RelativeToRoot(BaseRoot, Files[I]);
+      if IsJunkFileForFind(RelPath) then
+        Continue;
       Arr.Add(RelPath);
       Inc(TotalBytes, Length(RelPath) + 4);
     end;
@@ -3589,12 +3618,14 @@ begin
   ScanLimited := False;
   FilesScanned := 0;
   TimedOut := False;
+  TotalBytes := 0;
   StartTick := GetTickCount64;
   try
     // A path to a file searches only that file, like Unix grep file.txt
     SingleFile := FileExists(FullPath) and not DirectoryExists(FullPath);
     if SingleFile then
     begin
+      Inc(FilesScanned);
       ScanFile(FullPath, RelativeToRoot(BaseRoot, FullPath));
     end
     else
@@ -3966,13 +3997,21 @@ end;
 
 function TCustomOllamaAgent.DispatchTool(const AName, AArgsJson: string): string;
 var
-  I: integer;
+  I, P: integer;
   Args: TJSONObject;
   Call: TExecCommandCall;
-  Command, Res: string;
+  Command, Res, CleanName: string;
   Allow: boolean;
 begin
-  LogLine(Format('DispatchTool name="%s" args="%s"', [AName, Copy(AArgsJson, 1, 200)]));
+  // Some models append <tool_call> or whitespace to the function name, strip it
+  CleanName := AName;
+  P := Pos('<', CleanName);
+  if P > 0 then
+    CleanName := Copy(CleanName, 1, P - 1);
+  CleanName := Trim(CleanName);
+  if CleanName = '' then
+    CleanName := AName;
+  LogLine(Format('DispatchTool name="%s" args="%s"', [CleanName, Copy(AArgsJson, 1, 200)]));
 
   Args := nil;
   try
@@ -3985,7 +4024,7 @@ begin
     // User-defined tools first
     for I := 0 to FTools.Count - 1 do
     begin
-      if FTools[I].Name = AName then
+      if FTools[I].Name = CleanName then
       begin
         Result := '';
         if Assigned(FTools[I].FOnExecute) then
@@ -3996,39 +4035,39 @@ begin
 
     if afFileTools in FFeatures then
     begin
-      if AName = 'read_file' then
+      if CleanName = 'read_file' then
         Exit(DoReadFile(Args))
-      else if AName = 'read_file_preview' then
+      else if CleanName = 'read_file_preview' then
         Exit(DoReadFilePreview(Args))
-      else if AName = 'write_file' then
+      else if CleanName = 'write_file' then
         Exit(DoWriteFile(Args))
-      else if AName = 'list_files' then
+      else if CleanName = 'list_files' then
         Exit(DoListFiles(Args))
-      else if AName = 'search_text' then
+      else if CleanName = 'search_text' then
         Exit(DoSearchText(Args))
-      else if AName = 'read_file_lines' then
+      else if CleanName = 'read_file_lines' then
         Exit(DoReadFileLines(Args))
-      else if AName = 'edit_file' then
+      else if CleanName = 'edit_file' then
         Exit(DoEditFile(Args))
-      else if AName = 'delete_file' then
+      else if CleanName = 'delete_file' then
         Exit(DoDeleteFile(Args))
-      else if AName = 'move_file' then
+      else if CleanName = 'move_file' then
         Exit(DoMoveFile(Args))
-      else if AName = 'copy_file' then
+      else if CleanName = 'copy_file' then
         Exit(DoCopyFile(Args))
-      else if AName = 'file_info' then
+      else if CleanName = 'file_info' then
         Exit(DoFileInfo(Args))
-      else if AName = 'create_directory' then
+      else if CleanName = 'create_directory' then
         Exit(DoCreateDirectory(Args))
-      else if AName = 'find_files' then
+      else if CleanName = 'find_files' then
         Exit(DoFindFiles(Args))
-      else if AName = 'grep' then
+      else if CleanName = 'grep' then
         Exit(DoGrep(Args))
-      else if AName = 'read_agents_md' then
+      else if CleanName = 'read_agents_md' then
         Exit(DoReadAgentsMd(Args));
     end;
 
-    if (AName = 'exec_command') and (afExecCommand in FFeatures) then
+    if (CleanName = 'exec_command') and (afExecCommand in FFeatures) then
     begin
       Result := '{"error": "no OnExecCommand handler"}';
       if not Assigned(FOnExecCommand) then
@@ -4057,29 +4096,29 @@ begin
 
     if afGit in FFeatures then
     begin
-      if AName = 'git_status' then
+      if CleanName = 'git_status' then
         Exit(DoGitStatus(Args))
-      else if AName = 'git_diff' then
+      else if CleanName = 'git_diff' then
         Exit(DoGitDiff(Args))
-      else if AName = 'git_log' then
+      else if CleanName = 'git_log' then
         Exit(DoGitLog(Args))
-      else if AName = 'git_commit' then
+      else if CleanName = 'git_commit' then
         Exit(DoGitCommit(Args));
     end;
 
-    if (AName = 'ask_user') and (afInteractive in FFeatures) then
+    if (CleanName = 'ask_user') and (afInteractive in FFeatures) then
       Exit(DoAskUser(Args));
 
     if afWebTools in FFeatures then
     begin
-      if AName = 'web_fetch' then
+      if CleanName = 'web_fetch' then
         Exit(DoWebFetch(Args))
-      else if AName = 'web_search' then
+      else if CleanName = 'web_search' then
         Exit(DoWebSearch(Args));
     end;
 
     // finish is handled in Execute before DispatchTool is called
-    Result := BuildUnknownToolError(AName);
+    Result := BuildUnknownToolError(CleanName);
   finally
     Args.Free;
   end;
