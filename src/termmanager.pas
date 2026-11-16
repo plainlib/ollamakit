@@ -1084,8 +1084,8 @@ const
   begin
     Result := False;
     for I := Low(CMDS) to High(CMDS) do
-      if (ALowCmd = CMDS[I]) or ((Length(ALowCmd) > Length(CMDS[I])) and
-        (Copy(ALowCmd, 1, Length(CMDS[I]) + 1) = CMDS[I] + ' ')) then
+      if (ALowCmd = CMDS[I]) or ((Length(ALowCmd) > Length(CMDS[I])) and (Copy(ALowCmd, 1, Length(CMDS[I]) + 1) =
+        CMDS[I] + ' ')) then
         Exit(True);
   end;
 
@@ -1137,10 +1137,22 @@ begin
         end;
       end;
       // findstr treats $ and \. literally, not as regex anchors
-      if (Hint = '') and (Pos('findstr', LowerCase(ACommand)) > 0) and ((Pos('$', ACommand) > 0) or
-        (Pos('\.', ACommand) > 0)) then
+      if (Hint = '') and (Pos('findstr', LowerCase(ACommand)) > 0) and ((Pos('$', ACommand) > 0) or (Pos('\.', ACommand) > 0)) then
         Hint := 'Note: findstr uses limited Windows regex, "$" and "\." are literal characters. ' +
           'Use the grep tool for text search, it is more reliable.';
+      // Unix find syntax, cmd.exe find only searches text inside files
+      if (Hint = '') and (Pos(' find ', ' ' + LowerCase(ACommand) + ' ') > 0) and
+        ((Pos(' -type ', ' ' + LowerCase(ACommand) + ' ') > 0) or (Pos(' -name ', ' ' + LowerCase(ACommand) + ' ') > 0) or
+        (Pos(' -maxdepth ', ' ' + LowerCase(ACommand) + ' ') > 0) or (Pos(' -not ', ' ' + LowerCase(ACommand) + ' ') > 0)) then
+        Hint := 'Note: "find" in cmd.exe searches text inside files, not filenames, ' +
+          'and does not accept Unix options like -type, -name, -maxdepth. ' +
+          'Use find_files tool with a glob pattern for filename search, or grep tool for text search.';
+      // dir /s produces huge output on large trees, prefer file tools
+      if (Hint = '') and (Pos('dir ', ' ' + LowerCase(ACommand) + ' ') > 0) and
+        (Pos(' /s', ' ' + LowerCase(ACommand) + ' ') > 0) then
+        Hint := 'Note: "dir /s" recurses into all subdirectories, it can take a long time ' +
+          'and produce huge output on large projects. Use find_files with a glob pattern ' +
+          'or list_files on a specific subdirectory instead.';
     end;
     sfUnix:
     begin

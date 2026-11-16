@@ -2760,7 +2760,7 @@ var
   Info: TSearchRec;
   Res, Dist, I, J: integer;
   Candidates: TStringList;
-  Dists: array of integer = ();
+  Dists: array of integer = nil;
   TmpName: string;
   TmpDist: integer;
 begin
@@ -2845,6 +2845,11 @@ begin
     Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
     Exit;
   end;
+  if DirectoryExists(FullPath) then
+  begin
+    Result := '{"error": "path is a directory, use list_files to see its contents"}';
+    Exit;
+  end;
   if not FileExists(FullPath) then
   begin
     Result := BuildFileNotFoundError(FullPath, RelPath);
@@ -2911,6 +2916,11 @@ begin
   if FullPath = '' then
   begin
     Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if DirectoryExists(FullPath) then
+  begin
+    Result := '{"error": "path is a directory, use list_files to see its contents"}';
     Exit;
   end;
   if not FileExists(FullPath) then
@@ -3254,6 +3264,11 @@ begin
   if FullPath = '' then
   begin
     Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Exit;
+  end;
+  if DirectoryExists(FullPath) then
+  begin
+    Result := '{"error": "path is a directory, use list_files to see its contents"}';
     Exit;
   end;
   if not FileExists(FullPath) then
