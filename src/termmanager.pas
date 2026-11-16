@@ -3030,12 +3030,13 @@ var
   Rec, NextRec: INPUT_RECORD;
   N: DWORD = 0;
   Line, PromptText: RawByteString;
-  ChS: RawByteString;
-  CursorPos, HistIndex, PromptRow, PromptCol, OldLen: Integer;
+  CursorPos, HistIndex, PromptRow: Integer;
   C: WideChar;
   Wide: UnicodeString;
   LastRedrawRows: Integer;
-  HasMore, IsModifier: Boolean;
+  HasMore, IsModifier, ShiftPressed, CtrlPressed: Boolean;
+  SelAnchor, SelStart, SelEnd: Integer;
+  HasSelection: Boolean;
 
   // Collects full UTF-8 sequence that conhost splits across key events
   procedure CollectBrokenUtf8(var AC: WideChar);
@@ -3137,56 +3138,279 @@ var
     Result.Add(Copy(S, Start, MaxInt));
   end;
 
-  // Computes 0-based row and column of the cursor inside the prefix
-  procedure CalcCursorPos(const APrefix: RawByteString; out ARow, ACol: Integer);
-  var
-    Parts: TStringList;
+  // Recomputes normalized selection bounds from anchor and cursor position
+  procedure UpdateSelection;
   begin
-    Parts := SplitLines(APrefix);
-    try
-      ARow := Parts.Count - 1;
-      if Parts.Count > 0 then
-        ACol := Utf8CharCount(Parts[Parts.Count - 1])
+    HasSelection := (SelAnchor >= 0) and (SelAnchor <> CursorPos);
+    if HasSelection then
+    begin
+      if SelAnchor < CursorPos then
+      begin
+        SelStart := SelAnchor;
+        SelEnd := CursorPos;
+      end
       else
-        ACol := 0;
-    finally
-      Parts.Free;
+      begin
+        SelStart := CursorPos;
+        SelEnd := SelAnchor;
+      end;
+    end
+    else
+    begin
+      SelStart := 0;
+      SelEnd := 0;
     end;
   end;
 
+  procedure ClearSelection;
+  begin
+    SelAnchor := -1;
+    HasSelection := False;
+    SelStart := 0;
+    SelEnd := 0;
+  end;
+
+  // Copies the selected byte range to the Windows clipboard as CF_UNICODETEXT
+  procedure CopySelectionToClipboard;
+  var
+    SelText: RawByteString;
+    SelWide: UnicodeString;
+    hData: THandle;
+    P: Pointer;
+    Size, SelLen: SizeInt;
+  begin
+    if not HasSelection then
+      Exit;
+    SelText := Copy(Line, SelStart + 1, SelEnd - SelStart);
+    SetCodePage(SelText, CP_UTF8, False);
+    SelWide := UTF8Decode(SelText);
+    SelLen := Length(SelWide);
+    if not OpenClipboard(0) then
+      Exit;
+    try
+      EmptyClipboard;
+      Size := (SelLen + 1) * SizeOf(WideChar);
+      hData := GlobalAlloc(GMEM_MOVEABLE or GMEM_ZEROINIT, Size);
+      if hData = 0 then
+        Exit;
+      P := GlobalLock(hData);
+      if P = nil then
+      begin
+        GlobalFree(hData);
+        Exit;
+      end;
+      if SelLen > 0 then
+        Move(SelWide[1], P^, SelLen * SizeOf(WideChar));
+      PWideChar(P)[SelLen] := #0;
+      GlobalUnlock(hData);
+      if SetClipboardData(CF_UNICODETEXT, hData) = 0 then
+        GlobalFree(hData);
+    finally
+      CloseClipboard;
+    end;
+    end;
+
+  // Reads clipboard text as a Unicode string, returns empty when clipboard has no text
+  function ReadClipboardText: UnicodeString;
+  var
+    hData: THandle;
+    P: Pointer;
+  begin
+    Result := '';
+    if not IsClipboardFormatAvailable(CF_UNICODETEXT) then
+      Exit;
+    if not OpenClipboard(0) then
+      Exit;
+    try
+      hData := GetClipboardData(CF_UNICODETEXT);
+      if hData = 0 then
+        Exit;
+      P := GlobalLock(hData);
+      if P = nil then
+        Exit;
+      try
+        Result := PWideChar(P);
+      finally
+        GlobalUnlock(hData);
+      end;
+    finally
+      CloseClipboard;
+    end;
+  end;
+
+  // Normalizes line endings to CRLF and inserts clipboard text at cursor
+  procedure PasteText(const AText: UnicodeString);
+  var
+    Utf8: RawByteString;
+  begin
+    if Length(AText) = 0 then
+      Exit;
+    Utf8 := UTF8Encode(AText);
+    SetCodePage(Utf8, CP_UTF8, False);
+    // Normalize all line ending variants to Windows CRLF
+    Utf8 := StringReplace(Utf8, #13#10, #10, [rfReplaceAll]);
+    Utf8 := StringReplace(Utf8, #13, #10, [rfReplaceAll]);
+    Utf8 := StringReplace(Utf8, #10, #13#10, [rfReplaceAll]);
+    if HasSelection then
+    begin
+      Delete(Line, SelStart + 1, SelEnd - SelStart);
+      CursorPos := SelStart;
+      ClearSelection;
+    end;
+    Insert(Utf8, Line, CursorPos + 1);
+    SetCodePage(Line, CP_UTF8, False);
+    Inc(CursorPos, Length(Utf8));
+  end;
+
+  // Inserts a UTF-8 char at the cursor, replacing the selection when active
+  procedure InsertTypedChar(const AUtf8: RawByteString);
+  var
+    OldLen: Integer;
+  begin
+    if HasSelection then
+    begin
+      Delete(Line, SelStart + 1, SelEnd - SelStart);
+      CursorPos := SelStart;
+      ClearSelection;
+    end;
+    OldLen := Length(Line);
+    Insert(AUtf8, Line, CursorPos + 1);
+    SetCodePage(Line, CP_UTF8, False);
+    Inc(CursorPos, Length(Line) - OldLen);
+  end;
+
+  // Redraws prompt and content, tracks visual wrapping and selection highlight
   procedure Redraw;
   var
-    I, CurRow, CurCol: Integer;
+    I, J, J2, LenS, GlobalPos, LineStart: Integer;
+    S: RawByteString;
     Lines: TStringList;
+    Info: CONSOLE_SCREEN_BUFFER_INFO;
+    NormalAttr, InvAttr: Word;
+    IsSel, PrevIsSel: Boolean;
+    CurRow, CurCol, EndRow: Integer;
+    CursorSaved: Boolean;
   begin
     HideConsoleCursor;
-    // Clear rows occupied by the previous redraw
+    Info:=Default(CONSOLE_SCREEN_BUFFER_INFO);
+
     if LastRedrawRows > 0 then
       for I := 0 to LastRedrawRows - 1 do
       begin
         ConGotoXY(1, PromptRow + I);
         ConClearLineFromCursor;
       end;
-    // Rewrite prompt and content line by line
+
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+    NormalAttr := Info.wAttributes;
+    // Swap foreground and background to build the selection highlight
+    InvAttr := ((NormalAttr and $0F) shl 4) or ((NormalAttr and $F0) shr 4);
+
     Lines := SplitLines(Line);
     try
+      ConGotoXY(1, PromptRow);
+      CursorSaved := False;
+      CurRow := PromptRow;
+      CurCol := 1;
+      LineStart := 1;
+
       for I := 0 to Lines.Count - 1 do
       begin
-        ConGotoXY(1, PromptRow + I);
         if I = 0 then
           ConWriteUtf8(PromptText);
-        ConWriteUtf8(Lines[I]);
+        S := Lines[I];
+        LenS := Length(S);
+
+        if HasSelection then
+        begin
+          // Slow path: char by char so attribute can change at boundaries
+          PrevIsSel := False;
+          J := 1;
+          while J <= LenS do
+          begin
+            GlobalPos := LineStart - 1 + (J - 1);
+            IsSel := (GlobalPos >= SelStart) and (GlobalPos < SelEnd);
+            if IsSel <> PrevIsSel then
+            begin
+              if IsSel then
+                SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), InvAttr)
+              else
+                SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), NormalAttr);
+              PrevIsSel := IsSel;
+            end;
+            if (not CursorSaved) and (CursorPos = GlobalPos) then
+            begin
+              GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+              CurRow := Info.dwCursorPosition.Y + 1;
+              CurCol := Info.dwCursorPosition.X + 1;
+              CursorSaved := True;
+            end;
+            J2 := Utf8NextPos(S, J);
+            ConWriteUtf8(Copy(S, J, J2 - J));
+            J := J2;
+          end;
+          if PrevIsSel then
+            SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), NormalAttr);
+        end
+        else
+        begin
+          // Fast path: split around cursor byte offset and capture between
+          J := CursorPos - (LineStart - 1);
+          if (not CursorSaved) and (J >= 0) and (J <= LenS) then
+          begin
+            if J > 0 then
+              ConWriteUtf8(Copy(S, 1, J));
+            GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+            CurRow := Info.dwCursorPosition.Y + 1;
+            CurCol := Info.dwCursorPosition.X + 1;
+            CursorSaved := True;
+            if J < LenS then
+              ConWriteUtf8(Copy(S, J + 1, MaxInt));
+          end
+          else
+            ConWriteUtf8(S);
+        end;
+
+        // Capture cursor at end of logical line content for the slow path
+        if (not CursorSaved) and (CursorPos = LineStart - 1 + LenS) then
+        begin
+          GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+          CurRow := Info.dwCursorPosition.Y + 1;
+          CurCol := Info.dwCursorPosition.X + 1;
+          CursorSaved := True;
+        end;
+
+        if I < Lines.Count - 1 then
+        begin
+          GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+          // Move to next visual row only when the cursor is not already there
+          if Info.dwCursorPosition.X > 0 then
+            ConGotoXY(1, Info.dwCursorPosition.Y + 2);
+          LineStart := LineStart + LenS + 2;
+        end;
       end;
-      LastRedrawRows := Lines.Count;
+
+      if not CursorSaved then
+      begin
+        GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+        CurRow := Info.dwCursorPosition.Y + 1;
+        CurCol := Info.dwCursorPosition.X + 1;
+      end;
+
+      // Count physical rows used so the next redraw clears them all
+      GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+      EndRow := Info.dwCursorPosition.Y + 1;
+      if Info.dwCursorPosition.X = 0 then
+        LastRedrawRows := EndRow - PromptRow
+      else
+        LastRedrawRows := EndRow - PromptRow + 1;
+      if LastRedrawRows < 1 then
+        LastRedrawRows := 1;
     finally
       Lines.Free;
     end;
-    // Place the cursor on the right row and column
-    CalcCursorPos(Copy(Line, 1, CursorPos), CurRow, CurCol);
-    if CurRow = 0 then
-      ConGotoXY(PromptCol + CurCol, PromptRow)
-    else
-      ConGotoXY(1 + CurCol, PromptRow + CurRow);
+
+    ConGotoXY(CurCol, CurRow);
     ShowConsoleCursor;
   end;
 
@@ -3194,10 +3418,13 @@ begin
   Result := '';
   Rec := Default(INPUT_RECORD);
   Line := '';
-  // Force UTF-8 tag so raw inserts do not get re-encoded later
   SetCodePage(Line, CP_UTF8, False);
   CursorPos := 0;
   HistIndex := FHistory.Count;
+  SelAnchor := -1;
+  HasSelection := False;
+  SelStart := 0;
+  SelEnd := 0;
 
   PromptText := GetPromptText;
   // Ensure prompt starts on a fresh line after streaming output
@@ -3206,7 +3433,6 @@ begin
   ConWriteUtf8(PromptText);
   FLastCharWasNewLine := False;
   PromptRow := ConWhereY;
-  PromptCol := Utf8CharCount(PromptText) + 1;
   LastRedrawRows := 1;
 
   Handle := GetStdHandle(STD_INPUT_HANDLE);
@@ -3228,13 +3454,14 @@ begin
     if (Ord(C) >= $FF00) or ((Ord(C) >= $C2) and (Ord(C) <= $F4)) then
       CollectBrokenUtf8(C);
 
+    ShiftPressed := (Rec.Event.KeyEvent.dwControlKeyState and SHIFT_PRESSED) <> 0;
+    CtrlPressed := (Rec.Event.KeyEvent.dwControlKeyState and
+      (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+
     case Rec.Event.KeyEvent.wVirtualKeyCode of
       VK_RETURN:
         begin
-          IsModifier := (Rec.Event.KeyEvent.dwControlKeyState and
-            (SHIFT_PRESSED or LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
-
-          // Look ahead: pending key-down event means this Enter is part of a paste
+          IsModifier := ShiftPressed or CtrlPressed;
           HasMore := False;
           if not IsModifier then
           begin
@@ -3251,19 +3478,17 @@ begin
           end
           else
           begin
-            // Swallow the matching Enter-up so it does not linger in the queue
             if PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) then
               if (NextRec.EventType = KEY_EVENT) and
                 (NextRec.Event.KeyEvent.wVirtualKeyCode = VK_RETURN) and
                 (not NextRec.Event.KeyEvent.bKeyDown) then
                 ReadConsoleInput(Handle, NextRec, 1, N);
           end;
-
           if IsModifier or HasMore then
           begin
-            // Shift/Ctrl+Enter or multiline paste: insert a line break
             Line := Line + LineEnding;
             CursorPos := Length(Line);
+            ClearSelection;
           end
           else
           begin
@@ -3273,125 +3498,186 @@ begin
           end;
         end;
       VK_BACK:
-        if CursorPos > 0 then
         begin
-          // Remove both chars of a CRLF pair when backspacing over a line break
-          if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
+          if HasSelection then
           begin
-            Dec(CursorPos, 2);
-            Delete(Line, CursorPos + 1, 2);
+            Delete(Line, SelStart + 1, SelEnd - SelStart);
+            CursorPos := SelStart;
+            ClearSelection;
           end
-          else
+          else if CursorPos > 0 then
           begin
-            CursorPos := Utf8PrevPos(Line, CursorPos);
-            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+            if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
+            begin
+              Dec(CursorPos, 2);
+              Delete(Line, CursorPos + 1, 2);
+            end
+            else
+            begin
+              CursorPos := Utf8PrevPos(Line, CursorPos);
+              Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+            end;
           end;
         end;
       VK_DELETE:
-        // Delete current history entry if navigated but not edited
-        if (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
         begin
-          FHistory.Delete(HistIndex);
-          if HistIndex > 0 then
-            Dec(HistIndex);
-          if FHistory.Count = 0 then
+          if HasSelection then
           begin
-            Line := '';
-            CursorPos := 0;
-            HistIndex := 0;
+            Delete(Line, SelStart + 1, SelEnd - SelStart);
+            CursorPos := SelStart;
+            ClearSelection;
           end
-          else
+          else if (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
           begin
-            if HistIndex >= FHistory.Count then
-              HistIndex := FHistory.Count - 1;
+            FHistory.Delete(HistIndex);
+            if HistIndex > 0 then
+              Dec(HistIndex);
+            if FHistory.Count = 0 then
+            begin
+              Line := '';
+              CursorPos := 0;
+              HistIndex := 0;
+            end
+            else
+            begin
+              if HistIndex >= FHistory.Count then
+                HistIndex := FHistory.Count - 1;
+              Line := FHistory[HistIndex];
+              SetCodePage(Line, CP_UTF8, False);
+              CursorPos := Length(Line);
+            end;
+          end
+          else if CursorPos < Length(Line) then
+          begin
+            if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and
+              (Line[CursorPos + 2] = #10) then
+              Delete(Line, CursorPos + 1, 2)
+            else
+              Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+          end;
+        end;
+      VK_LEFT:
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          if CursorPos > 0 then
+            CursorPos := Utf8PrevPos(Line, CursorPos);
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      VK_RIGHT:
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          // Utf8NextPos returns 1-based next char start, subtract 1 for byte count
+          if CursorPos < Length(Line) then
+            CursorPos := Utf8NextPos(Line, CursorPos + 1) - 1;
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      VK_HOME:
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          CursorPos := 0;
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      VK_END:
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          CursorPos := Length(Line);
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      VK_UP:
+        begin
+          ClearSelection;
+          if HistIndex > 0 then
+          begin
+            Dec(HistIndex);
             Line := FHistory[HistIndex];
             SetCodePage(Line, CP_UTF8, False);
             CursorPos := Length(Line);
           end;
-        end
-        else if CursorPos < Length(Line) then
-        begin
-          // Delete CRLF pair as one unit
-          if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and
-            (Line[CursorPos + 2] = #10) then
-            Delete(Line, CursorPos + 1, 2)
-          else
-            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
-        end;
-      VK_LEFT:
-        if CursorPos > 0 then
-          CursorPos := Utf8PrevPos(Line, CursorPos);
-      VK_RIGHT:
-        if CursorPos < Length(Line) then
-          CursorPos := Utf8NextPos(Line, CursorPos + 1);
-      VK_HOME:
-        CursorPos := 0;
-      VK_END:
-        CursorPos := Length(Line);
-      VK_UP:
-        if HistIndex > 0 then
-        begin
-          Dec(HistIndex);
-          Line := FHistory[HistIndex];
-          SetCodePage(Line, CP_UTF8, False);
-          CursorPos := Length(Line);
         end;
       VK_DOWN:
-        if HistIndex < FHistory.Count - 1 then
         begin
-          Inc(HistIndex);
-          Line := FHistory[HistIndex];
-          SetCodePage(Line, CP_UTF8, False);
-          CursorPos := Length(Line);
-        end
-        else if HistIndex < FHistory.Count then
-        begin
-          HistIndex := FHistory.Count;
-          Line := '';
-          CursorPos := 0;
+          ClearSelection;
+          if HistIndex < FHistory.Count - 1 then
+          begin
+            Inc(HistIndex);
+            Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
+            CursorPos := Length(Line);
+          end
+          else if HistIndex < FHistory.Count then
+          begin
+            HistIndex := FHistory.Count;
+            Line := '';
+            CursorPos := 0;
+          end;
         end;
       VK_ESCAPE:
         begin
           Line := '';
           CursorPos := 0;
+          ClearSelection;
         end;
-      VK_C:
-        if (Rec.Event.KeyEvent.dwControlKeyState and
-          (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0 then
+      VK_V:
+        if CtrlPressed then
+          PasteText(ReadClipboardText)
+        else if Ord(C) >= 32 then
+          InsertTypedChar(WideCharToUtf8(C));
+      VK_A:
+        if CtrlPressed then
         begin
-          ConGotoXY(1, PromptRow);
-          ConClearLineFromCursor;
-          ConWriteUtf8(PromptText);
-          ConWriteUtf8(Line);
-          ConWriteUtf8('^C');
-          ConWriteUtf8(LineEnding);
-          Line := '';
-          CursorPos := 0;
-          HistIndex := FHistory.Count;
-          ConWriteUtf8(PromptText);
-          FLastCharWasNewLine := False;
-          PromptRow := ConWhereY;
-          PromptCol := Utf8CharCount(PromptText) + 1;
-          LastRedrawRows := 1;
-          Continue;
+          SelAnchor := 0;
+          CursorPos := Length(Line);
+          UpdateSelection;
         end
         else if Ord(C) >= 32 then
+          InsertTypedChar(WideCharToUtf8(C));
+      VK_C:
+        if CtrlPressed then
         begin
-          ChS := WideCharToUtf8(C);
-          OldLen := Length(Line);
-          Insert(ChS, Line, CursorPos + 1);
-          SetCodePage(Line, CP_UTF8, False);
-          Inc(CursorPos, Length(Line) - OldLen);
-        end;
+          if HasSelection then
+          begin
+            CopySelectionToClipboard;
+            ClearSelection;
+          end
+          else
+          begin
+            ConGotoXY(1, PromptRow);
+            ConClearLineFromCursor;
+            ConWriteUtf8(PromptText);
+            ConWriteUtf8(Line);
+            ConWriteUtf8('^C');
+            ConWriteUtf8(LineEnding);
+            Line := '';
+            CursorPos := 0;
+            HistIndex := FHistory.Count;
+            ConWriteUtf8(PromptText);
+            FLastCharWasNewLine := False;
+            PromptRow := ConWhereY;
+            LastRedrawRows := 1;
+            Continue;
+          end;
+        end
+        else if Ord(C) >= 32 then
+          InsertTypedChar(WideCharToUtf8(C));
     else
       if Ord(C) >= 32 then
-      begin
-        ChS := WideCharToUtf8(C);
-        OldLen := Length(Line);
-        Insert(ChS, Line, CursorPos + 1);
-        SetCodePage(Line, CP_UTF8, False);
-        Inc(CursorPos, Length(Line) - OldLen);
-      end;
+        InsertTypedChar(WideCharToUtf8(C));
     end;
 
     Redraw;
