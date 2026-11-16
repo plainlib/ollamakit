@@ -146,6 +146,7 @@ type
     FAgent: TCustomOllamaAgent;
     // Previous agent handlers, restored when agent is detached
     FPrevAgentOnChunk: TAgentChunkEvent;
+    FPrevAgentOnLog: TAgentLogEvent;
     FPrevAgentOnThinking: TAgentThinkingEvent;
     FPrevAgentOnToolCall: TAgentToolCallEvent;
     FPrevAgentOnToolResult: TAgentToolResultEvent;
@@ -259,6 +260,8 @@ type
     procedure HandleAgentChunk(Sender: TObject; const AText: string);
     // Closes the active thinking block with a trailing blank line
     procedure CloseThinking;
+    // Prints agent log lines in thinking color
+    procedure HandleAgentLog(Sender: TObject; const AText: string);
     // Redirects agent thinking chunks to console output with a label
     procedure HandleAgentThinking(Sender: TObject; const AText: string);
     // Prints tool call label with surrounding blank lines
@@ -743,13 +746,21 @@ begin
   FPrevAgentOnFinish := nil;
   FPrevAgentOnExecCommand := nil;
   FPrevAgentOnAskUser := nil;
+  FPrevAgentOnLog := nil;
   FInThinking := False;
   if Assigned(FAgent) then
   begin
     FAgent.FreeNotification(Self);
-    // Share terminal directory with agent file tools at runtime only
-    if not (csDesigning in ComponentState) and (FAgent.RootPath = '') then
-      FAgent.RootPath := GetEffectivePath;
+    // Share terminal directory and shell name with the agent at runtime only
+    if not (csDesigning in ComponentState) then
+    begin
+      if FAgent.RootPath = '' then
+        FAgent.RootPath := GetEffectivePath;
+      FAgent.ExecShellInfo := FShellExec;
+      // Route agent log lines through the terminal so they are colored
+      FPrevAgentOnLog := FAgent.OnLog;
+      FAgent.OnLog := @HandleAgentLog;
+    end;
   end;
 end;
 
@@ -869,17 +880,27 @@ begin
   SetColor(tcToolBadge);
   WriteLine(LabelText, True);
   SetColor(tcDefault);
-  // Blank line after tool call for visual separation
-  WriteLine('', True);
+  // No blank line here, the tool result preview follows immediately
   if Assigned(FPrevAgentOnToolCall) then
     FPrevAgentOnToolCall(Sender, AName, AArgsJson);
 end;
 
 procedure TCustomTermManager.HandleAgentToolResult(Sender: TObject; const AName, AResult: string);
 begin
-  // Tool result is forwarded to the model, no console output here
+  // Preview is emitted by the agent through OnLog, only forward here
   if Assigned(FPrevAgentOnToolResult) then
     FPrevAgentOnToolResult(Sender, AName, AResult);
+end;
+
+procedure TCustomTermManager.HandleAgentLog(Sender: TObject; const AText: string);
+begin
+  // Close any open thinking block so the log starts on a fresh line
+  CloseThinking;
+  if not FLastCharWasNewLine then
+    WriteLine('', True);
+  SetColor(tcDim);
+  WriteLine(AText, True);
+  SetColor(tcDefault);
 end;
 
 procedure TCustomTermManager.HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
@@ -2714,6 +2735,7 @@ begin
             FPrevAgentOnFinish := FAgent.OnFinish;
             FPrevAgentOnExecCommand := FAgent.OnExecCommand;
             FPrevAgentOnAskUser := FAgent.OnAskUser;
+            FPrevAgentOnLog := FAgent.OnLog;
             FAgent.OnChunk := @HandleAgentChunk;
             FAgent.OnThinking := @HandleAgentThinking;
             FAgent.OnToolCall := @HandleAgentToolCall;
@@ -2762,6 +2784,7 @@ begin
               FAgent.OnFinish := FPrevAgentOnFinish;
               FAgent.OnExecCommand := FPrevAgentOnExecCommand;
               FAgent.OnAskUser := FPrevAgentOnAskUser;
+              FAgent.OnLog := FPrevAgentOnLog;
               FPrevAgentOnChunk := nil;
               FPrevAgentOnThinking := nil;
               FPrevAgentOnToolCall := nil;
@@ -2769,6 +2792,7 @@ begin
               FPrevAgentOnFinish := nil;
               FPrevAgentOnExecCommand := nil;
               FPrevAgentOnAskUser := nil;
+              FPrevAgentOnLog := nil;
               FInThinking := False;
               SetColor(tcDefault);
             end;
@@ -3337,6 +3361,7 @@ var
     CursorSaved: Boolean;
   begin
     HideConsoleCursor;
+    Info:=Default(CONSOLE_SCREEN_BUFFER_INFO);
     GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
     NormalAttr := Info.wAttributes;
     // Swap foreground and background to build the selection highlight

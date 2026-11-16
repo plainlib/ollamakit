@@ -50,6 +50,7 @@ type
   TAgentFinishEvent = procedure(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string) of object;
   TAgentToolExecuteEvent = procedure(Sender: TObject; const AArgsJson: string; var AResult: string) of object;
   TAgentAskUserEvent = procedure(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean) of object;
+  TAgentLogEvent = procedure(Sender: TObject; const AText: string) of object;
 
 type
   TCustomOllamaAgent = class;
@@ -139,7 +140,12 @@ type
     FDone: boolean;
     FCancelled: boolean;
     FFinalAnswer: string;
+    // When True, the agent logs every step and event to stderr
     FLog: boolean;
+    // When True, tool result previews are emitted through the log channel
+    FLogToolResult: boolean;
+    // Host handler for log lines, nil falls back to stderr
+    FOnLog: TAgentLogEvent;
     // Prompt plus generated tokens reported by the last step
     FContextUsed: integer;
     // Configured context window size in tokens, 0 when unknown
@@ -154,6 +160,8 @@ type
     FOnFinish: TAgentFinishEvent;
     // Optional context prepended to the next user message, cleared after use
     FContextPrelude: string;
+    // Shell executable that runs exec_command, empty falls back to platform default
+    FExecShellInfo: string;
     procedure SetOllamaManager(const AValue: TOllamaManager);
     procedure SetTools(const AValue: TAgentTools);
     procedure SetWebOptions(const AValue: TAgentWebOptions);
@@ -217,6 +225,10 @@ type
     function BuildToolsNames: string; virtual;
     // Writes a diagnostic line to stderr when Log is enabled
     procedure LogLine(const AText: string); virtual;
+    // Emits a log line through OnLog or stderr, no Log flag check
+    procedure DoLog(const AText: string); virtual;
+    // Emits a truncated tool result preview when LogToolResult is enabled
+    procedure EmitToolResult(const AName, AResult: string); virtual;
     // Resolves placeholders in SystemPrompt using current values
     function BuildSystemPrompt: string; virtual;
     // Resets usage counters in the manager and this agent
@@ -226,6 +238,8 @@ type
     property FinalAnswer: string read FFinalAnswer;
     // Context text placed before the next user message, cleared after the run
     property ContextPrelude: string read FContextPrelude write FContextPrelude;
+    // Shell executable name for exec_command, injected into the system prompt
+    property ExecShellInfo: string read FExecShellInfo write FExecShellInfo;
     property History: string read GetHistory write SetHistory;
     property ContextUsed: integer read FContextUsed;
     property ContextTotal: integer read FContextTotal;
@@ -244,6 +258,8 @@ type
     property WebOptions: TAgentWebOptions read FWebOptions write SetWebOptions;
     property KeepHistory: boolean read FKeepHistory write FKeepHistory default False;
     property Log: boolean read FLog write FLog default False;
+    property LogToolResult: boolean read FLogToolResult write FLogToolResult default True;
+    property OnLog: TAgentLogEvent read FOnLog write FOnLog;
     property OnRoute: TAgentRouteEvent read FOnRoute write FOnRoute;
     property OnChunk: TAgentChunkEvent read FOnChunk write FOnChunk;
     property OnThinking: TAgentThinkingEvent read FOnThinking write FOnThinking;
@@ -281,6 +297,10 @@ type
     property KeepHistory;
     // When True, the agent logs every step and event to stderr
     property Log;
+    // Emit tool result previews through the log channel, truncated to 500 chars
+    property LogToolResult;
+    // Receives every log line, host may color or redirect it
+    property OnLog;
     // Fired before chat step and each tool call, host may reject
     property OnRoute;
     // Fired for every streamed text chunk from the model
@@ -870,8 +890,19 @@ end;
 procedure TLogCall.Invoke;
 begin
   try
-    WriteLn(ErrOutput, Text);
-    Flush(ErrOutput);
+    if Assigned(Agent) and Assigned(Agent.FOnLog) then
+    begin
+      try
+        Agent.FOnLog(Agent, Text);
+      except
+        ; // Host handler raised, ignore
+      end;
+    end
+    else
+    begin
+      WriteLn(ErrOutput, Text);
+      Flush(ErrOutput);
+    end;
   finally
     Free;
   end;
@@ -1011,6 +1042,8 @@ var
   Call: TToolResultCall;
 begin
   FAgent.LogLine(Format('ToolResult name="%s" result_len=%d', [AName, Length(AResult)]));
+  // Emit result preview through the same log channel, independent of Log
+  FAgent.EmitToolResult(AName, AResult);
   if not Assigned(FAgent.FOnToolResult) then
     Exit;
   Call := TToolResultCall.Create;
@@ -1055,6 +1088,7 @@ var
   Attempt, TruncIdx, TruncSeen, TruncTotalTool: integer;
   TruncContent: string;
   ResolvedCtx: int64;
+  SystemPromptText: string;
 begin
   Reason := afrError;
   ErrMsg := '';
@@ -1080,9 +1114,11 @@ begin
 
       // Always send the system message, BuildSystemPrompt adds platform,
       // workspace and enabled tools even when the user prompt is empty
+      SystemPromptText := FAgent.BuildSystemPrompt;
+      FAgent.LogLine(Format('System prompt len=%d preview="%s"', [Length(SystemPromptText), Copy(SystemPromptText, 1, 400)]));
       MsgObj := TJSONObject.Create;
       MsgObj.Add('role', 'system');
-      MsgObj.Add('content', FAgent.BuildSystemPrompt);
+      MsgObj.Add('content', SystemPromptText);
       MessagesArr.Add(MsgObj);
 
       if FAgent.KeepHistory and (FAgent.FHistory <> '') then
@@ -1458,9 +1494,12 @@ begin
   FCancelled := False;
   FFinalAnswer := '';
   FLog := False;
+  FLogToolResult := True;
+  FOnLog := nil;
   FContextUsed := 0;
   FContextTotal := 0;
   FOnAskUser := nil;
+  FExecShellInfo := '';
   FTools := TAgentTools.Create(Self);
   FWebOptions := TAgentWebOptions.Create;
 end;
@@ -1564,7 +1603,7 @@ end;
 
 function TCustomOllamaAgent.BuildSystemPrompt: string;
 var
-  ToolList, PlatformName, EnvironmentBlock: string;
+  ToolList, PlatformName, EnvironmentBlock, ShellDesc: string;
 begin
   // Resolve user-provided placeholders first
   Result := string(FSystemPrompt);
@@ -1598,6 +1637,23 @@ begin
     PathDelim + '"' + LineEnding + '- Workspace root: ' + GetEffectiveRootPath + LineEnding +
     '- The workspace root may change during the session. Always re-check file ' +
     'existence after any directory change with a fresh tool call, results from ' + 'previous locations may be stale.' + LineEnding;
+
+  // The actual shell behind exec_command when known, else platform default
+  if Trim(FExecShellInfo) <> '' then
+    ShellDesc := Trim(FExecShellInfo)
+  else
+  begin
+    {$IFDEF WINDOWS}
+    ShellDesc := 'cmd.exe';
+    {$ELSE}
+    ShellDesc := '/bin/sh';
+    {$ENDIF}
+  end;
+  EnvironmentBlock := EnvironmentBlock + '- Shell for exec_command: ' + ShellDesc + LineEnding;
+
+  // One universal rule: file tools take relative paths, not absolute
+  EnvironmentBlock := EnvironmentBlock + '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding;
+
   Result := Result + #10#10 + EnvironmentBlock;
 
   // Append authoritative tool list so the model cannot claim disabled tools
@@ -1653,22 +1709,59 @@ begin
   Result := FContextTotal div 1024;
 end;
 
-procedure TCustomOllamaAgent.LogLine(const AText: string);
+procedure TCustomOllamaAgent.DoLog(const AText: string);
 var
   Call: TLogCall;
 begin
-  if not FLog then
-    Exit;
-  // Already on the main thread, log synchronously to keep ordering
+  // Main thread logs synchronously so lines keep their order
   if GetCurrentThreadID = MainThreadID then
   begin
-    WriteLn(ErrOutput, '[agent] ', AText);
+    if Assigned(FOnLog) then
+    begin
+      try
+        FOnLog(Self, AText);
+      except
+        ; // Host handler raised, ignore to keep the agent consistent
+      end;
+    end
+    else
+    begin
+      WriteLn(ErrOutput, AText);
+      Flush(ErrOutput);
+    end;
     Exit;
   end;
   Call := TLogCall.Create;
   Call.Agent := Self;
-  Call.Text := '[agent] ' + AText;
+  Call.Text := AText;
   TThread.Queue(nil, @Call.Invoke);
+end;
+
+procedure TCustomOllamaAgent.LogLine(const AText: string);
+begin
+  if not FLog then
+    Exit;
+  DoLog('[agent] ' + AText);
+end;
+
+procedure TCustomOllamaAgent.EmitToolResult(const AName, AResult: string);
+const
+  // Preview size, longer outputs are truncated with " ..."
+  PREVIEW_CHARS = 500;
+var
+  Display: string;
+begin
+  if not FLogToolResult then
+    Exit;
+  Display := AResult;
+  Display := StringReplace(Display, #13#10, ' ', [rfReplaceAll]);
+  Display := StringReplace(Display, #10, ' ', [rfReplaceAll]);
+  Display := StringReplace(Display, #13, ' ', [rfReplaceAll]);
+  if Length(Display) > PREVIEW_CHARS then
+    Display := Copy(Display, 1, PREVIEW_CHARS) + ' ...';
+  DoLog('  [' + AName + '] ' + Display);
+  // Separate the preview from the next block (thinking or another tool call)
+  DoLog('');
 end;
 
 function TCustomOllamaAgent.GetEffectiveRootPath: string;
