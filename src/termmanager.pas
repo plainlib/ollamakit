@@ -3262,6 +3262,51 @@ var
     Inc(CursorPos, Length(Utf8));
   end;
 
+  // Moves cursor vertically within the current input, returns False at edges
+  function MoveCursorVertical(ADelta: Integer): Boolean;
+  var
+    I, Idx, LineStart, TargetStart, TargetLen, Col: Integer;
+    Lines: TStringList;
+  begin
+    Result := False;
+    if Pos(LineEnding, Line) = 0 then
+      Exit;
+    Lines := SplitLines(Line);
+    try
+      if Lines.Count < 2 then
+        Exit;
+      // Locate the current line by cursor byte position
+      Idx := -1;
+      LineStart := 0;
+      for I := 0 to Lines.Count - 1 do
+      begin
+        if (CursorPos >= LineStart) and (CursorPos <= LineStart + Length(Lines[I])) then
+        begin
+          Idx := I;
+          Break;
+        end;
+        LineStart := LineStart + Length(Lines[I]) + 2;
+      end;
+      if Idx < 0 then
+        Exit;
+      if (Idx + ADelta < 0) or (Idx + ADelta >= Lines.Count) then
+        Exit;
+      // Compute target line byte offset
+      TargetStart := 0;
+      for I := 0 to Idx + ADelta - 1 do
+        Inc(TargetStart, Length(Lines[I]) + 2);
+      TargetLen := Length(Lines[Idx + ADelta]);
+      // Preserve column clamped to target line length
+      Col := CursorPos - LineStart;
+      if Col > TargetLen then
+        Col := TargetLen;
+      CursorPos := TargetStart + Col;
+      Result := True;
+    finally
+      Lines.Free;
+    end;
+  end;
+
   // Inserts a UTF-8 char at the cursor, replacing the selection when active
   procedure InsertTypedChar(const AUtf8: RawByteString);
   var
@@ -3288,19 +3333,10 @@ var
     Info: CONSOLE_SCREEN_BUFFER_INFO;
     NormalAttr, InvAttr: Word;
     IsSel, PrevIsSel: Boolean;
-    CurRow, CurCol, EndRow: Integer;
+    CurRow, CurCol, NewRows: Integer;
     CursorSaved: Boolean;
   begin
     HideConsoleCursor;
-    Info:=Default(CONSOLE_SCREEN_BUFFER_INFO);
-
-    if LastRedrawRows > 0 then
-      for I := 0 to LastRedrawRows - 1 do
-      begin
-        ConGotoXY(1, PromptRow + I);
-        ConClearLineFromCursor;
-      end;
-
     GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
     NormalAttr := Info.wAttributes;
     // Swap foreground and background to build the selection highlight
@@ -3382,10 +3418,13 @@ var
 
         if I < Lines.Count - 1 then
         begin
+          // Wipe stale content on the current row before moving on
+          ConClearLineFromCursor;
           GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
-          // Move to next visual row only when the cursor is not already there
           if Info.dwCursorPosition.X > 0 then
-            ConGotoXY(1, Info.dwCursorPosition.Y + 2);
+            ConGotoXY(1, Info.dwCursorPosition.Y + 2)
+          else
+            ConGotoXY(1, Info.dwCursorPosition.Y + 1);
           LineStart := LineStart + LenS + 2;
         end;
       end;
@@ -3397,15 +3436,24 @@ var
         CurCol := Info.dwCursorPosition.X + 1;
       end;
 
-      // Count physical rows used so the next redraw clears them all
+      // Wipe stale content on the last visible row
+      ConClearLineFromCursor;
+
       GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
-      EndRow := Info.dwCursorPosition.Y + 1;
       if Info.dwCursorPosition.X = 0 then
-        LastRedrawRows := EndRow - PromptRow
+        NewRows := Info.dwCursorPosition.Y + 1 - PromptRow
       else
-        LastRedrawRows := EndRow - PromptRow + 1;
-      if LastRedrawRows < 1 then
-        LastRedrawRows := 1;
+        NewRows := Info.dwCursorPosition.Y + 2 - PromptRow;
+      if NewRows < 1 then
+        NewRows := 1;
+      // Clear trailing rows that were used before but are now empty
+      if NewRows < LastRedrawRows then
+        for I := NewRows to LastRedrawRows - 1 do
+        begin
+          ConGotoXY(1, PromptRow + I);
+          ConClearLineFromCursor;
+        end;
+      LastRedrawRows := NewRows;
     finally
       Lines.Free;
     end;
@@ -3602,29 +3650,51 @@ begin
       VK_UP:
         begin
           ClearSelection;
-          if HistIndex > 0 then
+          // Move within multiline input first, fall back to history at top
+          if not MoveCursorVertical(-1) then
           begin
-            Dec(HistIndex);
-            Line := FHistory[HistIndex];
-            SetCodePage(Line, CP_UTF8, False);
-            CursorPos := Length(Line);
+            if HistIndex = FHistory.Count then
+            begin
+              // Save current live input so it can be recovered via VK_DOWN
+              if Line <> '' then
+              begin
+                AddToHistory(Line);
+                HistIndex := FHistory.Count - 2;
+              end
+              else
+                HistIndex := FHistory.Count - 1;
+              if HistIndex < 0 then
+                HistIndex := 0;
+            end
+            else if HistIndex > 0 then
+              Dec(HistIndex);
+            if (HistIndex >= 0) and (HistIndex < FHistory.Count) then
+            begin
+              Line := FHistory[HistIndex];
+              SetCodePage(Line, CP_UTF8, False);
+              CursorPos := Length(Line);
+            end;
           end;
         end;
       VK_DOWN:
         begin
           ClearSelection;
-          if HistIndex < FHistory.Count - 1 then
+          // Move within multiline input first, fall back to history at bottom
+          if not MoveCursorVertical(1) then
           begin
-            Inc(HistIndex);
-            Line := FHistory[HistIndex];
-            SetCodePage(Line, CP_UTF8, False);
-            CursorPos := Length(Line);
-          end
-          else if HistIndex < FHistory.Count then
-          begin
-            HistIndex := FHistory.Count;
-            Line := '';
-            CursorPos := 0;
+            if HistIndex < FHistory.Count - 1 then
+            begin
+              Inc(HistIndex);
+              Line := FHistory[HistIndex];
+              SetCodePage(Line, CP_UTF8, False);
+              CursorPos := Length(Line);
+            end
+            else if HistIndex = FHistory.Count - 1 then
+            begin
+              HistIndex := FHistory.Count;
+              Line := '';
+              CursorPos := 0;
+            end;
           end;
         end;
       VK_ESCAPE:
