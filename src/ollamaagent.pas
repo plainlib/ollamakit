@@ -219,6 +219,8 @@ type
     procedure ClearHistory;
     // Dispatches one tool call, called by the worker thread
     function DispatchTool(const AName, AArgsJson: string): string; virtual;
+    // Builds an actionable error listing available tools and hints
+    function BuildUnknownToolError(const AName: string): string; virtual;
     // Builds JSON schema array with all available tools
     function BuildToolsSchemaJson: string; virtual;
     // Returns comma-separated list of tool names for diagnostics
@@ -817,7 +819,11 @@ procedure TChunkCall.Invoke;
 begin
   try
     if Assigned(Agent.FOnChunk) then
+    try
       Agent.FOnChunk(Agent, Text);
+    except
+      ; // Swallow host handler errors, must not kill the main loop
+    end;
   finally
     Free;
   end;
@@ -827,7 +833,11 @@ procedure TThinkingCall.Invoke;
 begin
   try
     if Assigned(Agent.FOnThinking) then
+    try
       Agent.FOnThinking(Agent, Text);
+    except
+      ; // Swallow host handler errors
+    end;
   finally
     Free;
   end;
@@ -837,7 +847,11 @@ procedure TToolCallCall.Invoke;
 begin
   try
     if Assigned(Agent.FOnToolCall) then
+    try
       Agent.FOnToolCall(Agent, Name, Args);
+    except
+      ; // Swallow host handler errors
+    end;
   finally
     Free;
   end;
@@ -847,7 +861,11 @@ procedure TToolResultCall.Invoke;
 begin
   try
     if Assigned(Agent.FOnToolResult) then
+    try
       Agent.FOnToolResult(Agent, Name, Result);
+    except
+      ; // Swallow host handler errors
+    end;
   finally
     Free;
   end;
@@ -899,9 +917,11 @@ begin
       end;
     end
     else
-    begin
+    try
       WriteLn(ErrOutput, Text);
       Flush(ErrOutput);
+    except
+      ; // Console may be detached, ignore
     end;
   finally
     Free;
@@ -1650,6 +1670,7 @@ begin
     {$ENDIF}
   end;
   EnvironmentBlock := EnvironmentBlock + '- Shell for exec_command: ' + ShellDesc + LineEnding;
+  EnvironmentBlock := EnvironmentBlock + '- Use "nul" instead of "/dev/null" for discarding output on Windows.' + LineEnding;
 
   // One universal rule: file tools take relative paths, not absolute
   EnvironmentBlock := EnvironmentBlock + '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding;
@@ -1864,14 +1885,14 @@ begin
 
     if afFileTools in FFeatures then
     begin
-      AddTool(Arr, 'read_file',
-        'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
-        'prefer read_file_preview or read_file_lines for large ones.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"}},"required":["path"]}');
       AddTool(Arr, 'read_file_preview',
         'Preview a text file: first and last N lines plus total size. ' +
         'Call FIRST on unknown or large (>50KB) files before read_file.',
         '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"head":{"type":"integer","description":"First lines, default 30, max 500"},"tail":{"type":"integer","description":"Last lines, default 30, max 500"}},"required":["path"]}');
+      AddTool(Arr, 'read_file',
+        'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
+        'prefer read_file_preview or read_file_lines for large ones.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"}},"required":["path"]}');
       AddTool(Arr, 'write_file', 'Write contents to a file, creates parent directories',
         '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
       AddTool(Arr, 'list_files', 'List files in a directory, non-recursive',
@@ -2005,15 +2026,16 @@ const
   // Hard cap for max_bytes=0 to protect memory on accidental huge files
   HARD_LIMIT_BYTES = 16 * 1024 * 1024;
 var
-  RelPath, FullPath, Content: string;
+  RelPath, FullPath: string;
+  Content, Suffix: rawbytestring;
   Stream: TFileStream;
-  Buf: TBytes = ();
   ReadCount: int64;
   FullSize: int64;
   MaxBytes: int64;
   I, LinesShown: integer;
 begin
   Result := '{"error": "invalid arguments"}';
+  Content := '';
   if AArgs = nil then
     Exit;
   RelPath := AArgs.Get('path', '');
@@ -2037,13 +2059,15 @@ begin
   Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
   try
     FullSize := Stream.Size;
-    SetLength(Buf, Min(FullSize, MaxBytes));
-    if Length(Buf) > 0 then
-      ReadCount := Stream.Read(Buf[0], Length(Buf))
+    // Read bytes directly into the string to avoid TBytes-to-string cast
+    SetLength(Content, Min(FullSize, MaxBytes));
+    if Length(Content) > 0 then
+      ReadCount := Stream.Read(Content[1], Length(Content))
     else
       ReadCount := 0;
-    SetLength(Buf, ReadCount);
-    Content := string(Buf);
+    SetLength(Content, ReadCount);
+    // Tag as UTF-8 so JSON encoding does not reinterpret bytes as CP_ACP
+    SetCodePage(Content, CP_UTF8, False);
   finally
     Stream.Free;
   end;
@@ -2054,10 +2078,12 @@ begin
     for I := 1 to Length(Content) do
       if Content[I] = #10 then
         Inc(LinesShown);
-    Content := Content + #10#10 + '[file truncated: showed ' + IntToStr(ReadCount) + ' of ' + IntToStr(FullSize) +
+    Suffix := #10#10 + '[file truncated: showed ' + IntToStr(ReadCount) + ' of ' + IntToStr(FullSize) +
       ' bytes (' + IntToStr(LinesShown) + ' lines). ' + 'Use read_file_lines with start_line=' +
       IntToStr(LinesShown + 1) + ' to continue reading from where this message left off, ' +
       'or call read_file again with a larger max_bytes value if the file is small]';
+    SetCodePage(Suffix, CP_UTF8, False);
+    Content := Content + Suffix;
   end;
   Result := TJSONString.Create(Content).AsJSON;
 end;
@@ -3266,10 +3292,49 @@ begin
     end;
 
     // finish is handled in Execute before DispatchTool is called
-    Result := '{"error": "unknown tool: ' + AName + '"}';
+    Result := BuildUnknownToolError(AName);
   finally
     Args.Free;
   end;
+end;
+
+function TCustomOllamaAgent.BuildUnknownToolError(const AName: string): string;
+var
+  Available, Hint: string;
+  LowName: string;
+
+// Returns a replacement hint for known aliases from other agent frameworks
+  function SuggestFor(const AName: string): string;
+  begin
+    if (AName = 'glob') or (AName = 'search_files') or (AName = 'find') then
+      Exit('use find_files with a glob pattern like "*.pas" or "src/*.md"');
+    if (AName = 'bash') or (AName = 'shell') or (AName = 'run') or (AName = 'execute') then
+      Exit('use exec_command');
+    if (AName = 'read') or (AName = 'view') or (AName = 'open') then
+      Exit('use read_file or read_file_preview');
+    if (AName = 'write') or (AName = 'create') or (AName = 'save') then
+      Exit('use write_file');
+    if (AName = 'edit') or (AName = 'replace') then
+      Exit('use edit_file');
+    if (AName = 'delete') or (AName = 'remove') or (AName = 'rm') then
+      Exit('use delete_file');
+    if (AName = 'ls') or (AName = 'dir') then
+      Exit('use list_files');
+    if (AName = 'search') or (AName = 'rg') or (AName = 'ripgrep') then
+      Exit('use grep');
+    Result := '';
+  end;
+
+begin
+  Available := BuildToolsNames;
+  if Available = '' then
+    Available := 'none';
+  LowName := LowerCase(AName);
+  Hint := SuggestFor(LowName);
+  Result := '{"error": "unknown tool: ' + AName + '", ';
+  if Hint <> '' then
+    Result := Result + '"hint": "' + Hint + '", ';
+  Result := Result + '"available_tools": "' + Available + '"}';
 end;
 
 end.

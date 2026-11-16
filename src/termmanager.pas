@@ -1035,8 +1035,46 @@ begin
 end;
 
 procedure TCustomTermManager.HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
+type
+  TShellFamily = (sfCmd, sfUnix, sfPowerShell, sfUnknown);
+const
+  // Unix utilities that cmd.exe does not have
+  UNIX_CMDS: array[0..15] of string = (
+    'ls', 'cat', 'grep', 'head', 'tail', 'rm', 'cp', 'mv',
+    'touch', 'which', 'chmod', 'chown', 'sudo', 'sed', 'awk', 'wc');
+  // Windows utilities that Unix shells do not have
+  WIN_CMDS: array[0..3] of string = (
+    'findstr', 'cls', 'where', 'powershell');
+
+// Returns the shell family inferred from the executable name
+  function DetectShellFamily(const AShell: string): TShellFamily;
+  var
+    S: string;
+  begin
+    S := LowerCase(Trim(ExtractFileName(AShell)));
+    if (S = '') or (S = 'cmd.exe') or (S = 'cmd') or (S = 'command.com') then
+      Exit(sfCmd);
+    if (S = 'powershell.exe') or (S = 'powershell') or (S = 'pwsh.exe') or (S = 'pwsh') then
+      Exit(sfPowerShell);
+    if (S = 'sh') or (S = 'bash') or (S = 'zsh') or (S = 'dash') or (S = 'fish') or (S = 'ksh') then
+      Exit(sfUnix);
+    Result := sfUnknown;
+  end;
+
+  // True when AName appears as a command token, not as an argument or path
+  function IsCommandToken(const ACommand, AName: string): boolean;
+  var
+    Padded: string;
+  begin
+    Padded := ' ' + LowerCase(ACommand) + ' ';
+    Result := (Pos(' ' + AName + ' ', Padded) = 1) or (Pos('| ' + AName + ' ', Padded) > 0) or
+      (Pos('&& ' + AName + ' ', Padded) > 0) or (Pos('; ' + AName + ' ', Padded) > 0);
+  end;
+
 var
-  ExitCode: integer;
+  ExitCode, I: integer;
+  Hint, FoundCmd: string;
+  Family: TShellFamily;
 begin
   // When host provided own handler, let it run and skip default execution
   if Assigned(FPrevAgentOnExecCommand) then
@@ -1047,6 +1085,44 @@ begin
   AAllow := True;
   ExitCode := 0;
   AResult := ExecuteCommandCapture(ACommand, ExitCode, FAgentCommandTimeout);
+
+  Hint := '';
+  Family := DetectShellFamily(FShellExec);
+  case Family of
+    sfCmd:
+    begin
+      // Unix commands do not exist in cmd.exe, hint the right replacements
+      for I := Low(UNIX_CMDS) to High(UNIX_CMDS) do
+        if IsCommandToken(ACommand, UNIX_CMDS[I]) then
+        begin
+          FoundCmd := UNIX_CMDS[I];
+          Hint := 'Note: this shell is cmd.exe, not Unix. "' + FoundCmd + '" is not available. ' +
+            'Use dir instead of ls, type instead of cat, findstr instead of grep, and remove | head / | tail.';
+          Break;
+        end;
+    end;
+    sfUnix:
+    begin
+      // Windows commands do not exist in Unix shells, hint the right replacements
+      for I := Low(WIN_CMDS) to High(WIN_CMDS) do
+        if IsCommandToken(ACommand, WIN_CMDS[I]) then
+        begin
+          FoundCmd := WIN_CMDS[I];
+          Hint := 'Note: this shell is ' + ExtractFileName(FShellExec) + ', not cmd.exe. "' + FoundCmd +
+            '" is not available on Unix. Use ls instead of dir, cat instead of type, grep instead of findstr.';
+          Break;
+        end;
+    end;
+    else
+      ; // PowerShell aliases overlap both worlds, no hint to avoid false positives
+  end;
+
+  // Make empty output distinguishable from a silent success
+  if Trim(AResult) = '' then
+    AResult := '(command produced no output, exit code ' + IntToStr(ExitCode) + ')';
+
+  if Hint <> '' then
+    AResult := AResult + #10 + Hint;
 end;
 
 procedure TCustomTermManager.HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);
@@ -1079,31 +1155,48 @@ var
 begin
   if AText = '' then
     Exit;
-  if FStripEmoji then
-    Sanitized := StripEmojiChars(AText)
-  else
+  try
+    if FStripEmoji then
+      Sanitized := StripEmojiChars(AText)
+    else
+      Sanitized := AText;
+  except
+    // Strip may fail on malformed UTF-8, fall back to raw text
     Sanitized := AText;
+  end;
   Utf8 := UTF8Encode(Sanitized);
   {$IFDEF WINDOWS}
-  if AIsStderr then
-    WriteUtf8ToHandle(GetStdHandle(STD_ERROR_HANDLE), Utf8)
-  else
-    WriteUtf8ToHandle(GetStdHandle(STD_OUTPUT_HANDLE), Utf8);
+  try
+    if AIsStderr then
+      WriteUtf8ToHandle(GetStdHandle(STD_ERROR_HANDLE), Utf8)
+    else
+      WriteUtf8ToHandle(GetStdHandle(STD_OUTPUT_HANDLE), Utf8);
+  except
+    ; // Console may be detached, keep the agent loop alive
+  end;
   {$ELSE}
-  if AIsStderr then
-  begin
-    Write(ErrOutput, AText);
-    Flush(ErrOutput);
-  end
-  else
-  begin
-    Write(Output, AText);
-    Flush(Output);
+  try
+    if AIsStderr then
+    begin
+      Write(ErrOutput, AText);
+      Flush(ErrOutput);
+    end
+    else
+    begin
+      Write(Output, AText);
+      Flush(Output);
+    end;
+  except
+    ; // Output stream may be closed, keep the agent loop alive
   end;
   {$ENDIF}
   FLastCharWasNewLine := AText[Length(AText)] in [#10, #13];
   if Assigned(FOnOutput) then
+  try
     FOnOutput(Self, AText, AIsStderr);
+  except
+    ; // Host handler must not break the agent loop
+  end;
 end;
 
 procedure TCustomTermManager.WriteLine(const AText: string; AIsStderr: boolean);
@@ -3503,12 +3596,14 @@ begin
   // Ensure prompt starts on a fresh line after streaming output
   if not FLastCharWasNewLine then
     ConWriteUtf8(LineEnding);
+  Handle := GetStdHandle(STD_INPUT_HANDLE);
+  // Drop input events accumulated while the agent was streaming, a paste
+  // sent to a busy console would otherwise flood Line on the next read
+  FlushConsoleInputBuffer(Handle);
   ConWriteUtf8(PromptText);
   FLastCharWasNewLine := False;
   PromptRow := ConWhereY;
   LastRedrawRows := 1;
-
-  Handle := GetStdHandle(STD_INPUT_HANDLE);
 
   while FRunning do
   begin
