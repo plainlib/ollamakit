@@ -1407,7 +1407,7 @@ end;
 
 procedure TCustomTermManager.HandleBuiltin(const ALine: string);
 var
-  Cmd, Arg, TargetPath: string;
+  Cmd, Arg, TargetPath, ToolsList: string;
   P, I: integer;
 begin
   P := Pos(' ', ALine);
@@ -1489,6 +1489,19 @@ begin
       '  term.commandtimeout   : %d' + LineEnding + '  term.maxcapturebytes  : %d' + LineEnding +
       '  term.agentcommandtimeout : %d' + LineEnding, [GetEffectivePath, FShellExec, BoolToStr(FShowThinking, 'on', 'off'),
       FCommandTimeout, FMaxCaptureBytes, FAgentCommandTimeout]) + LineEnding, False);
+    if Assigned(FAgent) then
+    begin
+      ToolsList := '';
+      if afFileTools in FAgent.EnabledTools then ToolsList := ToolsList + 'filetools ';
+      if afExecCommand in FAgent.EnabledTools then ToolsList := ToolsList + 'exec ';
+      if afGit in FAgent.EnabledTools then ToolsList := ToolsList + 'git ';
+      if afInteractive in FAgent.EnabledTools then ToolsList := ToolsList + 'interactive ';
+      if afFinish in FAgent.EnabledTools then ToolsList := ToolsList + 'finish ';
+      if afWebTools in FAgent.EnabledTools then ToolsList := ToolsList + 'web ';
+      if ToolsList = '' then
+        ToolsList := 'none';
+      DoOutput('  tools                 : ' + Trim(ToolsList) + LineEnding, False);
+    end;
   end
   else if Cmd = 'models' then
     HandleModelsCommand(Arg)
@@ -3580,6 +3593,36 @@ var
     ShowConsoleCursor;
   end;
 
+    // Returns byte offset of the start of the logical line containing APos
+  function FindLineStart(APos: integer): integer;
+  var
+    I: integer;
+  begin
+    I := APos;
+    while I > 0 do
+    begin
+      if (Line[I] = #10) or (Line[I] = #13) then
+        Exit(I);
+      Dec(I);
+    end;
+    Result := 0;
+  end;
+
+  // Returns byte offset of the end of the logical line containing APos
+  function FindLineEnd(APos: integer): integer;
+  var
+    I: integer;
+  begin
+    I := APos + 1;
+    while I <= Length(Line) do
+    begin
+      if (Line[I] = #10) or (Line[I] = #13) then
+        Exit(I - 1);
+      Inc(I);
+    end;
+    Result := Length(Line);
+  end;
+
 begin
   Result := '';
   Rec := Default(INPUT_RECORD);
@@ -3753,7 +3796,8 @@ begin
             SelAnchor := CursorPos
           else if not ShiftPressed then
             ClearSelection;
-          CursorPos := 0;
+          // Jump to start of the current logical line, not the buffer
+          CursorPos := FindLineStart(CursorPos);
           if ShiftPressed then
             UpdateSelection;
         end;
@@ -3763,7 +3807,8 @@ begin
             SelAnchor := CursorPos
           else if not ShiftPressed then
             ClearSelection;
-          CursorPos := Length(Line);
+          // Jump to end of the current logical line, not the buffer
+          CursorPos := FindLineEnd(CursorPos);
           if ShiftPressed then
             UpdateSelection;
         end;

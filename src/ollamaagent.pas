@@ -160,6 +160,8 @@ type
     FOnFinish: TAgentFinishEvent;
     // Optional context prepended to the next user message, cleared after use
     FContextPrelude: string;
+    // Cached capabilities per model name, "1" means tools supported
+    FCapabilitiesCache: TStringList;
     // Shell executable that runs exec_command, empty falls back to platform default
     FExecShellInfo: string;
     procedure SetOllamaManager(const AValue: TOllamaManager);
@@ -221,6 +223,10 @@ type
     function DispatchTool(const AName, AArgsJson: string): string; virtual;
     // Builds an actionable error listing available tools and hints
     function BuildUnknownToolError(const AName: string): string; virtual;
+    // Returns False when the model definitely lacks tool support
+    function ModelSupportsTools(out AErrorMsg: string): boolean;
+    // Compresses a JSON array of messages into a short summary string
+    function SummarizeMessages(const AMessagesJson: string): string;
     // Builds JSON schema array with all available tools
     function BuildToolsSchemaJson: string; virtual;
     // Returns comma-separated list of tool names for diagnostics
@@ -518,10 +524,58 @@ begin
   Result := AHost <> '';
 end;
 
+// Decodes &#NNN; and &#xHH; entities to UTF-8 bytes
+function DecodeNumericEntities(const AText: string): string;
+var
+  I, EndPos, Code: integer;
+  Hex: boolean;
+  NumStr: string;
+begin
+  Result := '';
+  I := 1;
+  while I <= Length(AText) do
+  begin
+    if (AText[I] = '&') and (I < Length(AText)) and (AText[I + 1] = '#') then
+    begin
+      EndPos := PosFrom(';', AText, I + 2);
+      if (EndPos > 0) and (EndPos - I <= 10) then
+      begin
+        NumStr := Copy(AText, I + 2, EndPos - I - 2);
+        Hex := False;
+        if (Length(NumStr) > 0) and ((NumStr[1] = 'x') or (NumStr[1] = 'X')) then
+        begin
+          Hex := True;
+          Delete(NumStr, 1, 1);
+        end;
+        if Hex then
+          Code := StrToIntDef('$' + NumStr, -1)
+        else
+          Code := StrToIntDef(NumStr, -1);
+        if (Code > 0) and (Code < $110000) then
+        begin
+          if Code < $80 then
+            Result := Result + Chr(Code)
+          else if Code < $800 then
+            Result := Result + Chr($C0 or (Code shr 6)) + Chr($80 or (Code and $3F))
+          else if Code < $10000 then
+            Result := Result + Chr($E0 or (Code shr 12)) + Chr($80 or ((Code shr 6) and $3F)) + Chr($80 or (Code and $3F))
+          else
+            Result := Result + Chr($F0 or (Code shr 18)) + Chr($80 or ((Code shr 12) and $3F)) +
+              Chr($80 or ((Code shr 6) and $3F)) + Chr($80 or (Code and $3F));
+          I := EndPos + 1;
+          Continue;
+        end;
+      end;
+    end;
+    Result := Result + AText[I];
+    Inc(I);
+  end;
+end;
+
 // Strips HTML tags, script and style blocks, decodes common entities
 function StripHtmlTags(const AHtml: string): string;
 var
-  I, P: integer;
+  I: integer;
   LowerHtml: string;
   InSkip: boolean;
 
@@ -543,6 +597,16 @@ var
     Result := True;
   end;
 
+  // Ensures Result ends with a newline before appending more text
+  procedure EnsureNewline;
+  begin
+    if (Result <> '') and (Result[Length(Result)] <> #10) then
+      Result := Result + #10;
+  end;
+
+var
+  TagEnd: integer;
+  IsBrTag, IsBlockTag: boolean;
 begin
   Result := '';
   LowerHtml := LowerCase(AHtml);
@@ -558,28 +622,56 @@ begin
       InSkip := SkipUntilClosing('<style', '</style');
       if InSkip then
         Continue;
-      P := PosFrom('>', AHtml, I);
-      if P > 0 then
+      // Classify block-level tags that should become newlines
+      TagEnd := PosFrom('>', AHtml, I);
+      IsBrTag := (Copy(LowerHtml, I, 3) = '<br') and (TagEnd > 0);
+      IsBlockTag := (Copy(LowerHtml, I, 2) = '<p') or (Copy(LowerHtml, I, 3) = '</p') or (Copy(LowerHtml, I, 4) = '<div') or
+        (Copy(LowerHtml, I, 5) = '</div') or (Copy(LowerHtml, I, 3) = '<li') or (Copy(LowerHtml, I, 4) = '</li') or
+        (Copy(LowerHtml, I, 2) = '<h1') or (Copy(LowerHtml, I, 3) = '</h1') or (Copy(LowerHtml, I, 2) = '<h2') or
+        (Copy(LowerHtml, I, 3) = '</h2') or (Copy(LowerHtml, I, 2) = '<h3') or (Copy(LowerHtml, I, 3) = '</h3') or
+        (Copy(LowerHtml, I, 4) = '<ul>') or (Copy(LowerHtml, I, 5) = '</ul>') or (Copy(LowerHtml, I, 4) = '<ol>') or
+        (Copy(LowerHtml, I, 5) = '</ol>');
+      if IsBrTag then
+        EnsureNewline
+      else if IsBlockTag then
       begin
-        I := P + 1;
+        EnsureNewline;
+        // Opening tags like <p class=...> are safe to skip
+        if TagEnd > 0 then
+        begin
+          I := TagEnd + 1;
+          Continue;
+        end;
+      end;
+      if TagEnd > 0 then
+      begin
+        I := TagEnd + 1;
         Continue;
       end;
     end;
     Result := Result + AHtml[I];
     Inc(I);
   end;
-  // Collapse whitespace
-  Result := StringReplace(Result, #13, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
-  Result := StringReplace(Result, #9, ' ', [rfReplaceAll]);
+  // Normalize line endings, keep newlines
+  Result := StringReplace(Result, #13#10, #10, [rfReplaceAll]);
+  Result := StringReplace(Result, #13, #10, [rfReplaceAll]);
+  // Collapse runs of spaces and tabs only, newlines stay intact
   while Pos('  ', Result) > 0 do
     Result := StringReplace(Result, '  ', ' ', [rfReplaceAll]);
-  // Decode common entities
+  while Pos(#9, Result) > 0 do
+    Result := StringReplace(Result, #9, ' ', [rfReplaceAll]);
+  // Collapse repeated blank lines
+  while Pos(#10#10#10, Result) > 0 do
+    Result := StringReplace(Result, #10#10#10, #10#10, [rfReplaceAll]);
+  // Decode numeric entities before named ones
+  Result := DecodeNumericEntities(Result);
+  // Decode common named entities
   Result := StringReplace(Result, '&amp;', '&', [rfReplaceAll]);
   Result := StringReplace(Result, '&lt;', '<', [rfReplaceAll]);
   Result := StringReplace(Result, '&gt;', '>', [rfReplaceAll]);
   Result := StringReplace(Result, '&quot;', '"', [rfReplaceAll]);
   Result := StringReplace(Result, '&#39;', '''', [rfReplaceAll]);
+  Result := StringReplace(Result, '&apos;', '''', [rfReplaceAll]);
   Result := StringReplace(Result, '&nbsp;', ' ', [rfReplaceAll]);
 end;
 
@@ -612,6 +704,42 @@ begin
   end;
   // Normalize slashes to platform delimiters
   Result := StringReplace(Result, '/', PathDelim, [rfReplaceAll]);
+end;
+
+// Expands {a,b,c} alternatives into separate patterns, supports nesting
+function ExpandBracePatterns(const APattern: string): TStringList;
+var
+  P1, P2, I, Start: integer;
+  Prefix, Suffix, Body, Item: string;
+begin
+  Result := TStringList.Create;
+  Result.CaseSensitive := False;
+  Result.Duplicates := dupIgnore;
+  P1 := Pos('{', APattern);
+  if P1 = 0 then
+  begin
+    Result.Add(APattern);
+    Exit;
+  end;
+  P2 := Pos('}', APattern, P1 + 1);
+  if P2 = 0 then
+  begin
+    Result.Add(APattern);
+    Exit;
+  end;
+  Prefix := Copy(APattern, 1, P1 - 1);
+  Suffix := Copy(APattern, P2 + 1, MaxInt);
+  Body := Copy(APattern, P1 + 1, P2 - P1 - 1);
+  Start := 1;
+  for I := 1 to Length(Body) + 1 do
+  begin
+    if (I > Length(Body)) or (Body[I] = ',') then
+    begin
+      Item := Copy(Body, Start, I - Start);
+      Start := I + 1;
+      Result.AddStrings(ExpandBracePatterns(Prefix + Item + Suffix));
+    end;
+  end;
 end;
 
 // Loads simple .gitignore rules from ARootPath, skips comments and negations
@@ -689,6 +817,36 @@ begin
     // Simple name or glob matches the basename only
     else if MatchesMask(LowName, P) then
       Exit(True);
+  end;
+end;
+
+// Finds a safe cut point for history compaction, -1 when no valid cut exists
+function FindCompactionCutPoint(AMessages: TJSONArray; AKeepLast: integer): integer;
+var
+  I: integer;
+  MsgObj: TJSONObject;
+  Role: string;
+begin
+  Result := -1;
+  if (AMessages = nil) or (AMessages.Count <= AKeepLast + 2) then
+    Exit;
+  I := AMessages.Count - AKeepLast;
+  while I > 1 do
+  begin
+    if AMessages.Items[I].JSONType <> jtObject then
+    begin
+      Dec(I);
+      Continue;
+    end;
+    MsgObj := TJSONObject(AMessages.Items[I]);
+    Role := MsgObj.Get('role', '');
+    // Safe cut: right before a user message or a plain assistant (no pending tool calls)
+    if (Role = 'user') or ((Role = 'assistant') and (MsgObj.Find('tool_calls') = nil)) then
+    begin
+      Result := I;
+      Exit;
+    end;
+    Dec(I);
   end;
 end;
 
@@ -1094,6 +1252,16 @@ const
   TRUNCATE_TOOL_BYTES = 1000;
   // Retry limit for the chat call on transport timeout
   CHAT_MAX_ATTEMPTS = 3;
+  // Compaction triggers when context usage reaches this percent
+  COMPACT_THRESHOLD_PCT = 75;
+  // Minimum number of messages before compaction is attempted
+  COMPACT_MIN_MESSAGES = 10;
+  // Always keep at least this many messages from the end after compaction
+  KEEP_RECENT_MESSAGES = 5;
+  // Cap on the total bytes sent to the summarizer, prevents overflow
+  MAX_SUMMARIZE_INPUT_CHARS = 80000;
+  // Per-message cap when building the summarizer input
+  MAX_SUMMARIZE_MSG_CHARS = 5000;
 var
   Step, I, SavedTimeout, EffectiveMaxSteps: integer;
   MessagesArr: TJSONArray;
@@ -1109,6 +1277,10 @@ var
   TruncContent: string;
   ResolvedCtx: int64;
   SystemPromptText: string;
+  CutPoint: integer;
+  OldMsgsStr, MsgStr, Summary: string;
+  NewArr: TJSONArray;
+  SummObj: TJSONObject;
 begin
   Reason := afrError;
   ErrMsg := '';
@@ -1130,6 +1302,17 @@ begin
         ErrMsg := 'ModelName is empty';
         FAgent.LogLine('Abort: ModelName empty');
         Exit;
+      end;
+
+      // Verify the model declares tool support before promising to use tools
+      if FAgent.FFeatures <> [] then
+      begin
+        if not FAgent.ModelSupportsTools(ErrMsg) then
+        begin
+          Reason := afrError;
+          FAgent.LogLine('Abort: ' + ErrMsg);
+          Exit;
+        end;
       end;
 
       // Always send the system message, BuildSystemPrompt adds platform,
@@ -1198,6 +1381,61 @@ begin
         end;
 
         FCurrentContent := '';
+        // Compact history when context is near full and there is room to cut
+        if (FAgent.FContextTotal > 0) and (FAgent.FContextUsed > 0) and (FAgent.FContextUsed * 100 div
+          FAgent.FContextTotal >= COMPACT_THRESHOLD_PCT) and (MessagesArr.Count > COMPACT_MIN_MESSAGES) then
+        begin
+          CutPoint := FindCompactionCutPoint(MessagesArr, KEEP_RECENT_MESSAGES);
+          if CutPoint > 1 then
+          begin
+            FAgent.LogLine(Format('Compacting: context %d/%d, %d old messages', [FAgent.FContextUsed,
+              FAgent.FContextTotal, CutPoint - 1]));
+            // Build a bounded input for the summarizer
+            OldMsgsStr := '';
+            for I := 1 to CutPoint - 1 do
+            begin
+              if MessagesArr.Items[I].JSONType <> jtObject then
+                Continue;
+              MsgStr := MessagesArr.Items[I].AsJSON;
+              if Length(MsgStr) > MAX_SUMMARIZE_MSG_CHARS then
+                MsgStr := Copy(MsgStr, 1, MAX_SUMMARIZE_MSG_CHARS) + '...[truncated]';
+              OldMsgsStr := OldMsgsStr + MsgStr + #10;
+              if Length(OldMsgsStr) >= MAX_SUMMARIZE_INPUT_CHARS then
+              begin
+                OldMsgsStr := OldMsgsStr + '[... remaining messages omitted ...]';
+                Break;
+              end;
+            end;
+            Summary := FAgent.SummarizeMessages(OldMsgsStr);
+            if Summary <> '' then
+            begin
+              NewArr := TJSONArray.Create;
+              try
+                // Preserve original system message
+                NewArr.Add(MessagesArr.Items[0].Clone);
+                // Insert summary as a second system message
+                SummObj := TJSONObject.Create;
+                SummObj.Add('role', 'system');
+                SummObj.Add('content', '[Summary of earlier conversation]' + #10 + Summary);
+                NewArr.Add(SummObj);
+                // Keep messages from CutPoint onward
+                for I := CutPoint to MessagesArr.Count - 1 do
+                  NewArr.Add(MessagesArr.Items[I].Clone);
+                MessagesArr.Free;
+                MessagesArr := NewArr;
+                NewArr := nil;
+                FAgent.LogLine('Compaction done');
+              finally
+                NewArr.Free;
+              end;
+            end
+            else
+              FAgent.LogLine('Compaction skipped, empty summary');
+          end
+          else
+            FAgent.LogLine('Compaction skipped, no safe cut point');
+        end;
+
         // Keep only the most recent tool results intact, older ones are truncated
         TruncTotalTool := 0;
         for TruncIdx := 0 to MessagesArr.Count - 1 do
@@ -1520,6 +1758,8 @@ begin
   FContextTotal := 0;
   FOnAskUser := nil;
   FExecShellInfo := '';
+  FCapabilitiesCache := TStringList.Create;
+  FCapabilitiesCache.NameValueSeparator := '=';
   FTools := TAgentTools.Create(Self);
   FWebOptions := TAgentWebOptions.Create;
 end;
@@ -1531,6 +1771,7 @@ begin
     CheckSynchronize(50);
   // Drain any queued events so they do not fire after Free
   CheckSynchronize(0);
+  FCapabilitiesCache.Free;
   FWebOptions.Free;
   FTools.Free;
   inherited Destroy;
@@ -1811,6 +2052,109 @@ begin
   // Compare with trailing delimiter so '.' resolves to root itself
   if Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(Full))) = 1 then
     Result := Full;
+end;
+
+function TCustomOllamaAgent.ModelSupportsTools(out AErrorMsg: string): boolean;
+var
+  Kind: TOllamaErrorKind;
+  ShowErr, Json: string;
+  Data, Caps: TJSONData;
+  Arr: TJSONArray;
+  I, Idx: integer;
+  HasTools: boolean;
+  CapsStr: string;
+begin
+  Result := True;
+  AErrorMsg := '';
+  if not Assigned(FOllamaManager) then
+    Exit;
+  if Trim(FModelName) = '' then
+    Exit;
+  Idx := FCapabilitiesCache.IndexOfName(FModelName);
+  if Idx >= 0 then
+  begin
+    Result := FCapabilitiesCache.ValueFromIndex[Idx] = '1';
+    if not Result then
+      AErrorMsg := 'Model "' + FModelName + '" does not support tool calling. ' +
+        'Switch to a tool-capable model or run "set tools none".';
+    Exit;
+  end;
+  Json := FOllamaManager.ShowModel(FModelName, Kind, ShowErr);
+  if Kind <> oekNone then
+    Exit;
+  Data := nil;
+  try
+    try
+      Data := GetJSON(Json);
+    except
+      Data := nil;
+    end;
+    if (Data = nil) or (Data.JSONType <> jtObject) then
+      Exit;
+    Caps := TJSONObject(Data).Find('capabilities');
+    if (Caps = nil) or (Caps.JSONType <> jtArray) then
+      Exit;
+    Arr := TJSONArray(Caps);
+    if Arr.Count = 0 then
+      Exit;
+    CapsStr := '';
+    HasTools := False;
+    for I := 0 to Arr.Count - 1 do
+    begin
+      if Arr.Strings[I] = 'tools' then
+        HasTools := True;
+      if CapsStr <> '' then
+        CapsStr := CapsStr + ', ';
+      CapsStr := CapsStr + Arr.Strings[I];
+    end;
+    if HasTools then
+      FCapabilitiesCache.Values[FModelName] := '1'
+    else
+      FCapabilitiesCache.Values[FModelName] := '0';
+    Result := HasTools;
+    if not HasTools then
+      AErrorMsg := 'Model "' + FModelName + '" does not support tool calling (capabilities: ' + CapsStr +
+        '). Switch to a tool-capable model or run "set tools none".';
+  finally
+    Data.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.SummarizeMessages(const AMessagesJson: string): string;
+var
+  Kind: TOllamaErrorKind;
+  ErrMsg, SummJson: string;
+  SummArr: TJSONArray;
+  SysMsg, UserMsg: TJSONObject;
+begin
+  Result := '';
+  if not Assigned(FOllamaManager) then
+    Exit;
+  SummArr := TJSONArray.Create;
+  try
+    SysMsg := TJSONObject.Create;
+    SysMsg.Add('role', 'system');
+    SysMsg.Add('content', 'You are a conversation summarizer. Compress the provided ' +
+      'conversation into a compact summary. Preserve: user goals, key facts, files ' +
+      'modified, decisions made, remaining tasks. Drop: redundant tool output, ' +
+      'greetings, intermediate reasoning. Write in the user''s language. Aim for 10-20% ' +
+      'of the original length. Output only the summary.');
+    SummArr.Add(SysMsg);
+    UserMsg := TJSONObject.Create;
+    UserMsg.Add('role', 'user');
+    UserMsg.Add('content', 'Summarize this conversation:' + #10 + AMessagesJson);
+    SummArr.Add(UserMsg);
+    SummJson := SummArr.AsJSON;
+  finally
+    SummArr.Free;
+  end;
+  LogLine(Format('Summarizing conversation, input_len=%d', [Length(AMessagesJson)]));
+  Result := FOllamaManager.ChatWithTools(FModelName, SummJson, '', Kind, ErrMsg);
+  if Kind <> oekNone then
+  begin
+    LogLine('Summarize failed: ' + ErrMsg);
+    Result := '';
+  end;
 end;
 
 function TCustomOllamaAgent.BuildToolsSchemaJson: string;
@@ -2701,13 +3045,17 @@ end;
 function TCustomOllamaAgent.DoFindFiles(AArgs: TJSONObject): string;
 const
   MAX_RESULTS = 2000;
+  MAX_TOTAL_BYTES = 50000;
 var
-  RelPath, FullPath, Pattern: string;
+  RelPath, FullPath, Pattern, NormPattern: string;
   Recursive: boolean;
   Files: TStringList;
+  Patterns: TStringList;
+  GitPatterns: TStringList;
   Arr: TJSONArray;
-  I: integer;
+  I, P, TotalBytes: integer;
   BaseRoot: string;
+  Truncated: boolean;
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -2717,8 +3065,6 @@ begin
   Recursive := AArgs.Get('recursive', True);
   if Pattern = '' then
     Pattern := '*';
-  // Accept git-style globs and character classes from the model
-  Pattern := NormalizeGlobPattern(Pattern);
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
@@ -2732,21 +3078,47 @@ begin
   end;
   BaseRoot := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
   Files := TStringList.Create;
+  Files.Sorted := True;
+  Files.Duplicates := dupIgnore;
   Arr := TJSONArray.Create;
+  GitPatterns := LoadGitignorePatterns(GetEffectiveRootPath);
+  Patterns := ExpandBracePatterns(Pattern);
   try
-    FindAllFiles(Files, FullPath, Pattern, Recursive);
+    // Run FindAllFiles once per expanded pattern, Files dedupes results
+    for P := 0 to Patterns.Count - 1 do
+    begin
+      NormPattern := NormalizeGlobPattern(Patterns[P]);
+      if NormPattern <> '' then
+        FindAllFiles(Files, FullPath, NormPattern, Recursive);
+    end;
     Files.Sort;
+    TotalBytes := 0;
+    Truncated := False;
     for I := 0 to Files.Count - 1 do
     begin
       if Arr.Count >= MAX_RESULTS then
+      begin
+        Truncated := True;
         Break;
-      Arr.Add(RelativeToRoot(BaseRoot, Files[I]));
+      end;
+      if TotalBytes >= MAX_TOTAL_BYTES then
+      begin
+        Truncated := True;
+        Break;
+      end;
+      RelPath := RelativeToRoot(BaseRoot, Files[I]);
+      if IsIgnoredByGitignore(RelPath, GitPatterns) then
+        Continue;
+      Arr.Add(RelPath);
+      Inc(TotalBytes, Length(RelPath) + 4);
     end;
-    Result := '{"count": ' + IntToStr(Arr.Count) + ', "truncated": ' + BoolToStr(Files.Count > MAX_RESULTS, 'true', 'false') +
+    Result := '{"count": ' + IntToStr(Arr.Count) + ', "truncated": ' + BoolToStr(Truncated, 'true', 'false') +
       ', "files": ' + Arr.AsJSON + '}';
   finally
+    Patterns.Free;
     Arr.Free;
     Files.Free;
+    GitPatterns.Free;
   end;
 end;
 
@@ -2757,6 +3129,9 @@ const
   MAX_FILES_SCANNED = 2000;
   // Wall-clock budget for a single grep call to protect the agent loop
   MAX_GREP_MS = 10000;
+  // Byte and per-line caps for the total response to the model
+  MAX_TOTAL_BYTES = 50000;
+  MAX_MATCH_LINE_CHARS = 500;
 var
   RelPath, FullPath, Pattern: string;
   Recursive, Literal, SingleFile, ScanLimited: boolean;
@@ -2768,6 +3143,7 @@ var
   GitPatterns: TStringList;
   StartTick: QWord;
   TimedOut: boolean;
+  TotalBytes: integer;
 
 // Returns True for VCS, build output and package caches to skip
   function IsJunkPath(const ARelPath: string): boolean;
@@ -2811,6 +3187,8 @@ var
       begin
         if Matches.Count >= MAX_MATCHES then
           Break;
+        if TotalBytes >= MAX_TOTAL_BYTES then
+          Break;
         Line := Lines[J];
         if Literal then
           HasMatch := Pos(Pattern, Line) > 0
@@ -2824,11 +3202,14 @@ var
         end;
         if HasMatch then
         begin
+          if Length(Line) > MAX_MATCH_LINE_CHARS then
+            Line := Copy(Line, 1, MAX_MATCH_LINE_CHARS) + '... [truncated]';
           MatchObj := TJSONObject.Create;
           MatchObj.Add('file', ARelPath);
           MatchObj.Add('line', J + 1);
           MatchObj.Add('text', Line);
           Matches.Add(MatchObj);
+          Inc(TotalBytes, Length(ARelPath) + Length(Line) + 30);
         end;
       end;
     finally
@@ -2889,6 +3270,11 @@ begin
       begin
         if Matches.Count >= MAX_MATCHES then
           Break;
+        if TotalBytes >= MAX_TOTAL_BYTES then
+        begin
+          ScanLimited := True;
+          Break;
+        end;
         if FilesScanned >= MAX_FILES_SCANNED then
         begin
           ScanLimited := True;
