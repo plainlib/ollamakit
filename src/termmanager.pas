@@ -295,6 +295,8 @@ type
     procedure WriteLine(const AText: string; AIsStderr: boolean = False); virtual;
     // Returns multi-line help for term.* properties
     function FormatTermHelp: string; virtual;
+    // Returns multi-line current values of term.* properties
+    function FormatTermConfig: string; virtual;
 
     property Path: string read FPath write SetPath;
     property Prompt: string read FPrompt write FPrompt;
@@ -1407,7 +1409,7 @@ end;
 
 procedure TCustomTermManager.HandleBuiltin(const ALine: string);
 var
-  Cmd, Arg, TargetPath, ToolsList: string;
+  Cmd, Arg, TargetPath: string;
   P, I: integer;
 begin
   P := Pos(' ', ALine);
@@ -1484,24 +1486,7 @@ begin
   else if (Cmd = 'config') or (Cmd = 'settings') then
   begin
     DoOutput(FormatAgentConfig(FAgent) + LineEnding, False);
-    DoOutput(Format('Terminal Settings' + LineEnding + '  term.path             : %s' + LineEnding +
-      '  term.shell            : %s' + LineEnding + '  term.showthinking     : %s' + LineEnding +
-      '  term.commandtimeout   : %d' + LineEnding + '  term.maxcapturebytes  : %d' + LineEnding +
-      '  term.agentcommandtimeout : %d' + LineEnding, [GetEffectivePath, FShellExec, BoolToStr(FShowThinking, 'on', 'off'),
-      FCommandTimeout, FMaxCaptureBytes, FAgentCommandTimeout]) + LineEnding, False);
-    if Assigned(FAgent) then
-    begin
-      ToolsList := '';
-      if afFileTools in FAgent.EnabledTools then ToolsList := ToolsList + 'filetools ';
-      if afExecCommand in FAgent.EnabledTools then ToolsList := ToolsList + 'exec ';
-      if afGit in FAgent.EnabledTools then ToolsList := ToolsList + 'git ';
-      if afInteractive in FAgent.EnabledTools then ToolsList := ToolsList + 'interactive ';
-      if afFinish in FAgent.EnabledTools then ToolsList := ToolsList + 'finish ';
-      if afWebTools in FAgent.EnabledTools then ToolsList := ToolsList + 'web ';
-      if ToolsList = '' then
-        ToolsList := 'none';
-      DoOutput('  tools                 : ' + Trim(ToolsList) + LineEnding, False);
-    end;
+    DoOutput(FormatTermConfig + LineEnding, False);
   end
   else if Cmd = 'models' then
     HandleModelsCommand(Arg)
@@ -1513,18 +1498,29 @@ end;
 
 procedure TCustomTermManager.HandleHelpCommand(const AArg: string);
 var
-  Topic, CommandsList: string;
+  Topic: string;
   BaseUrl, ModelName, MaxSteps, Streaming, Tools: string;
 
-// Adds a labeled line with aligned description
-  procedure Line(const ALabel, AValue, ADesc: string);
+// Writes a command group row with a two-space indent
+  procedure Group(const AName, AValue: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + AName;
+    while Length(Pad) < 14 do
+      Pad := Pad + ' ';
+    DoOutput(Pad + AValue + LineEnding, False);
+  end;
+
+  // Writes a hint row with a label and a short description
+  procedure Item(const ALabel, ADesc: string);
   var
     Pad: string;
   begin
     Pad := '  ' + ALabel;
-    while Length(Pad) < 38 do
+    while Length(Pad) < 26 do
       Pad := Pad + ' ';
-    DoOutput(Pad + AValue + '  (' + ADesc + ')' + LineEnding, False);
+    DoOutput(Pad + ADesc + LineEnding, False);
   end;
 
   // Returns comma separated short tool names for display in help
@@ -1563,53 +1559,60 @@ begin
     DoOutput(FormatTermHelp + LineEnding, False)
   else
   begin
-    // Add a space after commas for readability
-    CommandsList := StringReplace(FBuiltinCommands.CommaText, ',', ', ', [rfReplaceAll]);
-    DoOutput('Built-in commands: ' + CommandsList + LineEnding, False);
+    DoOutput('Commands' + LineEnding, False);
+    Group('shell', 'cd  pwd  cls  clear  history  exit  quit');
+    Group('settings', 'set  get  config');
+    Group('models', 'models  ollama');
+    Group('help', 'help  help agent  help term  ?');
     DoOutput('' + LineEnding, False);
+
     if Assigned(FAgent) then
     begin
-      DoOutput('Current agent state:' + LineEnding, False);
       if Assigned(FAgent.OllamaManager) then
-      begin
-        BaseUrl := FAgent.OllamaManager.BaseURL;
-        if BaseUrl = '' then
-          BaseUrl := '(empty)';
-      end
+        BaseUrl := FAgent.OllamaManager.BaseURL
       else
-        BaseUrl := '(no OllamaManager)';
+        BaseUrl := '(no manager)';
       ModelName := FAgent.ModelName;
       if ModelName = '' then
         ModelName := '(not selected)';
-      MaxSteps := IntToStr(FAgent.MaxSteps);
-      if FAgent.MaxSteps = 0 then
+      if FAgent.MaxSteps > 0 then
+        MaxSteps := IntToStr(FAgent.MaxSteps)
+      else
         MaxSteps := '0 (unlimited)';
       if FAgent.Streaming then
         Streaming := 'on'
       else
         Streaming := 'off';
       Tools := BuildToolsList(FAgent.EnabledTools);
-      Line('baseurl', BaseUrl, 'set baseurl <url> to change');
-      Line('model', ModelName, 'set model <name>, or "models" to list');
-      Line('maxsteps', MaxSteps, 'set maxsteps <n>, 0 for unlimited');
-      Line('streaming', Streaming, 'set streaming on|off');
-      Line('tools', Tools, 'set tools <list>, "set tools all" or "none"');
+
+      DoOutput('Agent' + LineEnding, False);
+      Group('baseurl', BaseUrl);
+      Group('model', ModelName);
+      Group('maxsteps', MaxSteps);
+      Group('streaming', Streaming);
+      Group('tools', Tools);
+      DoOutput('' + LineEnding, False);
+
+      Item('set <name> <value>', 'change a property');
+      Item('get <name>', 'inspect a property');
+      Item('config', 'full settings dump');
+      Item('ollama help', 'model management commands');
+      Item('', '');
     end
     else
     begin
-      DoOutput('No agent attached, showing examples:' + LineEnding, False);
-      Line('baseurl', 'http://localhost:11434', 'Set Ollama server URL');
-      Line('model', 'qwen2.5:7b', 'Select a model for the agent');
-      Line('maxsteps', '20', 'Iteration limit, 0 for unlimited');
-      Line('streaming', 'on', 'Real time output');
-      Line('tools', 'filetools, exec, web', 'Enabled tool groups');
+      DoOutput('Agent  not attached, chat disabled' + LineEnding, False);
+      DoOutput('' + LineEnding, False);
+      Item('set baseurl <url>', 'server URL, e.g. http://localhost:11434');
+      Item('set model <name>', 'select a model');
+      Item('set maxsteps <n>', 'iteration limit, 0 = unlimited');
+      Item('set streaming on|off', 'real time output');
+      Item('set tools <list>', 'tool groups, "all" or "none"');
+      DoOutput('' + LineEnding, False);
+      Item('config', 'full settings dump');
+      Item('ollama help', 'model management commands');
+      Item('', '');
     end;
-    DoOutput('' + LineEnding, False);
-    DoOutput('Other commands: config (all settings), models (installed models), get/set <name>' + LineEnding, False);
-    DoOutput('Ollama management: ollama <subcommand>, e.g. "ollama list" or "ollama help"' + LineEnding, False);
-    DoOutput('Agent properties: help agent, or just "?"' + LineEnding, False);
-    DoOutput('Terminal properties: help term' + LineEnding, False);
-    DoOutput('' + LineEnding, False);
   end;
 end;
 
@@ -1790,25 +1793,67 @@ end;
 function TCustomTermManager.FormatTermHelp: string;
 var
   T: TStringList;
+
+// Adds an aligned settings row with two-space indent
+  procedure Row(const AName, ADesc: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + AName;
+    while Length(Pad) < 24 do
+      Pad := Pad + ' ';
+    T.Add(Pad + ADesc);
+  end;
+
 begin
   T := TStringList.Create;
   try
-    T.Add('Terminal configuration, prefix all names with "term."');
+    T.Add('Terminal settings  prefix "term."');
     T.Add('');
-    T.Add('  set term.path <path>               Working directory');
-    T.Add('  set term.shell <exe>               Shell executable, e.g. cmd.exe');
-    T.Add('  set term.showthinking on|off       Show agent reasoning text');
-    T.Add('  set term.commandtimeout <ms>       Timeout for user-typed commands');
-    T.Add('  set term.maxcapturebytes <n>       Cap on captured output per command');
-    T.Add('  set term.agentcommandtimeout <ms>  Timeout for agent exec_command');
-    T.Add('  get term.<name>                    Show current value');
-    T.Add('  config                             Show all settings');
+    Row('path', 'working directory');
+    Row('shell', 'executable, e.g. cmd.exe or pwsh.exe');
+    Row('showthinking', 'on|off, show agent reasoning text');
+    Row('commandtimeout', 'ms, user command timeout, 0 = none');
+    Row('maxcapturebytes', 'cap on captured output per command');
+    Row('agentcommandtimeout', 'ms, agent exec_command timeout, 0 = none');
     T.Add('');
-    T.Add('Examples:');
-    T.Add('  set term.shell pwsh.exe');
-    T.Add('  set term.showthinking off');
-    T.Add('  set term.agentcommandtimeout 60000');
-    T.Add('  get term.shell');
+    Row('set term.<name> <value>', 'change a setting');
+    Row('get term.<name>', 'inspect a setting');
+    Row('config', 'full settings dump');
+    T.Add('');
+    T.Add('  example  set term.shell pwsh.exe');
+    T.Add('');
+    Result := T.Text;
+  finally
+    T.Free;
+  end;
+end;
+
+function TCustomTermManager.FormatTermConfig: string;
+var
+  T: TStringList;
+
+// Adds an aligned setting row
+  procedure Row(const AName, AValue: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + AName;
+    while Length(Pad) < 24 do
+      Pad := Pad + ' ';
+    T.Add(Pad + AValue);
+  end;
+
+begin
+  T := TStringList.Create;
+  try
+    T.Add('Terminal');
+    Row('path', GetEffectivePath);
+    Row('shell', FShellExec);
+    Row('showthinking', BoolToStr(FShowThinking, 'on', 'off'));
+    Row('commandtimeout', IntToStr(FCommandTimeout));
+    Row('maxcapturebytes', IntToStr(FMaxCaptureBytes));
+    Row('agentcommandtimeout', IntToStr(FAgentCommandTimeout));
     Result := T.Text;
   finally
     T.Free;
@@ -2433,23 +2478,61 @@ begin
 end;
 
 procedure TCustomTermManager.HandleOllamaHelp;
+var
+  T: TStringList;
+
+// Writes a section header with a leading blank line
+  procedure Header(const AText: string);
+  begin
+    if T.Count > 0 then
+      T.Add('');
+    T.Add(AText);
+  end;
+
+  // Writes an aligned command row
+  procedure Row(const ACmd, ADesc: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + ACmd;
+    while Length(Pad) < 28 do
+      Pad := Pad + ' ';
+    T.Add(Pad + ADesc);
+  end;
+
 begin
-  DoOutput('Ollama server management through OllamaManager, no external CLI' + LineEnding, False);
-  DoOutput('' + LineEnding, False);
-  DoOutput('  ollama list                        List installed models' + LineEnding, False);
-  DoOutput('  ollama ps                          List running models' + LineEnding, False);
-  DoOutput('  ollama show <model>                Show model details as JSON' + LineEnding, False);
-  DoOutput('  ollama pull <model>                Download model from registry' + LineEnding, False);
-  DoOutput('  ollama rm <model>                  Delete installed model' + LineEnding, False);
-  DoOutput('  ollama load <model>                Load model into memory' + LineEnding, False);
-  DoOutput('  ollama unload <model>              Unload model from memory' + LineEnding, False);
-  DoOutput('  ollama stop <model>                Alias for unload' + LineEnding, False);
-  DoOutput('  ollama copy <source> <dest>        Copy model under a new name' + LineEnding, False);
-  DoOutput('  ollama create <name> <file>        Create model from Modelfile' + LineEnding, False);
-  DoOutput('  ollama version                     Show server version' + LineEnding, False);
-  DoOutput('  ollama help                        This help' + LineEnding, False);
-  DoOutput('' + LineEnding, False);
-  DoOutput('All commands use the configured BaseURL, no shell invocation' + LineEnding, False);
+  T := TStringList.Create;
+  try
+    T.Add('Ollama server management via the API, no external CLI');
+
+    Header('List');
+    Row('ollama list', 'installed models');
+    Row('ollama ps', 'running models');
+    Row('ollama show <model>', 'details as JSON');
+    Row('ollama version', 'server version');
+
+    Header('Models');
+    Row('ollama pull <model>', 'download from registry');
+    Row('ollama rm <model>', 'delete installed model');
+    Row('ollama copy <src> <dst>', 'copy under a new name');
+    Row('ollama create <name> <file>', 'build from a Modelfile');
+
+    Header('Memory');
+    Row('ollama load <model>', 'load into memory');
+    Row('ollama unload <model>', 'unload from memory');
+    Row('ollama stop <model>', 'same as unload');
+
+    Header('Other');
+    Row('ollama help', 'this help');
+
+    T.Add('');
+    T.Add('  Uses baseurl, never invokes the shell');
+    T.Add('');
+
+    DoOutput(T.Text, False);
+  finally
+    T.Free;
+  end;
 end;
 
 procedure TCustomTermManager.HandleModelsCommand(const AArg: string);

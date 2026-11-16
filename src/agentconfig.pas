@@ -302,40 +302,79 @@ end;
 
 function FormatAgentHelp: string;
 var
-  I: integer;
-  NameCol, Marker: string;
-begin
-  Result :=
-    'Agent configuration:' + LineEnding + '  set <name> <value>     Set an agent property' + LineEnding +
-    '  get <name>             Show current value of a property' + LineEnding +
-    '  config                 Show saved settings (excludes runtime-only)' + LineEnding +
-    '  models                 Query Ollama server and list installed models' + LineEnding +
-    '  help agent             Show this help (also just "?")' + LineEnding + LineEnding + 'Value formats:' +
-    LineEnding + '  string    free text, use quotes if it contains spaces' + LineEnding +
-    '  integer   whole number, 0 has special meaning where noted' + LineEnding + '  boolean   on, off, true, false, yes, no, 1, 0' +
-    LineEnding + '  set       comma separated names, for example "filetools, exec, git"' + LineEnding +
-    '  text      single line, or "from <file>" to load multiline file' + LineEnding +
-    '  list      comma separated entries, "none" clears the list' + LineEnding + LineEnding +
-    'Properties (marked * are runtime-only and not saved between runs):' + LineEnding;
-  for I := Low(PROPERTIES) to High(PROPERTIES) do
+  T: TStringList;
+
+// Adds a section header with a leading blank line
+  procedure Header(const AText: string);
   begin
-    if PROPERTIES[I].Runtime then
-      Marker := ' * '
-    else
-      Marker := '   ';
-    NameCol := '  ' + Marker + PROPERTIES[I].Name;
-    while Length(NameCol) < 26 do
-      NameCol := NameCol + ' ';
-    Result := Result + NameCol + PROPERTIES[I].Description + LineEnding;
-    if PROPERTIES[I].Aliases <> '' then
-      Result := Result + '      aliases: ' + PROPERTIES[I].Aliases + LineEnding;
+    T.Add('');
+    T.Add(AText);
   end;
-  Result := Result + LineEnding + 'Examples:' + LineEnding + '  set baseurl http://192.168.1.10:11434' +
-    LineEnding + '  set keepalive -1' + LineEnding + '  set numctx 8192' + LineEnding + '  set active on' +
-    LineEnding + '  models' + LineEnding + '  set model qwen2.5:7b' + LineEnding + '  set maxsteps 40' +
-    LineEnding + '  set streaming on' + LineEnding + '  set tools filetools, exec, web' + LineEnding +
-    '  set tools all' + LineEnding + '  set systemprompt from prompt.txt' + LineEnding + '  set web.timeout 8000' +
-    LineEnding + '  get tools' + LineEnding + '  config';
+
+  // Adds an aligned property row
+  procedure Row(const AName, ADesc: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + AName;
+    while Length(Pad) < 24 do
+      Pad := Pad + ' ';
+    T.Add(Pad + ADesc);
+  end;
+
+begin
+  T := TStringList.Create;
+  try
+    T.Add('Agent settings  set <name> <value>  get <name>  config  models');
+
+    Header('OllamaManager');
+    Row('baseurl', 'server URL, e.g. http://localhost:11434');
+    Row('keepalive', 'keep loaded, -1 forever, 0 unload');
+    Row('autorefresh', 'refresh model list on popup');
+    Row('connectiontimeout', 'connect timeout ms');
+    Row('manager.timeout', 'default request timeout ms');
+    Row('pulltimeout', 'pull timeout ms, 0 = none');
+    Row('numctx', 'context override, 0 = model default');
+    Row('active', 'background refresh and connection');
+
+    Header('Agent');
+    Row('model', 'model name, e.g. flint:40b');
+    Row('systemprompt', 'message text or "from <file>"');
+    Row('maxsteps', 'iterations per run, 0 = unlimited');
+    Row('timeout', 'request timeout ms, 0 = manager');
+    Row('streaming', 'stream content in real time');
+    Row('tools', 'filetools exec git interactive finish web');
+    Row('rootpath', 'sandbox directory for file tools');
+    Row('keephistory', 'persist messages between runs');
+    Row('log', 'log every step to stderr');
+
+    Header('Web');
+    Row('web.searchurl', 'template, {query} placeholder');
+    Row('web.useragent', 'User-Agent header');
+    Row('web.timeout', 'request timeout ms');
+    Row('web.maxbytes', 'response body cap');
+    Row('web.striphtml', 'strip HTML tags');
+    Row('web.blocklocalhost', 'block localhost');
+    Row('web.blockprivateips', 'block private IPv4');
+    Row('web.allowedhosts', 'whitelist, "none" = any');
+
+    Header('Values');
+    T.Add('  boolean   on off true false yes no 1 0');
+    T.Add('  list      comma separated, "none" clears');
+    T.Add('  text      single line, or "from <file>"');
+    T.Add('  runtime   numctx and active are not saved');
+
+    Header('Examples');
+    T.Add('  set baseurl http://192.168.1.10:11434');
+    T.Add('  set model qwen2.5:7b');
+    T.Add('  set tools filetools, exec');
+    T.Add('  set systemprompt from prompt.txt');
+    T.Add('  get tools');
+
+    Result := T.Text;
+  finally
+    T.Free;
+  end;
 end;
 
 function FormatAgentConfig(AAgent: TCustomOllamaAgent): string;
