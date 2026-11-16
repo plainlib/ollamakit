@@ -3034,6 +3034,8 @@ var
   CursorPos, HistIndex, PromptRow, PromptCol, OldLen: Integer;
   C: WideChar;
   Wide: UnicodeString;
+  LastRedrawRows: Integer;
+  HasMore, IsModifier: Boolean;
 
   // Collects full UTF-8 sequence that conhost splits across key events
   procedure CollectBrokenUtf8(var AC: WideChar);
@@ -3104,17 +3106,87 @@ var
     end;
   end;
 
+  // Splits text into lines, preserving trailing empty line after a line break
+  function SplitLines(const S: RawByteString): TStringList;
+  var
+    I, Start: Integer;
+  begin
+    Result := TStringList.Create;
+    Start := 1;
+    I := 1;
+    while I <= Length(S) do
+    begin
+      if S[I] = #13 then
+      begin
+        Result.Add(Copy(S, Start, I - Start));
+        if (I < Length(S)) and (S[I + 1] = #10) then
+          Inc(I, 2)
+        else
+          Inc(I);
+        Start := I;
+      end
+      else if S[I] = #10 then
+      begin
+        Result.Add(Copy(S, Start, I - Start));
+        Inc(I);
+        Start := I;
+      end
+      else
+        Inc(I);
+    end;
+    Result.Add(Copy(S, Start, MaxInt));
+  end;
+
+  // Computes 0-based row and column of the cursor inside the prefix
+  procedure CalcCursorPos(const APrefix: RawByteString; out ARow, ACol: Integer);
+  var
+    Parts: TStringList;
+  begin
+    Parts := SplitLines(APrefix);
+    try
+      ARow := Parts.Count - 1;
+      if Parts.Count > 0 then
+        ACol := Utf8CharCount(Parts[Parts.Count - 1])
+      else
+        ACol := 0;
+    finally
+      Parts.Free;
+    end;
+  end;
+
   procedure Redraw;
   var
-    DisplayPrefix: RawByteString;
+    I, CurRow, CurCol: Integer;
+    Lines: TStringList;
   begin
-    // Hide cursor, redraw only input area, then show at final position
     HideConsoleCursor;
-    ConGotoXY(PromptCol, PromptRow);
-    ConClearLineFromCursor;
-    ConWriteUtf8(Line);
-    DisplayPrefix := Copy(Line, 1, CursorPos);
-    ConGotoXY(PromptCol + Utf8CharCount(DisplayPrefix), PromptRow);
+    // Clear rows occupied by the previous redraw
+    if LastRedrawRows > 0 then
+      for I := 0 to LastRedrawRows - 1 do
+      begin
+        ConGotoXY(1, PromptRow + I);
+        ConClearLineFromCursor;
+      end;
+    // Rewrite prompt and content line by line
+    Lines := SplitLines(Line);
+    try
+      for I := 0 to Lines.Count - 1 do
+      begin
+        ConGotoXY(1, PromptRow + I);
+        if I = 0 then
+          ConWriteUtf8(PromptText);
+        ConWriteUtf8(Lines[I]);
+      end;
+      LastRedrawRows := Lines.Count;
+    finally
+      Lines.Free;
+    end;
+    // Place the cursor on the right row and column
+    CalcCursorPos(Copy(Line, 1, CursorPos), CurRow, CurCol);
+    if CurRow = 0 then
+      ConGotoXY(PromptCol + CurCol, PromptRow)
+    else
+      ConGotoXY(1 + CurCol, PromptRow + CurRow);
     ShowConsoleCursor;
   end;
 
@@ -3135,6 +3207,7 @@ begin
   FLastCharWasNewLine := False;
   PromptRow := ConWhereY;
   PromptCol := Utf8CharCount(PromptText) + 1;
+  LastRedrawRows := 1;
 
   Handle := GetStdHandle(STD_INPUT_HANDLE);
 
@@ -3158,15 +3231,61 @@ begin
     case Rec.Event.KeyEvent.wVirtualKeyCode of
       VK_RETURN:
         begin
-          ConWriteUtf8(LineEnding);
-          FLastCharWasNewLine := True;
-          Break;
+          IsModifier := (Rec.Event.KeyEvent.dwControlKeyState and
+            (SHIFT_PRESSED or LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+
+          // Look ahead: pending key-down event means this Enter is part of a paste
+          HasMore := False;
+          if not IsModifier then
+          begin
+            while PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) do
+            begin
+              if (NextRec.EventType = KEY_EVENT) and NextRec.Event.KeyEvent.bKeyDown then
+              begin
+                HasMore := True;
+                Break;
+              end;
+              if not ReadConsoleInput(Handle, NextRec, 1, N) then
+                Break;
+            end;
+          end
+          else
+          begin
+            // Swallow the matching Enter-up so it does not linger in the queue
+            if PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) then
+              if (NextRec.EventType = KEY_EVENT) and
+                (NextRec.Event.KeyEvent.wVirtualKeyCode = VK_RETURN) and
+                (not NextRec.Event.KeyEvent.bKeyDown) then
+                ReadConsoleInput(Handle, NextRec, 1, N);
+          end;
+
+          if IsModifier or HasMore then
+          begin
+            // Shift/Ctrl+Enter or multiline paste: insert a line break
+            Line := Line + LineEnding;
+            CursorPos := Length(Line);
+          end
+          else
+          begin
+            ConWriteUtf8(LineEnding);
+            FLastCharWasNewLine := True;
+            Break;
+          end;
         end;
       VK_BACK:
         if CursorPos > 0 then
         begin
-          CursorPos := Utf8PrevPos(Line, CursorPos);
-          Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+          // Remove both chars of a CRLF pair when backspacing over a line break
+          if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
+          begin
+            Dec(CursorPos, 2);
+            Delete(Line, CursorPos + 1, 2);
+          end
+          else
+          begin
+            CursorPos := Utf8PrevPos(Line, CursorPos);
+            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+          end;
         end;
       VK_DELETE:
         // Delete current history entry if navigated but not edited
@@ -3191,7 +3310,14 @@ begin
           end;
         end
         else if CursorPos < Length(Line) then
-          Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+        begin
+          // Delete CRLF pair as one unit
+          if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and
+            (Line[CursorPos + 2] = #10) then
+            Delete(Line, CursorPos + 1, 2)
+          else
+            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+        end;
       VK_LEFT:
         if CursorPos > 0 then
           CursorPos := Utf8PrevPos(Line, CursorPos);
@@ -3231,7 +3357,7 @@ begin
         end;
       VK_C:
         if (Rec.Event.KeyEvent.dwControlKeyState and
-            (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0 then
+          (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0 then
         begin
           ConGotoXY(1, PromptRow);
           ConClearLineFromCursor;
@@ -3246,6 +3372,7 @@ begin
           FLastCharWasNewLine := False;
           PromptRow := ConWhereY;
           PromptCol := Utf8CharCount(PromptText) + 1;
+          LastRedrawRows := 1;
           Continue;
         end
         else if Ord(C) >= 32 then
