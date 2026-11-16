@@ -184,6 +184,8 @@ type
     function GetEffectiveRootPath: string; virtual;
     // Resolves a relative path inside RootPath, returns '' when escaping
     function SafePath(const ARelPath: string): string; virtual;
+    // Builds a file-not-found error with similar names from the same directory
+    function BuildFileNotFoundError(const AFullPath, ARelPath: string): string; virtual;
     // Built-in tool implementations, invoked from DispatchTool
     function DoReadFile(AArgs: TJSONObject): string; virtual;
     // Shows first and last lines of a file with a gap marker
@@ -981,6 +983,53 @@ begin
   for I := 2 to Length(APattern) - 1 do
     if (APattern[I] = '|') and (APattern[I - 1] <> ' ') and (APattern[I + 1] <> ' ') then
       Exit(True);
+end;
+
+// Returns the Levenshtein edit distance between two strings
+function LevenshteinDistance(const S1, S2: string): integer;
+var
+  I, J, Diag, Up, Left, Best: integer;
+  Prev, Cur: array of integer;
+begin
+  if Length(S1) = 0 then
+    Exit(Length(S2));
+  if Length(S2) = 0 then
+    Exit(Length(S1));
+  Prev := nil;
+  Cur := nil;
+  SetLength(Prev, Length(S2) + 1);
+  SetLength(Cur, Length(S2) + 1);
+  for J := 0 to Length(S2) do
+    Prev[J] := J;
+  for I := 1 to Length(S1) do
+  begin
+    Cur[0] := I;
+    for J := 1 to Length(S2) do
+    begin
+      if S1[I] = S2[J] then
+        Cur[J] := Prev[J - 1]
+      else
+      begin
+        Diag := Prev[J - 1];
+        Up := Prev[J];
+        Left := Cur[J - 1];
+        Best := Diag;
+        if Up < Best then
+          Best := Up;
+        if Left < Best then
+          Best := Left;
+        Cur[J] := Best + 1;
+      end;
+    end;
+    // Swap rows without reallocating, Prev becomes the finished Cur
+    for J := 0 to Length(S2) do
+    begin
+      Left := Prev[J];
+      Prev[J] := Cur[J];
+      Cur[J] := Left;
+    end;
+  end;
+  Result := Prev[Length(S2)];
 end;
 
 { TAgentWebOptions }
@@ -2702,6 +2751,75 @@ begin
   end;
 end;
 
+function TCustomOllamaAgent.BuildFileNotFoundError(const AFullPath, ARelPath: string): string;
+const
+  MAX_SUGGESTIONS = 3;
+  MAX_DISTANCE = 3;
+var
+  Dir, BaseName, SuggestNames: string;
+  Info: TSearchRec;
+  Res, Dist, I, J: integer;
+  Candidates: TStringList;
+  Dists: array of integer = ();
+  TmpName: string;
+  TmpDist: integer;
+begin
+  Dir := ExtractFileDir(AFullPath);
+  BaseName := ExtractFileName(AFullPath);
+  Candidates := TStringList.Create;
+  try
+    if DirectoryExists(Dir) then
+    begin
+      Res := FindFirst(IncludeTrailingPathDelimiter(Dir) + '*', faAnyFile, Info);
+      if Res = 0 then
+      try
+        repeat
+          if (Info.Name <> '.') and (Info.Name <> '..') and ((Info.Attr and faDirectory) = 0) then
+          begin
+            Dist := LevenshteinDistance(LowerCase(BaseName), LowerCase(Info.Name));
+            if (Dist > 0) and (Dist <= MAX_DISTANCE) then
+            begin
+              Candidates.Add(Info.Name);
+              SetLength(Dists, Candidates.Count);
+              Dists[Candidates.Count - 1] := Dist;
+            end;
+          end;
+        until FindNext(Info) <> 0;
+      finally
+        FindClose(Info);
+      end;
+    end;
+
+    // Bubble sort by distance, list is tiny
+    for I := 0 to Candidates.Count - 2 do
+      for J := 0 to Candidates.Count - 2 - I do
+        if Dists[J] > Dists[J + 1] then
+        begin
+          TmpName := Candidates[J];
+          Candidates[J] := Candidates[J + 1];
+          Candidates[J + 1] := TmpName;
+          TmpDist := Dists[J];
+          Dists[J] := Dists[J + 1];
+          Dists[J + 1] := TmpDist;
+        end;
+
+    SuggestNames := '';
+    for I := 0 to Min(Candidates.Count, MAX_SUGGESTIONS) - 1 do
+    begin
+      if SuggestNames <> '' then
+        SuggestNames := SuggestNames + ', ';
+      SuggestNames := SuggestNames + '"' + Candidates[I] + '"';
+    end;
+
+    Result := '{"error": "file not found: ' + TJSONString.Create(ARelPath).AsJSON;
+    if SuggestNames <> '' then
+      Result := Result + ', "did_you_mean": [' + SuggestNames + ']';
+    Result := Result + '}';
+  finally
+    Candidates.Free;
+  end;
+end;
+
 function TCustomOllamaAgent.DoReadFile(AArgs: TJSONObject): string;
 const
   DEFAULT_MAX_BYTES = 50000;
@@ -2729,7 +2847,7 @@ begin
   end;
   if not FileExists(FullPath) then
   begin
-    Result := '{"error": "file not found"}';
+    Result := BuildFileNotFoundError(FullPath, RelPath);
     Exit;
   end;
   MaxBytes := GetIntArg(AArgs, 'max_bytes', DEFAULT_MAX_BYTES);
@@ -2797,7 +2915,7 @@ begin
   end;
   if not FileExists(FullPath) then
   begin
-    Result := '{"error": "file not found"}';
+    Result := BuildFileNotFoundError(FullPath, RelPath);
     Exit;
   end;
   Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
@@ -3140,7 +3258,7 @@ begin
   end;
   if not FileExists(FullPath) then
   begin
-    Result := '{"error": "file not found"}';
+    Result := BuildFileNotFoundError(FullPath, RelPath);
     Exit;
   end;
   StartLine := integer(GetIntArg(AArgs, 'start_line', 1));
@@ -3212,7 +3330,7 @@ begin
   end;
   if not FileExists(FullPath) then
   begin
-    Result := '{"error": "file not found"}';
+    Result := BuildFileNotFoundError(FullPath, RelPath);
     Exit;
   end;
   if not ReadTextFileSafe(FullPath, Content) then
