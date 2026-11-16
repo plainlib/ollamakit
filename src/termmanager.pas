@@ -1041,10 +1041,9 @@ type
   TShellFamily = (sfCmd, sfUnix, sfPowerShell, sfUnknown);
 const
   // Unix utilities that cmd.exe does not have
-  UNIX_CMDS: array[0..18] of string = (
+  UNIX_CMDS: array[0..15] of string = (
     'ls', 'cat', 'grep', 'head', 'tail', 'rm', 'cp', 'mv',
-    'touch', 'which', 'chmod', 'chown', 'sudo', 'sed', 'awk', 'wc',
-    'find', 'for', 'export');
+    'touch', 'which', 'chmod', 'chown', 'sudo', 'sed', 'awk', 'wc');
   // Windows utilities that Unix shells do not have
   WIN_CMDS: array[0..3] of string = (
     'findstr', 'cls', 'where', 'powershell');
@@ -1074,11 +1073,27 @@ const
       (Pos('&& ' + AName + ' ', Padded) > 0) or (Pos('; ' + AName + ' ', Padded) > 0);
   end;
 
+  // True when the command starts with a listing or search utility
+  function IsListingOrSearchCommand(const ALowCmd: string): boolean;
+  const
+    CMDS: array[0..14] of string = (
+      'dir', 'ls', 'type', 'cat', 'find', 'findstr', 'grep', 'where', 'which',
+      'tree', 'head', 'tail', 'more', 'rg', 'fd');
+  var
+    I: integer;
+  begin
+    Result := False;
+    for I := Low(CMDS) to High(CMDS) do
+      if (ALowCmd = CMDS[I]) or ((Length(ALowCmd) > Length(CMDS[I])) and
+        (Copy(ALowCmd, 1, Length(CMDS[I]) + 1) = CMDS[I] + ' ')) then
+        Exit(True);
+  end;
+
 var
   ExitCode, I: integer;
-  Hint, FoundCmd: string;
+  Hint, FoundCmd, LowCmd: string;
   Family: TShellFamily;
-  EffectiveCmd: string;
+  InQuote: boolean;
 begin
   // When host provided own handler, let it run and skip default execution
   if Assigned(FPrevAgentOnExecCommand) then
@@ -1088,21 +1103,15 @@ begin
   end;
   AAllow := True;
   ExitCode := 0;
-  // Auto-translate Unix null device to Windows nul when using cmd.exe
-  EffectiveCmd := ACommand;
-  if SameText(ExtractFileName(FShellExec), 'cmd.exe') or (FShellExec = '') then
-  begin
-    EffectiveCmd := StringReplace(EffectiveCmd, '/dev/null', 'nul', [rfReplaceAll]);
-    EffectiveCmd := StringReplace(EffectiveCmd, '/dev/zero', 'nul', [rfReplaceAll]);
-  end;
-  AResult := ExecuteCommandCapture(EffectiveCmd, ExitCode, FAgentCommandTimeout);
+  AResult := ExecuteCommandCapture(ACommand, ExitCode, FAgentCommandTimeout);
 
   Hint := '';
   Family := DetectShellFamily(FShellExec);
+
+  // Shell-specific command family mismatches
   case Family of
     sfCmd:
     begin
-      // Unix commands do not exist in cmd.exe, hint the right replacements
       for I := Low(UNIX_CMDS) to High(UNIX_CMDS) do
         if IsCommandToken(ACommand, UNIX_CMDS[I]) then
         begin
@@ -1111,10 +1120,30 @@ begin
             'Use dir instead of ls, type instead of cat, findstr instead of grep, and remove | head / | tail.';
           Break;
         end;
+      // Semicolons are not command separators in cmd.exe
+      if Hint = '' then
+      begin
+        InQuote := False;
+        for I := 1 to Length(ACommand) do
+        begin
+          if ACommand[I] = '"' then
+            InQuote := not InQuote
+          else if (ACommand[I] = ';') and not InQuote then
+          begin
+            Hint := 'Note: cmd.exe does not use ";" to chain commands, it is treated as a literal. ' +
+              'Use "&&" to chain, or run one command per call.';
+            Break;
+          end;
+        end;
+      end;
+      // findstr treats $ and \. literally, not as regex anchors
+      if (Hint = '') and (Pos('findstr', LowerCase(ACommand)) > 0) and ((Pos('$', ACommand) > 0) or
+        (Pos('\.', ACommand) > 0)) then
+        Hint := 'Note: findstr uses limited Windows regex, "$" and "\." are literal characters. ' +
+          'Use the grep tool for text search, it is more reliable.';
     end;
     sfUnix:
     begin
-      // Windows commands do not exist in Unix shells, hint the right replacements
       for I := Low(WIN_CMDS) to High(WIN_CMDS) do
         if IsCommandToken(ACommand, WIN_CMDS[I]) then
         begin
@@ -1128,16 +1157,21 @@ begin
       ; // PowerShell aliases overlap both worlds, no hint to avoid false positives
   end;
 
+  // Universal rule: redirecting listing/search output to files pollutes the workspace
+  if (Hint = '') and (Pos(' > ', ' ' + ACommand + ' ') > 0) then
+  begin
+    LowCmd := LowerCase(TrimLeft(ACommand));
+    if IsListingOrSearchCommand(LowCmd) then
+      Hint := 'Note: do not redirect listing or search output to a file, use list_files, find_files ' +
+        'or grep tools instead. Those return results directly and do not pollute the workspace.';
+  end;
+
   // Make empty output distinguishable from a silent success
   if Trim(AResult) = '' then
     AResult := '(command produced no output, exit code ' + IntToStr(ExitCode) + ')';
 
-  // Detect bash for-loop and other shell constructs that cmd.exe rejects
-  if (Pos('; do ', LowerCase(ACommand)) > 0) or (Pos('; done', LowerCase(ACommand)) > 0) then
-    Hint := 'Note: this shell is cmd.exe, not bash. "for ... do ... done" loops are not supported. ' +
-      'Use "for %I in (list) do command" syntax instead, or separate commands with &&.';
   if Hint <> '' then
-    AResult := Hint + #10 + AResult;
+    AResult := AResult + #10 + Hint;
 end;
 
 procedure TCustomTermManager.HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);

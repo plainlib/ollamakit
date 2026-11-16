@@ -2170,11 +2170,19 @@ begin
     {$ENDIF}
   end;
   EnvironmentBlock := EnvironmentBlock + '- Shell for exec_command: ' + ShellDesc + LineEnding;
-  EnvironmentBlock := EnvironmentBlock + '- Use "nul" instead of "/dev/null" for discarding output on Windows.' + LineEnding;
 
-  // One universal rule: file tools take relative paths, not absolute
+  // Platform-specific shell notes, factual and short
+  {$IFDEF WINDOWS}
+  EnvironmentBlock := EnvironmentBlock +
+    '- Use "nul" instead of "/dev/null" to discard output, ";" does not chain commands, use "&&".' + LineEnding;
+  {$ELSE}
+  EnvironmentBlock := EnvironmentBlock + '- Use "/dev/null" to discard output, ";" and "&&" both chain commands.' + LineEnding;
+  {$ENDIF}
+
+  // Universal rules: prefer dedicated tools over shell for file work
+  EnvironmentBlock := EnvironmentBlock + '- Do NOT redirect listing or search output to files with ">", use list_files, find_files ' +
+    'or grep tools instead. Those tools return results directly and do not pollute the workspace.' + LineEnding;
   EnvironmentBlock := EnvironmentBlock + '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding;
-
   Result := Result + #10#10 + EnvironmentBlock;
 
   // Append the workspace root instruction file when present
