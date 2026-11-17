@@ -185,6 +185,8 @@ type
     FOllamaWaitModel: string;
     FOllamaPullPct: integer;
     FOllamaPullLastStep: integer;
+    FStdOutPending: rawbytestring;
+    FStdErrPending: rawbytestring;
     procedure SetPath(const AValue: string);
     procedure SetAgent(const AValue: TCustomOllamaAgent);
     procedure SetHistory(const AValue: TStringList);
@@ -257,7 +259,7 @@ type
     // Returns True if name is a known shell builtin or PATH executable
     function IsExternalCommand(const AName: string): boolean; virtual;
     // Converts OEM-encoded shell output to UTF-8 and prints it
-    procedure PumpOutput(const AData: rawbytestring; AIsStderr: boolean); virtual;
+    procedure PumpOutput(const AData: rawbytestring; AIsStderr: boolean; AFinal: boolean = False); virtual;
     // Redirects agent streamed chunks to console output
     procedure HandleAgentChunk(Sender: TObject; const AText: string);
     // Closes the active thinking block with a trailing blank line
@@ -457,6 +459,50 @@ begin
   U := C;
   Result := UTF8Encode(U);
   SetCodePage(Result, CP_UTF8, False);
+end;
+
+function IsValidUTF8(const S: rawbytestring): boolean;
+var
+  I, N, J: SizeInt;
+  B, B2: byte;
+begin
+  Result := False;
+  I := 1;
+
+  while I <= Length(S) do
+  begin
+    B := Ord(S[I]);
+
+    if B <= $7F then
+      N := 1
+    else if (B >= $C2) and (B <= $DF) then
+      N := 2
+    else if (B >= $E0) and (B <= $EF) then
+      N := 3
+    else if (B >= $F0) and (B <= $F4) then
+      N := 4
+    else
+      Exit;
+
+    if I + N - 1 > Length(S) then
+      Exit;
+
+    for J := 1 to N - 1 do
+    begin
+      B2 := Ord(S[I + J]);
+
+      if (B2 and $C0) <> $80 then
+        Exit;
+
+      if (J = 1) and (((B = $E0) and (B2 < $A0)) or ((B = $ED) and (B2 >= $A0)) or ((B = $F0) and (B2 < $90)) or
+        ((B = $F4) and (B2 > $8F))) then
+        Exit;
+    end;
+
+    Inc(I, N);
+  end;
+
+  Result := True;
 end;
 
 // Removes emoji and symbol ranges that plain console fonts cannot render
@@ -2638,16 +2684,85 @@ begin
     DoOutput(ListText, False);
 end;
 
-procedure TCustomTermManager.PumpOutput(const AData: rawbytestring; AIsStderr: boolean);
+procedure TCustomTermManager.PumpOutput(const AData: rawbytestring; AIsStderr: boolean; AFinal: boolean);
 var
-  Tmp: rawbytestring;
+  Tmp, Pending: rawbytestring;
+  I, J, TailLength, ProcessLength: SizeInt;
+  B: byte;
 begin
-  if Length(AData) = 0 then
+  if AIsStderr then
+    Pending := FStdErrPending
+  else
+    Pending := FStdOutPending;
+
+  Pending := Pending + AData;
+
+  if Length(Pending) = 0 then
     Exit;
-  // Bytes from cmd.exe are in OEM code page, convert bytes explicitly to UTF-8
-  Tmp := AData;
-  SetCodePage(Tmp, GetConsoleOutputCP, False);
-  SetCodePage(Tmp, CP_UTF8, True);
+
+  TailLength := 0;
+
+  if not AFinal then
+  begin
+    I := Length(Pending);
+
+    while (I > 0) and ((Ord(Pending[I]) and $C0) = $80) and (TailLength < 3) do
+    begin
+      Inc(TailLength);
+      Dec(I);
+    end;
+
+    if I > 0 then
+    begin
+      B := Ord(Pending[I]);
+
+      if (B >= $C2) and (B <= $DF) then
+        J := 2
+      else if (B >= $E0) and (B <= $EF) then
+        J := 3
+      else if (B >= $F0) and (B <= $F4) then
+        J := 4
+      else
+        J := 0;
+
+      if (J > 0) and (Length(Pending) - I + 1 < J) then
+        TailLength := Length(Pending) - I + 1
+      else
+        TailLength := 0;
+    end
+    else
+      TailLength := 0;
+  end;
+
+  ProcessLength := Length(Pending) - TailLength;
+
+  if ProcessLength <= 0 then
+  begin
+    if AIsStderr then
+      FStdErrPending := Pending
+    else
+      FStdOutPending := Pending;
+    Exit;
+  end;
+
+  Tmp := Copy(Pending, 1, ProcessLength);
+  Delete(Pending, 1, ProcessLength);
+
+  if AIsStderr then
+    FStdErrPending := Pending
+  else
+    FStdOutPending := Pending;
+
+  if not IsValidUTF8(Tmp) then
+  begin
+    {$IFDEF WINDOWS}
+    SetCodePage(Tmp, GetOEMCP, False);
+    {$ELSE}
+    SetCodePage(Tmp, DefaultSystemCodePage, False);
+    {$ENDIF}
+    SetCodePage(Tmp, CP_UTF8, True);
+  end;
+
   DoOutput(string(Tmp), AIsStderr);
 end;
 
@@ -2665,6 +2780,8 @@ begin
   Buffer := Default(TTermBuffer);
   if ACommand = '' then
     Exit;
+  FStdOutPending := '';
+  FStdErrPending := '';
   // Drive switch "d:", "d:\", "d:\path" must run in-process
   if (Length(ACommand) >= 2) and (ACommand[2] = ':') and (ACommand[1] in ['a'..'z', 'A'..'Z']) and
     ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) then
@@ -2692,10 +2809,11 @@ begin
     Process.Executable := FShellExec;
     {$IFDEF WINDOWS}
     Process.Parameters.Add('/c');
+    Process.Parameters.Add('chcp 65001 > nul & ' + ACommand);
     {$ELSE}
     Process.Parameters.Add('-c');
-    {$ENDIF}
     Process.Parameters.Add(ACommand);
+    {$ENDIF}
     Process.Options := [poUsePipes, poNoConsole];
     Process.CurrentDirectory := GetEffectivePath;
     Process.Execute;
@@ -2777,6 +2895,9 @@ begin
       end;
     end;
 
+    PumpOutput('', False, True);
+    PumpOutput('', True, True);
+
     Result := Process.ExitStatus;
   finally
     Process.Free;
@@ -2844,10 +2965,11 @@ begin
     Process.Executable := FShellExec;
     {$IFDEF WINDOWS}
     Process.Parameters.Add('/c');
+    Process.Parameters.Add('chcp 65001 > nul & ' + ACommand);
     {$ELSE}
     Process.Parameters.Add('-c');
-    {$ENDIF}
     Process.Parameters.Add(ACommand);
+    {$ENDIF}
     Process.Options := [poUsePipes, poNoConsole];
     Process.CurrentDirectory := GetEffectivePath;
     Process.Execute;
@@ -2874,10 +2996,18 @@ begin
 
     AExitCode := Process.ExitStatus;
 
-    // Convert OEM bytes from shell to UTF-8
     Tmp := Captured;
-    SetCodePage(Tmp, GetConsoleOutputCP, False);
-    SetCodePage(Tmp, CP_UTF8, True);
+
+    if not IsValidUTF8(Tmp) then
+    begin
+      {$IFDEF WINDOWS}
+      SetCodePage(Tmp, GetOEMCP, False);
+      {$ELSE}
+      SetCodePage(Tmp, DefaultSystemCodePage, False);
+      {$ENDIF}
+      SetCodePage(Tmp, CP_UTF8, True);
+    end;
+
     Result := string(Tmp);
   finally
     Process.Free;
