@@ -1514,6 +1514,7 @@ var
   ToolAllowArr: array of boolean;
   AllParallelSafe: boolean;
   Threads: TList;
+  SupportsTools: boolean;
 begin
   Reason := afrError;
   ErrMsg := '';
@@ -1542,14 +1543,22 @@ begin
         Exit;
       end;
 
-      // Verify tool support, degrade to chat-only when unsupported
-      SendTools := FAgent.FFeatures <> [];
-      if SendTools and not FAgent.ModelSupportsTools(ErrMsg) then
+      // Always verify the model is on the server, regardless of tools setting
+      SupportsTools := FAgent.ModelSupportsTools(ErrMsg);
+      if not SupportsTools then
       begin
-        FAgent.LogLine('Warning: ' + ErrMsg + ', continuing without tools');
-        SendTools := False;
-        ErrMsg := '';
+        // Hard fail when the model itself is missing
+        if Pos('is not available on the server', ErrMsg) > 0 then
+        begin
+          Reason := afrModelNotSet;
+          FAgent.LogLine('Abort: ' + ErrMsg);
+          Exit;
+        end;
+        // Model exists but lacks tool support, degrade to chat-only
+        if FAgent.FFeatures <> [] then
+          FAgent.LogLine('Warning: ' + ErrMsg + ', continuing without tools');
       end;
+      SendTools := SupportsTools and (FAgent.FFeatures <> []);
 
       // Always send the system message, BuildSystemPrompt adds platform,
       // workspace and enabled tools even when the user prompt is empty
@@ -1737,11 +1746,17 @@ begin
           FAgent.LogLine('Abort: cancelled during chat');
           Exit;
         end;
+
         if Kind <> oekNone then
         begin
           Reason := afrError;
           if ErrMsg = '' then
             ErrMsg := 'LLM error';
+          // HTTP 404 on chat always means the model is missing, WebStreamRequest
+          // drops the body so the message is just "HTTP 404"
+          if Pos('HTTP 404', ErrMsg) > 0 then
+            ErrMsg := 'Model "' + FAgent.ModelName + '" is not available on the server. ' +
+              'Run "models" to list installed models, or "ollama pull ' + FAgent.ModelName + '" to download it.';
           // Add an actionable hint for the most common context error
           if Pos('context length', LowerCase(ErrMsg)) > 0 then
             ErrMsg := ErrMsg + LineEnding + 'hint: use "cls" to clear history, or "set numctx <larger>" to raise the window';
@@ -2452,7 +2467,18 @@ begin
   end;
   Json := FOllamaManager.ShowModel(FModelName, Kind, ShowErr);
   if Kind <> oekNone then
+  begin
+    // Explicit 404 from /api/show means the model is not on the server
+    if Kind = oekNotFound then
+    begin
+      Result := False;
+      AErrorMsg := 'Model "' + FModelName + '" is not available on the server. ' +
+        'Run "models" to list installed models, or "ollama pull ' + FModelName + '" to download it.';
+      Exit;
+    end;
+    // Transient errors (connection, timeout, server 5xx) leave Result = True
     Exit;
+  end;
   Data := nil;
   try
     try
