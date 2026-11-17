@@ -15,7 +15,7 @@ unit OllamaAgent;
 interface
 
 uses
-  Classes, SysUtils, Controls, fpjson, jsonparser, OllamaManager, Network;
+  Classes, SysUtils, Controls, FileUtil, fpjson, jsonparser, OllamaManager, Network;
 
 type
   // Feature toggles controlled by the Features set property
@@ -358,7 +358,7 @@ type
 implementation
 
 uses
-  FileUtil, Math, RegExpr, Masks;
+  Math, RegExpr, Masks;
 
 // Returns display name for an agent operation kind
 function AgentOpName(AOp: TAgentOperation): string;
@@ -402,32 +402,184 @@ begin
     Result := APath;
 end;
 
-// Reads file as UTF-8 text, returns False on failure
-function ReadTextFileSafe(const APath: string; out AContent: string): boolean;
+// Strict UTF-8 byte validation used by feAuto detection
+function TryDecodeUTF8Strict(const ARaw: TBytes; out AText: unicodestring): boolean;
+var
+  I: integer;
+begin
+  Result := False;
+  AText := '';
+  I := 0;
+  while I < Length(ARaw) do
+  begin
+    if ARaw[I] < $80 then
+      Inc(I)
+    else if (ARaw[I] >= $C2) and (ARaw[I] <= $DF) then
+    begin
+      if (I + 1 >= Length(ARaw)) or (ARaw[I + 1] and $C0 <> $80) then Exit;
+      Inc(I, 2);
+    end
+    else if (ARaw[I] >= $E0) and (ARaw[I] <= $EF) then
+    begin
+      if (I + 2 >= Length(ARaw)) or (ARaw[I + 1] and $C0 <> $80) or (ARaw[I + 2] and $C0 <> $80) then Exit;
+      Inc(I, 3);
+    end
+    else if (ARaw[I] >= $F0) and (ARaw[I] <= $F4) then
+    begin
+      if (I + 3 >= Length(ARaw)) or (ARaw[I + 1] and $C0 <> $80) or (ARaw[I + 2] and $C0 <> $80) or (ARaw[I + 3] and $C0 <> $80) then
+        Exit;
+      Inc(I, 4);
+    end
+    else
+      Exit;
+  end;
+  try
+    AText := TEncoding.UTF8.GetString(ARaw);
+    Result := True;
+  except
+    Result := False;
+  end;
+end;
+
+type
+  // Encoding selector for ReadTextFileSafe
+  TFileEncoding = (feAuto, feUTF8, feANSI, feUTF16LE, feUTF16BE);
+
+function ReadTextFileSafe(const APath: string; out AContent: string; AEncoding: TFileEncoding; AStartLine: integer;
+  AEndLine: integer; AMaxBytes: int64; out ATotalLines: integer; out ABytesRead: int64; out AFileSize: int64): boolean;
 var
   Stream: TFileStream;
-  Raw: rawbytestring;
-  ReadCount: int64;
+  RawBytes: TBytes;
+  Enc: TEncoding;
+  UText: unicodestring;
+  UResult: unicodestring;
+  Probe: unicodestring;
+  Lines: TStringList;
+  I: integer;
 begin
   Result := False;
   AContent := '';
-  Raw := '';
+  ATotalLines := 0;
+  ABytesRead := 0;
+  AFileSize := 0;
+  RawBytes := nil;
+  Enc := nil;
+  UText := '';
+  UResult := '';
+  Probe := '';
+
   if not FileExists(APath) then
     Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+
+  // Read raw bytes from disk, capped by AMaxBytes when set
   try
-    SetLength(Raw, Stream.Size);
-    if Length(Raw) > 0 then
-      ReadCount := Stream.Read(Raw[1], Length(Raw))
-    else
-      ReadCount := 0;
-    SetLength(Raw, ReadCount);
-    SetCodePage(Raw, CP_UTF8, False);
-    AContent := string(Raw);
-    Result := True;
-  finally
-    Stream.Free;
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      AFileSize := Stream.Size;
+      if (AMaxBytes > 0) and (AMaxBytes < AFileSize) then
+        SetLength(RawBytes, AMaxBytes)
+      else
+        SetLength(RawBytes, AFileSize);
+      if Length(RawBytes) > 0 then
+      begin
+        Stream.ReadBuffer(RawBytes[0], Length(RawBytes));
+        ABytesRead := Length(RawBytes);
+      end
+      else
+        ABytesRead := 0;
+      SetLength(RawBytes, ABytesRead);
+    finally
+      Stream.Free;
+    end;
+  except
+    Exit;
   end;
+
+  // Explicit encoding
+  case AEncoding of
+    feUTF8: Enc := TEncoding.UTF8;
+    feANSI: Enc := TEncoding.ANSI;
+    feUTF16LE: Enc := TEncoding.Unicode;
+    feUTF16BE: Enc := TEncoding.BigEndianUnicode;
+  end;
+
+  // BOM detection overrides auto mode
+  if (Enc = nil) and (Length(RawBytes) >= 3) and (RawBytes[0] = $EF) and (RawBytes[1] = $BB) and (RawBytes[2] = $BF) then
+    Enc := TEncoding.UTF8
+  else if (Enc = nil) and (Length(RawBytes) >= 2) and (RawBytes[0] = $FF) and (RawBytes[1] = $FE) then
+    Enc := TEncoding.Unicode
+  else if (Enc = nil) and (Length(RawBytes) >= 2) and (RawBytes[0] = $FE) and (RawBytes[1] = $FF) then
+    Enc := TEncoding.BigEndianUnicode;
+
+  // Auto: strict UTF-8 check, then fall back to system ANSI
+  if Enc = nil then
+  begin
+    if TryDecodeUTF8Strict(RawBytes, Probe) then
+    begin
+      Enc := TEncoding.UTF8;
+      UText := Probe;
+    end
+    else
+      Enc := TEncoding.ANSI;
+  end;
+
+  if UText = '' then
+  begin
+    try
+      UText := Enc.GetString(RawBytes);
+    except
+      Exit;
+    end;
+  end;
+
+  // Strip a leading BOM from the decoded text
+  if (Length(UText) > 0) and (UText[1] = #$FEFF) then
+    Delete(UText, 1, 1);
+
+  Lines := TStringList.Create;
+  try
+    Lines.Text := UTF8Encode(UText);
+    ATotalLines := Lines.Count;
+
+    if (AStartLine >= 1) or (AEndLine >= 1) then
+    begin
+      if AStartLine < 1 then
+        AStartLine := 1;
+      if (AEndLine < 0) or (AEndLine > ATotalLines) then
+        AEndLine := ATotalLines;
+      UResult := '';
+      for I := AStartLine - 1 to AEndLine - 1 do
+      begin
+        if I > AStartLine - 1 then
+          UResult := UResult + #13#10;
+        UResult := UResult + UTF8Decode(Lines[I]);
+      end;
+    end
+    else
+      UResult := UText;
+  finally
+    Lines.Free;
+  end;
+
+  // Encode as UTF-8 bytes into the AnsiString result
+  AContent := string(UTF8Encode(UResult));
+  SetCodePage(rawbytestring(AContent), CP_UTF8, False);
+
+  Result := True;
+end;
+
+function ReadTextFileSafe(const APath: string; out AContent: string; AEncoding: TFileEncoding): boolean;
+var
+  TotalLines: integer;
+  BytesRead: int64;
+  FileSize: int64;
+begin
+  Result := ReadTextFileSafe(APath, AContent, AEncoding, 0, -1, 0, TotalLines, BytesRead, FileSize);
+end;
+
+function ReadTextFileSafe(const APath: string; out AContent: string): boolean;
+begin
+  Result := ReadTextFileSafe(APath, AContent, feAuto);
 end;
 
 // Writes UTF-8 text to file, creates parent directories
@@ -3007,12 +3159,10 @@ const
   HARD_LIMIT_BYTES = 16 * 1024 * 1024;
 var
   RelPath, FullPath: string;
-  Content, Suffix: rawbytestring;
-  Stream: TFileStream;
-  ReadCount: int64;
-  FullSize: int64;
+  Content, Suffix: string;
+  ReadCount, FullSize: int64;
   MaxBytes: int64;
-  I, LinesShown: integer;
+  TotalLines, I, LinesShown: integer;
 begin
   Result := '{"error": "invalid arguments"}';
   Content := '';
@@ -3044,20 +3194,11 @@ begin
     MaxBytes := DEFAULT_MAX_BYTES;
   if (MaxBytes = 0) or (MaxBytes > HARD_LIMIT_BYTES) then
     MaxBytes := HARD_LIMIT_BYTES;
-  Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
-  try
-    FullSize := Stream.Size;
-    // Read bytes directly into the string to avoid TBytes-to-string cast
-    SetLength(Content, Min(FullSize, MaxBytes));
-    if Length(Content) > 0 then
-      ReadCount := Stream.Read(Content[1], Length(Content))
-    else
-      ReadCount := 0;
-    SetLength(Content, ReadCount);
-    // Tag as UTF-8 so JSON encoding does not reinterpret bytes as CP_ACP
-    SetCodePage(Content, CP_UTF8, False);
-  finally
-    Stream.Free;
+  // Unified read, byte-capped before decoding
+  if not ReadTextFileSafe(FullPath, Content, feAuto, 0, -1, MaxBytes, TotalLines, ReadCount, FullSize) then
+  begin
+    Result := '{"error": "cannot read file"}';
+    Exit;
   end;
   // Tell the model how much was shown and where to continue
   if FullSize > ReadCount then
@@ -3070,7 +3211,6 @@ begin
       ' bytes (' + IntToStr(LinesShown) + ' lines, applied max_bytes=' + IntToStr(MaxBytes) + '). ' +
       'Use read_file_lines with start_line=' + IntToStr(LinesShown + 1) + ' to continue reading from where this message left off, ' +
       'or call read_file again with a larger max_bytes value if the file is small]';
-    SetCodePage(Suffix, CP_UTF8, False);
     Content := Content + Suffix;
   end;
   Result := TJSONString.Create(Content).AsJSON;
@@ -3086,10 +3226,11 @@ var
   RelPath, FullPath: string;
   Lines: TStringList;
   TotalLines, HeadCount, TailCount, I, SkippedCount: integer;
-  Size: int64;
+  Size, BytesRead: int64;
   Buf: TStringBuilder;
   Stream: TFileStream;
-  RawBuf: TBytes = ();
+  RawBuf: TBytes = nil;
+  Content: string;
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -3157,20 +3298,15 @@ begin
     TailCount := DEFAULT_TAIL;
   if TailCount > MAX_LINES_PER_EDGE then
     TailCount := MAX_LINES_PER_EDGE;
+  // Unified read, encoding auto-detected
+  if not ReadTextFileSafe(FullPath, Content, feAuto, 0, -1, 0, TotalLines, BytesRead, Size) then
+  begin
+    Result := '{"error": "cannot read file"}';
+    Exit;
+  end;
   Lines := TStringList.Create;
   try
-    try
-      Lines.LoadFromFile(FullPath, TEncoding.UTF8);
-    except
-      // Fall back to system codepage when the file is not valid UTF-8
-      try
-        Lines.LoadFromFile(FullPath);
-      except
-        Result := '{"error": "cannot read file"}';
-        Exit;
-      end;
-    end;
-    TotalLines := Lines.Count;
+    Lines.Text := Content;
     Buf := TStringBuilder.Create;
     try
       Buf.Append('=== File preview: ' + RelPath + ' ===' + #10);
@@ -3439,8 +3575,10 @@ function TCustomOllamaAgent.DoReadFileLines(AArgs: TJSONObject): string;
 var
   RelPath, FullPath: string;
   Lines: TStringList;
-  StartLine, EndLine, I: integer;
+  StartLine, EndLine, TotalLines, I: integer;
   Buf: TStringBuilder;
+  Content: string;
+  BytesRead, FileSize: int64;
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -3469,26 +3607,22 @@ begin
   EndLine := integer(GetIntArg(AArgs, 'end_line', -1));
   if StartLine < 1 then
     StartLine := 1;
+  // Unified read, encoding auto-detected
+  if not ReadTextFileSafe(FullPath, Content, feAuto, 0, -1, 0, TotalLines, BytesRead, FileSize) then
+  begin
+    Result := '{"error": "cannot read file"}';
+    Exit;
+  end;
+  if EndLine < 0 then
+    EndLine := TotalLines
+  else if EndLine > TotalLines then
+    EndLine := TotalLines;
+  // Cap at 5000 lines per call
+  if EndLine - StartLine + 1 > 5000 then
+    EndLine := StartLine + 4999;
   Lines := TStringList.Create;
   try
-    try
-      Lines.LoadFromFile(FullPath, TEncoding.UTF8);
-    except
-      // Fall back to system codepage when the file is not valid UTF-8
-      try
-        Lines.LoadFromFile(FullPath);
-      except
-        Result := '{"error": "cannot read file"}';
-        Exit;
-      end;
-    end;
-    if EndLine < 0 then
-      EndLine := Lines.Count
-    else if EndLine > Lines.Count then
-      EndLine := Lines.Count;
-    // Cap at 5000 lines per call
-    if EndLine - StartLine + 1 > 5000 then
-      EndLine := StartLine + 4999;
+    Lines.Text := Content;
     Buf := TStringBuilder.Create;
     try
       for I := StartLine - 1 to EndLine - 1 do
@@ -3498,7 +3632,7 @@ begin
           Buf.Append(LineEnding);
       end;
       Result := '{"content": ' + TJSONString.Create(Buf.ToString).AsJSON + ', "total_lines": ' +
-        IntToStr(Lines.Count) + ', "shown_from": ' + IntToStr(StartLine) + ', "shown_to": ' + IntToStr(EndLine) + '}';
+        IntToStr(TotalLines) + ', "shown_from": ' + IntToStr(StartLine) + ', "shown_to": ' + IntToStr(EndLine) + '}';
     finally
       Buf.Free;
     end;
