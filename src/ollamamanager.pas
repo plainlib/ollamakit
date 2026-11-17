@@ -12,7 +12,7 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Menus, Dialogs, ExtCtrls, fpjson, jsonparser,
-  Network, StringHelper, httpsend, blcksock;
+  Network, StringHelper, httpsend, blcksock, Clipbrd;
 
 type
   { Error kind reported by TOllamaErrorEvent }
@@ -44,6 +44,9 @@ type
   TConnectingEvent = procedure(Sender: TObject) of object;
   { Event fired after a successful refresh/connection }
   TConnectedEvent = procedure(Sender: TObject) of object;
+  // Occurs when a model start or stop operation completes.
+  // Success indicates whether the operation completed successfully.
+  TModelOperationEvent = procedure(Sender: TObject; const ModelName: string; Success: boolean; const ErrorMsg: string) of object;
 
   { Background operation kinds }
   TOllamaBgOp = (boPull, boStart, boStop, boRefresh);
@@ -104,6 +107,7 @@ type
     FAutoRefresh: boolean;
     FConnectionTimeout: integer;
     FRequestTimeout: integer;
+    FModelTimeout: integer;
     FPullTimeout: integer;
     FMenuSections: TOllamaMenuSections;
 
@@ -112,6 +116,8 @@ type
     FOnPullProgress: TPullProgressEvent;
     FOnConnecting: TConnectingEvent;
     FOnConnected: TConnectedEvent;
+    FOnModelStart: TModelOperationEvent;
+    FOnModelStop: TModelOperationEvent;
 
     // Internal state
     FInstalledModels: TStringList;
@@ -141,9 +147,10 @@ type
 
     // HTTP helpers, none of these raise exceptions
     function DoRequest(AMethod: TWebMethod; const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind;
-      out ErrorMsg: string): string;
+      out ErrorMsg: string; ARequestTimeout: integer = 0): string;
     function ApiGet(const Endpoint: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
-    function ApiPost(const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+    function ApiPost(const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind; out ErrorMsg: string;
+      ARequestTimeout: integer = 0): string;
     function RawDelete(const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
     function ParseModels(const JsonStr: string; ADetails: TStringList): TStringList;
     function IsCloudModel(const ModelName: string): boolean;
@@ -166,6 +173,7 @@ type
     procedure MenuStartClick(Sender: TObject);
     procedure MenuStopClick(Sender: TObject);
     procedure MenuDeleteClick(Sender: TObject);
+    procedure MenuCopyNameClick(Sender: TObject);
     procedure MenuInfoClick(Sender: TObject);
     procedure MenuReconnectClick(Sender: TObject);
     procedure MenuConnectClick(Sender: TObject);
@@ -236,7 +244,7 @@ type
     function UnloadModelSync(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
 
     // Called by the background thread via Synchronize
-    procedure BgFinished(const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
+    procedure BgFinished(AOp: TOllamaBgOp; const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
     procedure UnregisterThread(AThread: TThread);
 
     // Resets usage counters to zero
@@ -271,6 +279,8 @@ type
     property OnPullProgress: TPullProgressEvent read FOnPullProgress write FOnPullProgress;
     property OnConnecting: TConnectingEvent read FOnConnecting write FOnConnecting;
     property OnConnected: TConnectedEvent read FOnConnected write FOnConnected;
+    property OnModelStart: TModelOperationEvent read FOnModelStart write FOnModelStart;
+    property OnModelStop: TModelOperationEvent read FOnModelStop write FOnModelStop;
   end;
 
   { TOllamaManager }
@@ -291,6 +301,8 @@ type
     property AutoRefresh;
     // Connection timeout in milliseconds, applied while establishing the connection
     property ConnectionTimeout;
+    // Maximum time in milliseconds to wait for a model start or stop operation.
+    property ModelTimeout: integer read FModelTimeout write FModelTimeout default 300000;
     // Timeout in milliseconds for regular API requests
     property RequestTimeout;
     // Per-chunk timeout in milliseconds during pull, 0 means use RequestTimeout
@@ -307,6 +319,10 @@ type
     property OnConnecting;
     // Fired after the model list has been successfully refreshed
     property OnConnected;
+    // Occurs when a model start operation completes.
+    property OnModelStart;
+    // Occurs when a model stop operation completes.
+    property OnModelStop;
   end;
 
 implementation
@@ -317,6 +333,7 @@ resourcestring
   rsStartMenu = 'Start';
   rsStopMenu = 'Stop';
   rsDeleteMenu = 'Delete';
+  rsCopyNameMenu = 'Copy Name';
   rsInfoMenu = 'Info...';
   rsLoadingModel = 'Loading %s...';
   rsLoadingModelPercent = 'Loading %s... %d%%';
@@ -504,12 +521,12 @@ begin
         boStart:
         begin
           JsonBody := Format('{"model":"%s","prompt":"","keep_alive":%d,"stream":false}', [FModelName, FManager.KeepAlive]);
-          FManager.ApiPost('/api/generate', JsonBody, FErrorKind, FErrorMsg);
+          FManager.ApiPost('/api/generate', JsonBody, FErrorKind, FErrorMsg, FManager.FModelTimeout);
         end;
         boStop:
         begin
           JsonBody := Format('{"model":"%s","prompt":"","keep_alive":0,"stream":false}', [FModelName]);
-          FManager.ApiPost('/api/generate', JsonBody, FErrorKind, FErrorMsg);
+          FManager.ApiPost('/api/generate', JsonBody, FErrorKind, FErrorMsg, FManager.FModelTimeout);
         end;
         boRefresh:
         begin
@@ -544,7 +561,7 @@ begin
   if FOp = boRefresh then
     Mgr.ProcessRefreshData(FTagsJson, FPsJson, FErrorKind, FErrorMsg, FGen)
   else
-    Mgr.BgFinished(FModelName, FErrorKind, FErrorMsg);
+    Mgr.BgFinished(FOp, FModelName, FErrorKind, FErrorMsg);
 end;
 
 { TCustomOllamaManager }
@@ -560,6 +577,7 @@ begin
   FAutoRefresh := True;
   FConnectionTimeout := 5000;
   FRequestTimeout := 30000;
+  FModelTimeout := 300000;
   FPullTimeout := 0;
   FMenuSections := [msPull, msServer, msModels, msConnect];
   FConnecting := False;
@@ -1007,9 +1025,10 @@ begin
     BuildPopupMenu;
 end;
 
-procedure TCustomOllamaManager.BgFinished(const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
+procedure TCustomOllamaManager.BgFinished(AOp: TOllamaBgOp; const ModelName: string; Kind: TOllamaErrorKind; const ErrorMsg: string);
 var
   Idx: integer;
+  Success: boolean;
 begin
   if FShutdown then
     Exit;
@@ -1030,10 +1049,28 @@ begin
   if Idx >= 0 then
     FStartingProgress.Delete(Idx);
 
+  Success := Kind = oekNone;
+
   if Kind <> oekNone then
     DoError(Kind, ModelName, ErrorMsg);
 
-  // Refresh the model list in the background
+  case AOp of
+    boStart:
+      if Assigned(FOnModelStart) then
+      try
+        FOnModelStart(Self, ModelName, Success, ErrorMsg);
+      except
+        ; // Ignore user handler exceptions
+      end;
+    boStop:
+      if Assigned(FOnModelStop) then
+      try
+        FOnModelStop(Self, ModelName, Success, ErrorMsg);
+      except
+        ; // Ignore user handler exceptions
+      end;
+  end;
+
   BeginConnect;
 
   if (FStartingModels.Count = 0) and Assigned(FProgressTimer) then
@@ -1272,6 +1309,12 @@ begin
             ModelItem.Add(SubItem);
 
             SubItem := TMenuItem.Create(ModelItem);
+            SubItem.Caption := rsCopyNameMenu;
+            SubItem.Hint := ModelName;
+            SubItem.OnClick := @MenuCopyNameClick;
+            ModelItem.Add(SubItem);
+
+            SubItem := TMenuItem.Create(ModelItem);
             SubItem.Caption := rsInfoMenu;
             SubItem.Hint := ModelName;
             SubItem.OnClick := @MenuInfoClick;
@@ -1301,6 +1344,12 @@ begin
             SubItem.Caption := rsDeleteMenu;
             SubItem.Hint := ModelName;
             SubItem.OnClick := @MenuDeleteClick;
+            ModelItem.Add(SubItem);
+
+            SubItem := TMenuItem.Create(ModelItem);
+            SubItem.Caption := rsCopyNameMenu;
+            SubItem.Hint := ModelName;
+            SubItem.OnClick := @MenuCopyNameClick;
             ModelItem.Add(SubItem);
 
             SubItem := TMenuItem.Create(ModelItem);
@@ -1630,7 +1679,7 @@ begin
 end;
 
 function TCustomOllamaManager.DoRequest(AMethod: TWebMethod; const Endpoint, JsonBody: string;
-  out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+  out Kind: TOllamaErrorKind; out ErrorMsg: string; ARequestTimeout: integer): string;
 const
   // Connection and timeout failures are retried, HTTP errors are not
   MAX_ATTEMPTS = 3;
@@ -1665,7 +1714,10 @@ begin
   HTTP := nil;
 
   Tm.Connection := FConnectionTimeout;
-  Tm.Request := FRequestTimeout;
+  if ARequestTimeout > 0 then
+    Tm.Request := ARequestTimeout
+  else
+    Tm.Request := FRequestTimeout;
 
   if AMethod = wmPost then
     ContentType := 'application/json'
@@ -1781,9 +1833,10 @@ begin
   Result := DoRequest(wmGet, Endpoint, '', Kind, ErrorMsg);
 end;
 
-function TCustomOllamaManager.ApiPost(const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): string;
+function TCustomOllamaManager.ApiPost(const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind;
+  out ErrorMsg: string; ARequestTimeout: integer): string;
 begin
-  Result := DoRequest(wmPost, Endpoint, JsonBody, Kind, ErrorMsg);
+  Result := DoRequest(wmPost, Endpoint, JsonBody, Kind, ErrorMsg, ARequestTimeout);
 end;
 
 function TCustomOllamaManager.RawDelete(const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
@@ -1891,6 +1944,14 @@ begin
   ModelName := Item.Hint;
   if MessageDlg(Format(rsDeleteConfirm, [ModelName]), mtConfirmation, [mbYes, mbNo], 0) = mrYes then
     DeleteModel(ModelName);
+end;
+
+procedure TCustomOllamaManager.MenuCopyNameClick(Sender: TObject);
+var
+  Item: TMenuItem;
+begin
+  Item := TMenuItem(Sender);
+  Clipboard.AsText := Item.Hint;
 end;
 
 procedure TCustomOllamaManager.MenuInfoClick(Sender: TObject);
