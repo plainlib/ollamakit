@@ -247,6 +247,8 @@ type
     procedure EmitToolResult(const AName, AResult: string); virtual;
     // Resolves placeholders in SystemPrompt using current values
     function BuildSystemPrompt: string; virtual;
+    // Resolves model context window size and updates ContextTotal
+    procedure RefreshContextInfo;
     // Resets usage counters in the manager and this agent
     procedure ResetUsage;
 
@@ -262,7 +264,7 @@ type
     property AgentsFileName: string read FAgentsFileName write FAgentsFileName;
     property History: string read GetHistory write SetHistory;
     property ContextUsed: integer read FContextUsed;
-    property ContextTotal: integer read FContextTotal;
+    property ContextTotal: integer read FContextTotal write FContextTotal;
     property ContextPercent: integer read GetContextPercent;
     property ContextUsedKb: integer read GetContextUsedKb;
     property ContextTotalKb: integer read GetContextTotalKb;
@@ -2306,6 +2308,25 @@ begin
     Result := Result + #10 + 'When read_file returns a truncation notice, use read_file_lines with ' +
       'start_line and end_line to read further parts of the file in chunks. ' +
       'Do not give up on large files, read them in sections until you have the ' + 'content you need.';
+end;
+
+procedure TCustomOllamaAgent.RefreshContextInfo;
+var
+  ResolvedCtx: int64;
+begin
+  FContextTotal := 0;
+  if not Assigned(FOllamaManager) then
+    Exit;
+  if Trim(FModelName) = '' then
+    Exit;
+  if FOllamaManager.NumCtx > 0 then
+  begin
+    FContextTotal := FOllamaManager.NumCtx;
+    Exit;
+  end;
+  ResolvedCtx := FOllamaManager.GetModelContextLength(FModelName);
+  if ResolvedCtx > 0 then
+    FContextTotal := ResolvedCtx;
 end;
 
 procedure TCustomOllamaAgent.ResetUsage;
