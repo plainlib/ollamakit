@@ -168,6 +168,10 @@ type
     FLoadAgentsMd: boolean;
     // File name for project instruction files, standard is AGENTS.md
     FAgentsFileName: string;
+    // Allow file tools to reach any path on the system, disable to sandbox to RootPath
+    FAllowAccessToSystem: boolean;
+    // Reject access to well-known secret files like .ssh/, .env, *.key
+    FBlockSensitiveFiles: boolean;
     procedure SetOllamaManager(const AValue: TOllamaManager);
     procedure SetTools(const AValue: TAgentTools);
     procedure SetWebOptions(const AValue: TAgentWebOptions);
@@ -184,6 +188,10 @@ type
     function GetEffectiveRootPath: string; virtual;
     // Resolves a relative path inside RootPath, returns '' when escaping
     function SafePath(const ARelPath: string): string; virtual;
+    // Builds the JSON error for a rejected path, depends on sandbox mode
+    function SafePathError: string; virtual;
+    // Unified URL check used by web_fetch and web_search
+    function CheckUrlSafety(const AUrl: string; out AErrorMsg: string): boolean; virtual;
     // Builds a file-not-found error with similar names from the same directory
     function BuildFileNotFoundError(const AFullPath, ARelPath: string): string; virtual;
     // Built-in tool implementations, invoked from DispatchTool
@@ -262,6 +270,10 @@ type
     property LoadAgentsMd: boolean read FLoadAgentsMd write FLoadAgentsMd default True;
     // Instruction file name, looked up in the root and in subdirectories
     property AgentsFileName: string read FAgentsFileName write FAgentsFileName;
+    // Allow file tools to reach any path on the system, False sandboxes to RootPath
+    property AllowAccessToSystem: boolean read FAllowAccessToSystem write FAllowAccessToSystem default True;
+    // Deny access to well-known secret files (.ssh/, .env, *.key, id_rsa, ...)
+    property BlockSensitiveFiles: boolean read FBlockSensitiveFiles write FBlockSensitiveFiles default True;
     property History: string read GetHistory write SetHistory;
     property ContextUsed: integer read FContextUsed;
     property ContextTotal: integer read FContextTotal write FContextTotal;
@@ -321,6 +333,10 @@ type
     property LoadAgentsMd;
     // Instruction file name, looked up in the root and in subdirectories
     property AgentsFileName;
+    // When False, file tools are sandboxed to RootPath, absolute paths are rejected
+    property AllowAccessToSystem;
+    // Deny access to well-known secret files like .ssh/, .env, *.key, id_rsa
+    property BlockSensitiveFiles;
     // When True, the agent logs every step and event to stderr
     property Log;
     // Emit tool result previews through the log channel, truncated to 500 chars
@@ -490,43 +506,129 @@ begin
   end;
 end;
 
-// Returns True for localhost names and loopback addresses
-function IsLocalhostHost(const AHost: string): boolean;
+// Parses an IPv4 dotted quad, returns False on malformed input
+function ParseIPv4(const AHost: string; out O1, O2, O3, O4: integer): boolean;
 var
-  H: string;
-begin
-  H := LowerCase(Trim(AHost));
-  Result := (H = 'localhost') or (H = 'localhost.localdomain') or (H = '127.0.0.1') or (H = '0.0.0.0') or
-    (H = '::1') or (Copy(H, 1, 4) = '127.');
-end;
-
-// Returns True for RFC1918 private and link-local IPv4 addresses
-function IsPrivateIPv4(const AHost: string): boolean;
-var
-  Octet1, Octet2, P: integer;
-  Rest: string;
+  Parts: array[0..3] of integer;
+  S: string;
+  P, I: integer;
 begin
   Result := False;
-  P := Pos('.', AHost);
-  if P = 0 then
-    Exit;
-  Octet1 := StrToIntDef(Copy(AHost, 1, P - 1), -1);
-  if Octet1 < 0 then
-    Exit;
-  Rest := Copy(AHost, P + 1, MaxInt);
-  P := Pos('.', Rest);
-  if P = 0 then
-    Exit;
-  Octet2 := StrToIntDef(Copy(Rest, 1, P - 1), -1);
-  if Octet2 < 0 then
-    Exit;
-  if Octet1 = 10 then
+  O1 := -1;
+  O2 := -1;
+  O3 := -1;
+  O4 := -1;
+  S := AHost;
+  for I := 0 to 3 do
+  begin
+    P := Pos('.', S);
+    if P = 0 then
+    begin
+      if I <> 3 then
+        Exit;
+      Parts[I] := StrToIntDef(S, -1);
+    end
+    else
+    begin
+      if I = 3 then
+        Exit;
+      Parts[I] := StrToIntDef(Copy(S, 1, P - 1), -1);
+      S := Copy(S, P + 1, MaxInt);
+    end;
+    if (Parts[I] < 0) or (Parts[I] > 255) then
+      Exit;
+  end;
+  O1 := Parts[0];
+  O2 := Parts[1];
+  O3 := Parts[2];
+  O4 := Parts[3];
+  Result := True;
+end;
+
+// Returns True for localhost names, loopback and unspecified addresses
+function IsLocalhostAddress(const AHost: string): boolean;
+var
+  H: string;
+  O1, O2, O3, O4: integer;
+begin
+  Result := False;
+  H := LowerCase(Trim(AHost));
+  if (H = 'localhost') or (H = 'localhost.localdomain') then
     Exit(True);
-  if (Octet1 = 172) and (Octet2 >= 16) and (Octet2 <= 31) then
+  // IPv6 loopback and unspecified
+  if (H = '::1') or (H = '::') then
     Exit(True);
-  if (Octet1 = 192) and (Octet2 = 168) then
+  // IPv4-mapped IPv6 pointing at loopback
+  if Copy(H, 1, 7) = '::ffff:' then
+    Exit(IsLocalhostAddress(Copy(H, 8, MaxInt)));
+  // IPv4 loopback and "this network"
+  if ParseIPv4(H, O1, O2, O3, O4) then
+    if (O1 = 0) or (O1 = 127) then
+      Exit(True);
+end;
+
+// Returns True for RFC1918, CGNAT, link-local, multicast and reserved ranges
+function IsPrivateAddress(const AHost: string): boolean;
+var
+  H, FirstWord, Embedded: string;
+  O1, O2, O3, O4: integer;
+  P: integer;
+begin
+  Result := False;
+  H := LowerCase(Trim(AHost));
+  // Strip IPv6 zone ID like %eth0
+  P := Pos('%', H);
+  if P > 0 then
+    H := Copy(H, 1, P - 1);
+  // IPv4-mapped IPv6, recurse on the embedded IPv4
+  if Copy(H, 1, 7) = '::ffff:' then
+  begin
+    Embedded := Copy(H, 8, MaxInt);
+    Exit(IsPrivateAddress(Embedded));
+  end;
+  if ParseIPv4(H, O1, O2, O3, O4) then
+  begin
+    if O1 = 10 then
+      Exit(True);
+    // 100.64.0.0/10 carrier-grade NAT
+    if (O1 = 100) and (O2 >= 64) and (O2 <= 127) then
+      Exit(True);
+    // 169.254.0.0/16 link-local
+    if (O1 = 169) and (O2 = 254) then
+      Exit(True);
+    // 172.16.0.0/12 private
+    if (O1 = 172) and (O2 >= 16) and (O2 <= 31) then
+      Exit(True);
+    // 192.168.0.0/16 private
+    if (O1 = 192) and (O2 = 168) then
+      Exit(True);
+    // 198.18.0.0/15 benchmark
+    if (O1 = 198) and (O2 >= 18) and (O2 <= 19) then
+      Exit(True);
+    // 224.0.0.0/4 multicast
+    if (O1 >= 224) and (O1 <= 239) then
+      Exit(True);
+    // 240.0.0.0/4 reserved, includes 255.255.255.255
+    if O1 >= 240 then
+      Exit(True);
+    Exit;
+  end;
+  // IPv6: take the first hex group
+  P := Pos(':', H);
+  if P > 0 then
+    FirstWord := Copy(H, 1, P - 1)
+  else
+    FirstWord := H;
+  if FirstWord = '' then
+    Exit;
+  // Link-local fe80::/10, first group fe80 to febf
+  if (Length(FirstWord) >= 3) and (Copy(FirstWord, 1, 2) = 'fe') and (FirstWord[3] in ['8', '9', 'a', 'b']) then
     Exit(True);
-  if (Octet1 = 169) and (Octet2 = 254) then
+  // Unique local fc00::/7
+  if (Length(FirstWord) >= 2) and ((Copy(FirstWord, 1, 2) = 'fc') or (Copy(FirstWord, 1, 2) = 'fd')) then
+    Exit(True);
+  // Multicast ff00::/8
+  if (Length(FirstWord) >= 2) and (Copy(FirstWord, 1, 2) = 'ff') then
     Exit(True);
 end;
 
@@ -538,17 +640,28 @@ var
 begin
   Result := False;
   AHost := '';
-  U := LowerCase(Trim(AUrl));
-  if Copy(U, 1, 7) = 'http://' then
+  U := Trim(AUrl);
+  if Copy(LowerCase(U), 1, 7) = 'http://' then
     U := Copy(U, 8, MaxInt)
-  else if Copy(U, 1, 8) = 'https://' then
+  else if Copy(LowerCase(U), 1, 8) = 'https://' then
     U := Copy(U, 9, MaxInt)
   else
     Exit;
+  // IPv6 literal in brackets: [::1], [2001:db8::1]:8080
+  if (Length(U) > 0) and (U[1] = '[') then
+  begin
+    P := Pos(']', U);
+    if P = 0 then
+      Exit;
+    AHost := LowerCase(Copy(U, 2, P - 2));
+    Result := AHost <> '';
+    Exit;
+  end;
+  // IPv4 or hostname, stop at port, path or query
   P := 1;
   while (P <= Length(U)) and not (U[P] in ['/', '?', '#', ':']) do
     Inc(P);
-  AHost := Copy(U, 1, P - 1);
+  AHost := LowerCase(Copy(U, 1, P - 1));
   Result := AHost <> '';
 end;
 
@@ -1032,6 +1145,29 @@ begin
     end;
   end;
   Result := Prev[Length(S2)];
+end;
+
+// Returns True for well-known secret files that should not be exposed to the LLM
+function IsSensitiveFile(const AFullPath: string): boolean;
+var
+  Low, Name, Ext: string;
+begin
+  Result := False;
+  Low := '/' + LowerCase(StringReplace(AFullPath, '\', '/', [rfReplaceAll])) + '/';
+  // Credential directories anywhere in the path
+  if (Pos('/.ssh/', Low) > 0) or (Pos('/.aws/', Low) > 0) or (Pos('/.gnupg/', Low) > 0) then
+    Exit(True);
+  Name := LowerCase(ExtractFileName(AFullPath));
+  Ext := LowerCase(ExtractFileExt(AFullPath));
+  // Private key and certificate containers
+  if (Ext = '.key') or (Ext = '.pfx') or (Ext = '.p12') or (Ext = '.pem') then
+    Exit(True);
+  // Environment files
+  if (Name = '.env') or (Copy(Name, 1, 5) = '.env.') then
+    Exit(True);
+  // SSH private keys without extension
+  if (Name = 'id_rsa') or (Name = 'id_ed25519') or (Name = 'id_ecdsa') or (Name = 'id_dsa') then
+    Exit(True);
 end;
 
 { TAgentWebOptions }
@@ -2095,6 +2231,8 @@ begin
   FExecShellInfo := '';
   FLoadAgentsMd := True;
   FAgentsFileName := 'AGENTS.md';
+  FAllowAccessToSystem := True;
+  FBlockSensitiveFiles := True;
   FCapabilitiesCache := TStringList.Create;
   FCapabilitiesCache.NameValueSeparator := '=';
   FTools := TAgentTools.Create(Self);
@@ -2443,9 +2581,22 @@ begin
     Full := ExpandFileName(Normalized)
   else
     Full := ExpandFileName(Root + Normalized);
-  // Compare with trailing delimiter so '.' resolves to root itself
-  if Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(Full))) = 1 then
-    Result := Full;
+  // Sandbox mode, path must stay inside RootPath, compare with trailing
+  // delimiter so '.' resolves to root itself
+  if (not FAllowAccessToSystem) and (Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(Full))) <> 1) then
+    Exit;
+  // Sensitive file protection applies in both modes
+  if FBlockSensitiveFiles and IsSensitiveFile(Full) then
+    Exit;
+  Result := Full;
+end;
+
+function TCustomOllamaAgent.SafePathError: string;
+begin
+  if FAllowAccessToSystem then
+    Result := '{"error": "path is blocked, it matches a sensitive file pattern"}'
+  else
+    Result := '{"error": "path outside workspace or blocked, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
 end;
 
 function TCustomOllamaAgent.ModelSupportsTools(out AErrorMsg: string): boolean;
@@ -2880,7 +3031,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if DirectoryExists(FullPath) then
@@ -2956,7 +3107,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if DirectoryExists(FullPath) then
@@ -3101,7 +3252,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   try
@@ -3140,7 +3291,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not DirectoryExists(FullPath) then
@@ -3214,7 +3365,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not DirectoryExists(FullPath) then
@@ -3307,7 +3458,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if DirectoryExists(FullPath) then
@@ -3387,7 +3538,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not FileExists(FullPath) then
@@ -3453,7 +3604,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not FileExists(FullPath) then
@@ -3485,7 +3636,7 @@ begin
   DstFull := SafePath(DstRel);
   if (SrcFull = '') or (DstFull = '') then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not FileExists(SrcFull) then
@@ -3525,7 +3676,7 @@ begin
   DstFull := SafePath(DstRel);
   if (SrcFull = '') or (DstFull = '') then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not FileExists(SrcFull) then
@@ -3567,7 +3718,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   Res := FindFirst(FullPath, faAnyFile, Info);
@@ -3598,7 +3749,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if DirectoryExists(FullPath) then
@@ -3652,7 +3803,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not DirectoryExists(FullPath) then
@@ -3824,7 +3975,7 @@ begin
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
-    Result := '{"error": "path outside workspace, workspace is ' + GetEffectiveRootPath + ', use relative paths"}';
+    Result := SafePathError;
     Exit;
   end;
   if not FileExists(FullPath) and not DirectoryExists(FullPath) then
@@ -3945,7 +4096,7 @@ begin
   // Refuse paths outside the workspace
   if Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(SearchPath))) <> 1 then
   begin
-    Result := '{"error": "path outside workspace"}';
+    Result := SafePathError;
     Exit;
   end;
   // Walk up the tree for the nearest AGENTS.md within the workspace
@@ -4098,6 +4249,39 @@ begin
     Result := '{"error": "user cancelled the question"}';
 end;
 
+function TCustomOllamaAgent.CheckUrlSafety(const AUrl: string; out AErrorMsg: string): boolean;
+var
+  Host: string;
+begin
+  Result := False;
+  AErrorMsg := '';
+  if not IsSafeHttpUrl(AUrl, Host) then
+  begin
+    AErrorMsg := 'only http and https urls are allowed';
+    Exit;
+  end;
+  // Whitelist takes priority when configured
+  if FWebOptions.AllowedHosts.Count > 0 then
+  begin
+    if FWebOptions.AllowedHosts.IndexOf(Host) < 0 then
+    begin
+      AErrorMsg := 'host not in allowed list: ' + Host;
+      Exit;
+    end;
+  end;
+  if FWebOptions.BlockLocalhost and IsLocalhostAddress(Host) then
+  begin
+    AErrorMsg := 'localhost access is blocked: ' + Host;
+    Exit;
+  end;
+  if FWebOptions.BlockPrivateIPs and IsPrivateAddress(Host) then
+  begin
+    AErrorMsg := 'private address access is blocked: ' + Host;
+    Exit;
+  end;
+  Result := True;
+end;
+
 function TCustomOllamaAgent.DoWebFetchInternal(const AUrl: string; out AContent, AErrorMsg: string): boolean;
 var
   Headers, Cookies, ResponseHeaders: TStringList;
@@ -4142,7 +4326,7 @@ end;
 
 function TCustomOllamaAgent.DoWebFetch(AArgs: TJSONObject): string;
 var
-  Url, Host, Content, ErrorMsg: string;
+  Url, Content, ErrorMsg: string;
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -4153,28 +4337,9 @@ begin
     Result := '{"error": "url required"}';
     Exit;
   end;
-  if not IsSafeHttpUrl(Url, Host) then
+  if not CheckUrlSafety(Url, ErrorMsg) then
   begin
-    Result := '{"error": "only http and https urls are allowed"}';
-    Exit;
-  end;
-  // Whitelist takes priority when configured
-  if FWebOptions.AllowedHosts.Count > 0 then
-  begin
-    if FWebOptions.AllowedHosts.IndexOf(Host) < 0 then
-    begin
-      Result := '{"error": "host not in allowed list: ' + Host + '"}';
-      Exit;
-    end;
-  end;
-  if FWebOptions.BlockLocalhost and IsLocalhostHost(Host) then
-  begin
-    Result := '{"error": "localhost access is blocked"}';
-    Exit;
-  end;
-  if FWebOptions.BlockPrivateIPs and IsPrivateIPv4(Host) then
-  begin
-    Result := '{"error": "private ip access is blocked"}';
+    Result := '{"error": ' + TJSONString.Create(ErrorMsg).AsJSON + '}';
     Exit;
   end;
   // Skip request entirely when cancellation is already requested
@@ -4217,6 +4382,12 @@ begin
     Exit;
   end;
   Url := StringReplace(Template, '{query}', UrlEncode(Query), [rfReplaceAll]);
+  // Apply the same safety checks as web_fetch, search URL comes from config
+  if not CheckUrlSafety(Url, ErrorMsg) then
+  begin
+    Result := '{"error": ' + TJSONString.Create(ErrorMsg).AsJSON + '}';
+    Exit;
+  end;
   // Skip request entirely when cancellation is already requested
   if FCancelled then
   begin
