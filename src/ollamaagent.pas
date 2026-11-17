@@ -262,17 +262,11 @@ type
 
     property Done: boolean read FDone;
     property FinalAnswer: string read FFinalAnswer;
-    // Context text placed before the next user message, cleared after the run
     property ContextPrelude: string read FContextPrelude write FContextPrelude;
-    // Shell executable name for exec_command, injected into the system prompt
     property ExecShellInfo: string read FExecShellInfo write FExecShellInfo;
-    // Load workspace root AGENTS.md into the system prompt
     property LoadAgentsMd: boolean read FLoadAgentsMd write FLoadAgentsMd default True;
-    // Instruction file name, looked up in the root and in subdirectories
     property AgentsFileName: string read FAgentsFileName write FAgentsFileName;
-    // Allow file tools to reach any path on the system, False sandboxes to RootPath
     property AllowAccessToSystem: boolean read FAllowAccessToSystem write FAllowAccessToSystem default True;
-    // Deny access to well-known secret files (.ssh/, .env, *.key, id_rsa, ...)
     property BlockSensitiveFiles: boolean read FBlockSensitiveFiles write FBlockSensitiveFiles default True;
     property History: string read GetHistory write SetHistory;
     property ContextUsed: integer read FContextUsed;

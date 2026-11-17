@@ -248,9 +248,7 @@ type
     // Quick TCP-only reachability check, no HTTP, no SSL, no locks
     function CheckServerReachableQuick(ATimeoutMs: integer = 500): boolean;
 
-    // Currently installed models as reported by the last refresh
     property InstalledModels: TStringList read FInstalledModels;
-    // Currently loaded models as reported by the last refresh
     property RunningModels: TStringList read FRunningModels;
     property BaseURL: string read FBaseURL write SetBaseURL;
     property PopupMenu: TPopupMenu read FPopupMenu write SetPopupMenu;
@@ -258,18 +256,13 @@ type
     property IsConnected: boolean read FConnected;
     property IsConnecting: boolean read FConnecting;
     property KeepAlive: integer read FKeepAlive write FKeepAlive default -1;
-    // num_ctx value sent with requests, 0 means use Ollama default
     property NumCtx: integer read FNumCtx write FNumCtx default 0;
-    // Prompt tokens reported by the last completed request
     property LastPromptEvalCount: integer read FLastPromptEvalCount;
-    // Generated tokens reported by the last completed request
     property LastEvalCount: integer read FLastEvalCount;
-    // Sum of prompt and generated tokens from the last request
     property LastUsageTotal: integer read GetLastUsageTotal;
     property AutoRefresh: boolean read FAutoRefresh write FAutoRefresh default True;
     property ConnectionTimeout: integer read FConnectionTimeout write FConnectionTimeout default 5000;
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 30000;
-    // Per-chunk timeout in milliseconds during pull, 0 means use RequestTimeout
     property PullTimeout: integer read FPullTimeout write FPullTimeout default 0;
     property MenuSections: TOllamaMenuSections read FMenuSections write SetMenuSections default [msPull, msServer, msModels, msConnect];
 
@@ -304,7 +297,6 @@ type
     property PullTimeout;
     // Sections of the popup menu shown to the user; clear a flag to hide it
     property MenuSections;
-
     // Fired after the installed model list has been refreshed
     property OnModelsRefreshed;
     // Fired for any API or connection error; never raises
@@ -2272,8 +2264,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2341,8 +2333,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
