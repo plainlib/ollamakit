@@ -1496,7 +1496,7 @@ var
   Kind: TOllamaErrorKind;
   Allow: boolean;
   Reason: TAgentFinishReason;
-  Data, MessageData, ToolCallsData, FuncData, ArgsData, FinishData: TJSONData;
+  Data, MessageData, ToolCallsData, FuncData, ArgsData: TJSONData;
   ToolCallsArr: TJSONArray;
   ToolCallObj, FuncObj, MsgObj: TJSONObject;
   FinalContent: string;
@@ -1941,23 +1941,10 @@ begin
                 Continue;
               end;
 
-              // finish tool terminates the run with the given message
+              // finish tool only signals completion, the answer is in streamed content
               if (ToolNames[ToolIdx] = 'finish') and (afFinish in FAgent.FFeatures) then
               begin
-                FinishData := nil;
-                try
-                  try
-                    FinishData := GetJSON(ToolArgArr[ToolIdx]);
-                    if (FinishData <> nil) and (FinishData.JSONType = jtObject) then
-                      FinalContent := TJSONObject(FinishData).Get('message', '');
-                  except
-                    FinalContent := '';
-                  end;
-                finally
-                  FinishData.Free;
-                end;
-                if FinalContent = '' then
-                  FinalContent := FCurrentContent;
+                FinalContent := FCurrentContent;
                 FAgent.LogLine('Finished: explicit finish tool called');
                 Reason := afrSuccess;
                 Exit;
@@ -2708,8 +2695,9 @@ begin
         '{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}');
 
     if afFinish in FFeatures then
-      AddTool(Arr, 'finish', 'Declare the task complete and return a final message to the user',
-        '{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}');
+      AddTool(Arr, 'finish',
+        'Declare the task complete. Put the full final answer in the regular message content BEFORE calling this tool. This tool takes no arguments and only signals completion.',
+        '{"type":"object","properties":{}}');
 
     if afWebTools in FFeatures then
     begin

@@ -157,6 +157,8 @@ type
     FInThinking: boolean;
     // Set to True when the model produced its first chunk of any kind
     FFirstChunkSeen: boolean;
+    // Set to True when the model called the finish tool
+    FFinishToolCalled: boolean;
     // Shown when the agent is slow but the server is reachable
     FWaitSlowHint: TCaption;
     // Shown when the agent is slow and the server is unreachable
@@ -645,6 +647,7 @@ begin
   FPrevAgentOnAskUser := nil;
   FInThinking := False;
   FFirstChunkSeen := False;
+  FFinishToolCalled := False;
   FWaitSlowHint := 'Waiting for response, the model may be loading weights on the first call, please wait...';
   FWaitServerDownHint := 'Waiting but server appears unreachable, check Ollama address with "set baseurl <url>"';
   FWaitCheckDelayMs := 10000;
@@ -842,6 +845,21 @@ var
   P, KeyStart, KeyEnd: integer;
 begin
   CloseThinking;
+
+  if AName = 'finish' then
+  begin
+    FFinishToolCalled := True;
+    // finish only signals completion, the answer was already streamed
+    if not FLastCharWasNewLine then
+      WriteLine('', True);
+    SetColor(tcToolBadge);
+    WriteLine('[finish]', True);
+    SetColor(tcDefault);
+    if Assigned(FPrevAgentOnToolCall) then
+      FPrevAgentOnToolCall(Sender, AName, AArgsJson);
+    Exit;
+  end;
+
   LabelText := FToolCallLabel;
   // Substitute {name} and {args} first
   LabelText := StringReplace(LabelText, '{name}', AName, [rfReplaceAll]);
@@ -953,6 +971,7 @@ begin
   end;
   // Blank line after any finish for visual separation from the next prompt
   WriteLine('', False);
+  FFinishToolCalled := False;
   if Assigned(FPrevAgentOnFinish) then
     FPrevAgentOnFinish(Sender, AReason, AAnswer, AErrorMsg);
 end;
