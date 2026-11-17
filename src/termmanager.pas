@@ -2627,7 +2627,7 @@ begin
     Exit;
   // Bytes from cmd.exe are in OEM code page, convert bytes explicitly to UTF-8
   Tmp := AData;
-  SetCodePage(Tmp, GetOEMCP, False);
+  SetCodePage(Tmp, GetConsoleOutputCP, False);
   SetCodePage(Tmp, CP_UTF8, True);
   DoOutput(string(Tmp), AIsStderr);
 end;
@@ -2857,7 +2857,7 @@ begin
 
     // Convert OEM bytes from shell to UTF-8
     Tmp := Captured;
-    SetCodePage(Tmp, GetOEMCP, False);
+    SetCodePage(Tmp, GetConsoleOutputCP, False);
     SetCodePage(Tmp, CP_UTF8, True);
     Result := string(Tmp);
   finally
