@@ -394,7 +394,17 @@ type
 
 implementation
 
-// Buffer type for piping output with zero-initialization
+const
+  INTERACTIVE_COMMANDS =
+    '|ssh|ssh.exe|ssh-keygen|ssh-keygen.exe|scp|scp.exe|sftp|sftp.exe|' +
+    'ftp|ftp.exe|telnet|telnet.exe|rlogin|rlogin.exe|mosh|plink|putty|vim|vim.exe|vi|nano|nano.exe|emacs|emacs.exe|ne|micro|joe|' +
+    'less|less.exe|more|more.exe|man|man.exe|most|bat|top|htop|btop|atop|glances|nmon|watch|' +
+    'tmux|screen|mc|ranger|nnn|lf|yazi|python|python.exe|python3|python3.exe|ipython|ipython.exe|' +
+    'node|node.exe|deno|bun|irb|pry|ghci|lua|lua.exe|psql|psql.exe|mysql|mysql.exe|sqlite3|mongosh|redis-cli|' +
+    'sqlcmd|sqlcmd.exe|gdb|gdb.exe|lldb|fdb|debug|diskpart|diskpart.exe|wsl|wsl.exe|powershell|powershell.exe|pwsh|pwsh.exe|' +
+    'cmd|cmd.exe|sudo|su|passwd|doas|login|gpg|openssl|ollama|ollama.exe|';
+
+  // Buffer type for piping output with zero-initialization
 type
   TTermBuffer = array[0..4095] of byte;
 
@@ -2775,6 +2785,15 @@ var
   StartTime: TDateTime;
   N: integer;
   DrivePath: string;
+  CommandText: string;
+  CommandName: string;
+  P: integer;
+  IsInteractive: boolean;
+  {$IFDEF WINDOWS}
+  InHandle: THandle;
+  InMode: DWORD = 0;
+  InModeSaved: boolean;
+  {$ENDIF}
 begin
   Result := -1;
   Buffer := Default(TTermBuffer);
@@ -2782,6 +2801,7 @@ begin
     Exit;
   FStdOutPending := '';
   FStdErrPending := '';
+
   // Drive switch "d:", "d:\", "d:\path" must run in-process
   if (Length(ACommand) >= 2) and (ACommand[2] = ':') and (ACommand[1] in ['a'..'z', 'A'..'Z']) and
     ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) then
@@ -2803,8 +2823,34 @@ begin
     end;
     Exit;
   end;
+
+  // Detect commands that require direct console access
+  CommandText := TrimLeft(ACommand);
+  if (CommandText <> '') and (CommandText[1] = '"') then
+  begin
+    P := Pos('"', Copy(CommandText, 2, MaxInt));
+    if P > 0 then
+      CommandName := Copy(CommandText, 2, P - 1)
+    else
+      CommandName := CommandText;
+  end
+  else
+  begin
+    P := Pos(' ', CommandText);
+    if P > 0 then
+      CommandName := Copy(CommandText, 1, P - 1)
+    else
+      CommandName := CommandText;
+  end;
+
+  CommandName := LowerCase(ExtractFileName(StringReplace(CommandName, '\', '/', [rfReplaceAll])));
+  IsInteractive := Pos('|' + CommandName + '|', INTERACTIVE_COMMANDS) > 0;
+
   RawData := '';
   Process := TProcess.Create(nil);
+  {$IFDEF WINDOWS}
+  InModeSaved := False;
+  {$ENDIF}
   try
     Process.Executable := FShellExec;
     {$IFDEF WINDOWS}
@@ -2814,10 +2860,42 @@ begin
     Process.Parameters.Add('-c');
     Process.Parameters.Add(ACommand);
     {$ENDIF}
-    Process.Options := [poUsePipes, poNoConsole];
+
+    if IsInteractive then
+    begin
+      Process.Options := [];
+      {$IFDEF WINDOWS}
+      // Restore standard console input mode for the interactive process
+      InHandle := GetStdHandle(STD_INPUT_HANDLE);
+      InModeSaved := GetConsoleMode(InHandle, InMode);
+      if InModeSaved then
+        SetConsoleMode(InHandle, InMode or ENABLE_ECHO_INPUT or ENABLE_LINE_INPUT or ENABLE_PROCESSED_INPUT);
+      {$ENDIF}
+    end
+    else
+      Process.Options := [poUsePipes, poNoConsole];
+
     Process.CurrentDirectory := GetEffectivePath;
     Process.Execute;
     StartTime := Now;
+
+    if IsInteractive then
+    begin
+      // Wait for the interactive process without capturing its console output
+      while Process.Running do
+      begin
+        if (FCommandTimeout > 0) and (MilliSecondsBetween(Now, StartTime) >= FCommandTimeout) then
+        begin
+          Process.Terminate(1);
+          DoOutput(LineEnding + '[timeout]' + LineEnding, True);
+          Break;
+        end;
+        Sleep(10);
+      end;
+
+      Result := Process.ExitStatus;
+      Exit;
+    end;
 
     while Process.Running do
     begin
@@ -2900,6 +2978,10 @@ begin
 
     Result := Process.ExitStatus;
   finally
+    {$IFDEF WINDOWS}
+    if IsInteractive and InModeSaved then
+      SetConsoleMode(InHandle, InMode);
+    {$ENDIF}
     Process.Free;
   end;
 end;
