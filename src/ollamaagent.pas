@@ -2042,9 +2042,9 @@ begin
 
             if (Kind = oekNone) or FAgent.FCancelled or (Kind = oekCancelled) then
               Break;
-            if (Kind <> oekTimeout) or (FCurrentContent <> '') or (Attempt = CHAT_MAX_ATTEMPTS) then
+            if not (Kind in [oekTimeout, oekConnection]) or (FCurrentContent <> '') or (Attempt = CHAT_MAX_ATTEMPTS) then
               Break;
-            FAgent.LogLine(Format('Chat timeout, retrying (attempt %d of %d)', [Attempt + 1, CHAT_MAX_ATTEMPTS]));
+            FAgent.LogLine(Format('Chat connection error, retrying (attempt %d of %d)', [Attempt + 1, CHAT_MAX_ATTEMPTS]));
             Sleep(500 * Attempt);
           end;
         finally
@@ -3944,6 +3944,14 @@ begin
   Recursive := GetBoolArg(AArgs, 'recursive', True);
   if Pattern = '' then
     Pattern := '*';
+  if Pattern = '' then
+    Pattern := '*';
+  // Handle recursive glob prefix before splitting the path and mask
+  if (Copy(Pattern, 1, 3) = '**/') or (Copy(Pattern, 1, 3) = '**\') then
+  begin
+    Delete(Pattern, 1, 3);
+    Recursive := True;
+  end;
   // Accept path-style patterns like "src/*.pas" by merging them into the search root
   P := LastDelimiter('/' + PathDelim, Pattern);
   if P > 0 then
