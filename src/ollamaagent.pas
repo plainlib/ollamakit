@@ -15,7 +15,7 @@ unit OllamaAgent;
 interface
 
 uses
-  Classes, SysUtils, Controls, FileUtil, fpjson, jsonparser, OllamaManager, Network;
+  Classes, SysUtils, Controls, FileUtil, fpjson, jsonparser, StringHelper, OllamaManager, Network;
 
 type
   // Feature toggles controlled by the Features set property
@@ -501,6 +501,8 @@ begin
     feANSI: Enc := TEncoding.ANSI;
     feUTF16LE: Enc := TEncoding.Unicode;
     feUTF16BE: Enc := TEncoding.BigEndianUnicode;
+    else
+      ;
   end;
 
   // BOM detection overrides auto mode
@@ -1787,6 +1789,8 @@ const
   TRUNCATE_TOOL_BYTES = 1000;
   // Retry limit for the chat call on transport timeout
   CHAT_MAX_ATTEMPTS = 3;
+  // Maximum retries after an empty model response
+  MAX_EMPTY_RESPONSE_RETRIES = 2;
   // Compaction triggers when context usage reaches this percent
   COMPACT_THRESHOLD_PCT = 75;
   // Minimum number of messages before compaction is attempted
@@ -1799,6 +1803,7 @@ const
   MAX_SUMMARIZE_MSG_CHARS = 5000;
 var
   Step, I, SavedTimeout, EffectiveMaxSteps: integer;
+  EmptyResponseRetries: integer;
   MessagesArr: TJSONArray;
   MessagesJson, ToolsJson, FinalJson, ErrMsg: string;
   Kind: TOllamaErrorKind;
@@ -1827,6 +1832,7 @@ begin
   Reason := afrError;
   ErrMsg := '';
   FinalContent := '';
+  EmptyResponseRetries := 0;
   // Initialize managed array locals to silence compiler hints
   ToolNames := nil;
   ToolArgArr := nil;
@@ -2053,7 +2059,7 @@ begin
         if FAgent.FRequestTimeout > 0 then
           FAgent.OllamaManager.RequestTimeout := FAgent.FRequestTimeout;
         try
-          // Retry the chat call on transport timeout when nothing was streamed yet
+          // Retry transient errors and ask the model to regenerate malformed tool calls
           for Attempt := 1 to CHAT_MAX_ATTEMPTS do
           begin
             FCurrentContent := '';
@@ -2066,6 +2072,23 @@ begin
 
             if (Kind = oekNone) or FAgent.FCancelled or (Kind = oekCancelled) then
               Break;
+
+            // Ollama rejects malformed tool calls before they reach the client
+            if (Kind = oekHttpServer) and (FCurrentContent = '') and
+              (Pos('error parsing tool call', LowerCase(ErrMsg)) > 0) and (Attempt < CHAT_MAX_ATTEMPTS) then
+            begin
+              FAgent.LogLine('Malformed tool call rejected by Ollama, asking model to retry');
+              MsgObj := TJSONObject.Create;
+              MsgObj.Add('role', 'system');
+              MsgObj.Add('content',
+                'Your previous response contained a malformed tool call and could not be processed. ' +
+                'Retry the same operation. Every tool call argument must contain only a valid JSON object. ' +
+                'Do not append explanations or any other text to the JSON arguments.');
+              MessagesArr.Add(MsgObj);
+              MessagesJson := MessagesArr.AsJSON;
+              Continue;
+            end;
+
             if not (Kind in [oekTimeout, oekConnection]) or (FCurrentContent <> '') or (Attempt = CHAT_MAX_ATTEMPTS) then
               Break;
             FAgent.LogLine(Format('Chat connection error, retrying (attempt %d of %d)', [Attempt + 1, CHAT_MAX_ATTEMPTS]));
@@ -2147,12 +2170,39 @@ begin
               ToolCallsArr := TJSONArray(ToolCallsData);
           end;
 
+          // Retry the request when the model returns an empty response, prompting it to try a different approach
           if (ToolCallsArr = nil) or (ToolCallsArr.Count = 0) then
           begin
             if (MessageData <> nil) and (MessageData.JSONType = jtObject) then
               FinalContent := TJSONObject(MessageData).Get('content', '');
             if FinalContent = '' then
               FinalContent := FCurrentContent;
+
+            if Trim(FinalContent) = '' then
+            begin
+              Inc(EmptyResponseRetries);
+              FAgent.LogLine(Format('Empty response, retry %d of %d', [EmptyResponseRetries, MAX_EMPTY_RESPONSE_RETRIES]));
+
+              if EmptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES then
+              begin
+                MsgObj := TJSONObject.Create;
+                MsgObj.Add('role', 'user');
+                MsgObj.Add('content',
+                  'Your previous response was completely empty. The task is not completed. ' +
+                  'Review the conversation and try a different approach. ' +
+                  'If a file or directory was not found, inspect other directories and search the workspace more broadly. ' +
+                  'Do not repeat the same unsuccessful search.');
+                MessagesArr.Add(MsgObj);
+                FinalContent := '';
+                Continue;
+              end;
+
+              Reason := afrError;
+              ErrMsg := 'The model returned an empty response after multiple retries';
+              FAgent.LogLine('Abort: ' + ErrMsg);
+              Exit;
+            end;
+
             // Content is already emitted by ChatStream or ChatWithTools callbacks
             FAgent.LogLine(Format('Finished: content_len=%d tool_calls=0', [Length(FinalContent)]));
             Reason := afrSuccess;
@@ -4631,6 +4681,10 @@ begin
   if CleanName = '' then
     CleanName := AName;
   LogLine(Format('DispatchTool name="%s" args="%s"', [CleanName, Copy(AArgsJson, 1, 200)]));
+
+  // Reject malformed JSON before attempting to parse tool arguments
+  if not AArgsJson.IsJson then
+    Exit('{"error": "tool arguments are not valid JSON"}');
 
   Args := nil;
   try
