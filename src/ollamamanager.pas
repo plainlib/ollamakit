@@ -2329,9 +2329,10 @@ end;
 function TCustomOllamaManager.ChatStream(const ModelName, MessagesJson, ToolsJson: string;
   AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
 var
-  JsonBody, ErrFromNetwork, Url: string;
+  JsonBody, ErrFromNetwork, Url, UpperError: string;
   Tm: TTimeout;
   Helper: TOllamaChatStreamHelper;
+  HttpPos, HttpCode: integer;
 begin
   Result := '';
   AKind := oekNone;
@@ -2369,7 +2370,20 @@ begin
       'application/json', Tm, @Helper.HandleRaw, ErrFromNetwork) then
     begin
       AKind := oekConnection;
-      AErrorMsg := ErrFromNetwork;
+      UpperError := UpperCase(ErrFromNetwork);
+      HttpPos := Pos('HTTP ', UpperError);
+      if HttpPos > 0 then
+      begin
+        HttpCode := StrToIntDef(Copy(UpperError, HttpPos + 5, 3), 0);
+        if (HttpCode >= 400) and (HttpCode < 600) then
+          AKind := ClassifyHttp(HttpCode);
+      end;
+
+      AErrorMsg := Format('POST %s, model="%s", request_bytes=%d: %s',
+        [Url, ModelName, Length(JsonBody), Trim(ErrFromNetwork)]);
+      if AErrorMsg = '' then
+        AErrorMsg := 'Streaming request failed';
+
       DoError(AKind, ModelName, AErrorMsg);
       Exit;
     end;

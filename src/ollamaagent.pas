@@ -1995,7 +1995,34 @@ begin
         end;
 
         MessagesJson := MessagesArr.AsJSON;
-        FAgent.LogLine(Format('Step %d messages=%d timeout=%d', [Step, MessagesArr.Count, FAgent.OllamaManager.RequestTimeout]));
+        FAgent.LogLine(Format('Step %d messages=%d timeout=%d request_json_bytes=%d',
+          [Step, MessagesArr.Count, FAgent.OllamaManager.RequestTimeout, Length(MessagesJson)]));
+
+        // Log the last assistant tool call
+        for I := MessagesArr.Count - 1 downto 0 do
+        begin
+          if MessagesArr.Items[I].JSONType <> jtObject then
+            Continue;
+          MsgObj := TJSONObject(MessagesArr.Items[I]);
+          if (MsgObj.Get('role', '') = 'assistant') and (MsgObj.Find('tool_calls') <> nil) then
+          begin
+            FAgent.LogLine('Last assistant tool call: ' + MsgObj.AsJSON);
+            Break;
+          end;
+        end;
+
+        // Log the last tool result
+        for I := MessagesArr.Count - 1 downto 0 do
+        begin
+          if MessagesArr.Items[I].JSONType <> jtObject then
+            Continue;
+          MsgObj := TJSONObject(MessagesArr.Items[I]);
+          if MsgObj.Get('role', '') = 'tool' then
+          begin
+            FAgent.LogLine('Last tool result: ' + MsgObj.AsJSON);
+            Break;
+          end;
+        end;
 
         // Temporarily override manager timeout when agent has its own
         SavedTimeout := FAgent.OllamaManager.RequestTimeout;
@@ -2044,7 +2071,8 @@ begin
           // Add an actionable hint for the most common context error
           if Pos('context length', LowerCase(ErrMsg)) > 0 then
             ErrMsg := ErrMsg + LineEnding + 'hint: use "cls" to clear history, or "set numctx <larger>" to raise the window';
-          FAgent.LogLine(Format('Abort: chat error kind=%d msg="%s"', [Ord(Kind), ErrMsg]));
+          FAgent.LogLine(Format('Abort: chat error kind=%d attempt=%d response_len=%d request_bytes=%d msg="%s"',
+            [Ord(Kind), Attempt, Length(FinalJson), Length(MessagesJson), ErrMsg]));
           Exit;
         end;
 
