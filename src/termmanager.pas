@@ -4145,7 +4145,13 @@ begin
           else if not ShiftPressed then
             ClearSelection;
           if CursorPos > 0 then
-            CursorPos := Utf8PrevPos(Line, CursorPos);
+          begin
+            if (CursorPos >= 2) and (Line[CursorPos] = #10) and
+              (Line[CursorPos - 1] = #13) then
+              Dec(CursorPos, 2)
+            else
+              CursorPos := Utf8PrevPos(Line, CursorPos);
+          end;
           if ShiftPressed then
             UpdateSelection;
         end;
@@ -4157,7 +4163,13 @@ begin
             ClearSelection;
           // Utf8NextPos returns 1-based next char start, subtract 1 for byte count
           if CursorPos < Length(Line) then
-            CursorPos := Utf8NextPos(Line, CursorPos + 1) - 1;
+          begin
+            if (CursorPos + 2 <= Length(Line)) and
+              (Line[CursorPos + 1] = #13) and (Line[CursorPos + 2] = #10) then
+              Inc(CursorPos, 2)
+            else
+              CursorPos := Utf8NextPos(Line, CursorPos + 1) - 1;
+          end;
           if ShiftPressed then
             UpdateSelection;
         end;
