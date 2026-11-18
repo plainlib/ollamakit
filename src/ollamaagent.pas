@@ -1195,6 +1195,7 @@ begin
   Result := -1;
   if (AMessages = nil) or (AMessages.Count <= AKeepLast + 2) then
     Exit;
+
   I := AMessages.Count - AKeepLast;
   while I > 1 do
   begin
@@ -1203,15 +1204,79 @@ begin
       Dec(I);
       Continue;
     end;
+
     MsgObj := TJSONObject(AMessages.Items[I]);
+
+    // Ignore service messages when looking for a safe cut point
+    if MsgObj.Get('_service', False) then
+    begin
+      Dec(I);
+      Continue;
+    end;
+
     Role := MsgObj.Get('role', '');
+
     // Safe cut: right before a user message or a plain assistant (no pending tool calls)
     if (Role = 'user') or ((Role = 'assistant') and (MsgObj.Find('tool_calls') = nil)) then
     begin
       Result := I;
       Exit;
     end;
+
     Dec(I);
+  end;
+end;
+
+// Builds a message JSON without internal service data
+function BuildContextMessageJson(AData: TJSONData): string;
+var
+  MsgObj: TJSONObject;
+  CopyObj: TJSONObject;
+begin
+  Result := string.Empty;
+
+  if (AData = nil) or (AData.JSONType <> jtObject) then
+    Exit;
+
+  MsgObj := TJSONObject(AData);
+
+  // Service messages are kept in chat history but never sent to the model
+  if MsgObj.Get('_service', False) then
+    Exit;
+
+  CopyObj := TJSONObject(MsgObj.Clone);
+  try
+    // Remove legacy thinking stored inside assistant messages
+    CopyObj.Delete('thinking');
+    Result := CopyObj.AsJSON;
+  finally
+    CopyObj.Free;
+  end;
+end;
+
+// Builds the message array sent to Ollama
+function BuildRequestMessagesJson(AMessages: TJSONArray): string;
+var
+  I: integer;
+  MsgJson: string;
+  ResultArr: TJSONArray;
+begin
+  Result := '[]';
+  if AMessages = nil then
+    Exit;
+
+  ResultArr := TJSONArray.Create;
+  try
+    for I := 0 to AMessages.Count - 1 do
+    begin
+      MsgJson := BuildContextMessageJson(AMessages.Items[I]);
+      if MsgJson <> string.Empty then
+        ResultArr.Add(GetJSON(MsgJson));
+    end;
+
+    Result := ResultArr.AsJSON;
+  finally
+    ResultArr.Free;
   end;
 end;
 
@@ -1682,6 +1747,7 @@ type
     FAgent: TCustomOllamaAgent;
     FUserText: string;
     FCurrentContent: string;
+    FCurrentThinking: string;
     procedure HandleStreamChunk(const AContent: string; var ACancel: boolean);
     procedure HandleFullContent(const AContent: string; var ACancel: boolean);
     procedure HandleThinkingChunk(const AText: string; var ACancel: boolean);
@@ -1706,6 +1772,7 @@ begin
   FAgent := AAgent;
   FUserText := AUserText;
   FCurrentContent := '';
+  FCurrentThinking := '';
   Start;
 end;
 
@@ -1740,6 +1807,8 @@ begin
     ACancel := True;
     Exit;
   end;
+
+  FCurrentThinking := FCurrentThinking + AText;
   QueueThinking(AText);
 end;
 
@@ -1881,6 +1950,7 @@ var
   Threads: TList;
   SupportsTools: boolean;
   StoredHistory: TJSONArray;
+  ThinkingObj: TJSONObject;
 begin
   Reason := afrError;
   ErrMsg := '';
@@ -2009,9 +2079,10 @@ begin
             OldMsgsStr := '';
             for I := 1 to CutPoint - 1 do
             begin
-              if MessagesArr.Items[I].JSONType <> jtObject then
+              MsgStr := BuildContextMessageJson(MessagesArr.Items[I]);
+              if MsgStr = string.Empty then
                 Continue;
-              MsgStr := MessagesArr.Items[I].AsJSON;
+
               if Length(MsgStr) > MAX_SUMMARIZE_MSG_CHARS then
                 MsgStr := Copy(MsgStr, 1, MAX_SUMMARIZE_MSG_CHARS) + '...[truncated]';
               OldMsgsStr := OldMsgsStr + MsgStr + #10;
@@ -2077,7 +2148,7 @@ begin
           end;
         end;
 
-        MessagesJson := MessagesArr.AsJSON;
+        MessagesJson := BuildRequestMessagesJson(MessagesArr);
         FAgent.LogLine(Format('Step %d messages=%d timeout=%d request_json_bytes=%d',
           [Step, MessagesArr.Count, FAgent.OllamaManager.RequestTimeout, Length(MessagesJson)]));
 
@@ -2116,6 +2187,7 @@ begin
           for Attempt := 1 to CHAT_MAX_ATTEMPTS do
           begin
             FCurrentContent := '';
+            FCurrentThinking := '';
             if FAgent.FStreaming then
               FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
                 @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg)
@@ -2138,7 +2210,7 @@ begin
                 'Retry the same operation. Every tool call argument must contain only a valid JSON object. ' +
                 'Do not append explanations or any other text to the JSON arguments.');
               MessagesArr.Add(MsgObj);
-              MessagesJson := MessagesArr.AsJSON;
+              MessagesJson := BuildRequestMessagesJson(MessagesArr);
               Continue;
             end;
 
@@ -2211,8 +2283,28 @@ begin
           end;
 
           MessageData := TJSONObject(Data).Find('message');
-          if MessageData <> nil then
-            MessagesArr.Add(MessageData.Clone);
+          if (MessageData <> nil) and (MessageData.JSONType = jtObject) then
+          begin
+            MsgObj := TJSONObject(MessageData.Clone);
+
+            // Streaming responses may contain only the final empty content chunk
+            if MsgObj.Get('content', '') = '' then
+              MsgObj.Strings['content'] := FCurrentContent;
+
+            // Keep thinking separately as an internal history entry
+            MsgObj.Delete('thinking');
+            MessagesArr.Add(MsgObj);
+
+            if FCurrentThinking <> string.Empty then
+            begin
+              ThinkingObj := TJSONObject.Create;
+              ThinkingObj.Add('role', 'assistant');
+              ThinkingObj.Add('content', FCurrentThinking);
+              ThinkingObj.Add('_service', True);
+              ThinkingObj.Add('_type', 'thinking');
+              MessagesArr.Add(ThinkingObj);
+            end;
+          end;
 
           ToolCallsArr := nil;
           ToolCallsData := nil;
