@@ -52,7 +52,7 @@ const
     'file,files', 'execcommand,shell,command', '', 'ask', '', 'webtools'
     );
 
-  PROPERTIES: array[0..24] of TAgentPropertyInfo = (
+  PROPERTIES: array[0..30] of TAgentPropertyInfo = (
     // OllamaManager settings, saved
     (Name: 'baseurl'; Aliases: 'url,ollama.url'; Kind: apkString;
     Description: 'Ollama server URL (example: http://localhost:11434)'; Runtime: False),
@@ -66,6 +66,8 @@ const
     Description: 'OllamaManager default request timeout in ms'; Runtime: False),
     (Name: 'pulltimeout'; Aliases: 'ollama.pulltimeout'; Kind: apkInteger;
     Description: 'Pull operation timeout in ms, 0 means no limit'; Runtime: False),
+    (Name: 'modeltimeout'; Aliases: 'ollama.modeltimeout'; Kind: apkInteger;
+    Description: 'Model load and unload timeout in ms'; Runtime: False),
     // OllamaManager runtime-only
     (Name: 'numctx'; Aliases: 'ollama.numctx'; Kind: apkInteger;
     Description: 'Context window override, 0 means use model default'; Runtime: True),
@@ -90,6 +92,16 @@ const
     Description: 'Persist messages between runs'; Runtime: False),
     (Name: 'log'; Aliases: ''; Kind: apkBoolean;
     Description: 'Log every step to stderr'; Runtime: False),
+    (Name: 'logtoolresult'; Aliases: ''; Kind: apkBoolean;
+    Description: 'Log tool results'; Runtime: False),
+    (Name: 'loadagentsmd'; Aliases: ''; Kind: apkBoolean;
+    Description: 'Load AGENTS.md instructions'; Runtime: False),
+    (Name: 'agentsfilename'; Aliases: ''; Kind: apkString;
+    Description: 'Instructions file name'; Runtime: False),
+    (Name: 'allowaccesstosystem'; Aliases: ''; Kind: apkBoolean;
+    Description: 'Allow file access outside RootPath'; Runtime: False),
+    (Name: 'blocksensitivefiles'; Aliases: ''; Kind: apkBoolean;
+    Description: 'Block access to sensitive files'; Runtime: False),
     // Web options, saved
     (Name: 'web.searchurl'; Aliases: 'searchurl'; Kind: apkString;
     Description: 'URL template for web_search, use {query} placeholder'; Runtime: False),
@@ -334,6 +346,7 @@ begin
     Row('connectiontimeout', 'connect timeout ms');
     Row('manager.timeout', 'default request timeout ms');
     Row('pulltimeout', 'pull timeout ms, 0 = none');
+    Row('modeltimeout', 'model load/unload timeout ms');
     Row('numctx', 'context override, 0 = model default');
     Row('active', 'background refresh and connection');
 
@@ -347,6 +360,11 @@ begin
     Row('rootpath', 'sandbox directory for file tools');
     Row('keephistory', 'persist messages between runs');
     Row('log', 'log every step to stderr');
+    Row('logtoolresult', 'log tool results');
+    Row('loadagentsmd', 'load AGENTS.md instructions');
+    Row('agentsfilename', 'instructions file name');
+    Row('allowaccesstosystem', 'allow access outside RootPath');
+    Row('blocksensitivefiles', 'block sensitive files');
 
     Header('Web');
     Row('web.searchurl', 'template, {query} placeholder');
@@ -415,6 +433,7 @@ begin
       Add('connectiontimeout', IntToStr(AAgent.OllamaManager.ConnectionTimeout));
       Add('manager.timeout', IntToStr(AAgent.OllamaManager.RequestTimeout));
       Add('pulltimeout', IntToStr(AAgent.OllamaManager.PullTimeout));
+      Add('modeltimeout', IntToStr(AAgent.OllamaManager.ModelTimeout));
       T.Add('');
     end
     else
@@ -443,6 +462,11 @@ begin
       Add('rootpath', AAgent.RootPath);
     Add('keephistory', BoolToStrValue(AAgent.KeepHistory));
     Add('log', BoolToStrValue(AAgent.Log));
+    Add('logtoolresult', BoolToStrValue(AAgent.LogToolResult));
+    Add('loadagentsmd', BoolToStrValue(AAgent.LoadAgentsMd));
+    Add('agentsfilename', AAgent.AgentsFileName);
+    Add('allowaccesstosystem', BoolToStrValue(AAgent.AllowAccessToSystem));
+    Add('blocksensitivefiles', BoolToStrValue(AAgent.BlockSensitiveFiles));
     T.Add('');
     T.Add('Web Options');
     Add('web.searchurl', AAgent.WebOptions.SearchUrl);
@@ -487,7 +511,7 @@ begin
   // Manager-owned properties
   if (Canonical = 'baseurl') or (Canonical = 'keepalive') or (Canonical = 'autorefresh') or
     (Canonical = 'connectiontimeout') or (Canonical = 'manager.timeout') or (Canonical = 'pulltimeout') or
-    (Canonical = 'numctx') or (Canonical = 'active') then
+    (Canonical = 'modeltimeout') or (Canonical = 'numctx') or (Canonical = 'active') then
   begin
     if not Assigned(AAgent.OllamaManager) then
     begin
@@ -506,6 +530,8 @@ begin
       AValue := IntToStr(AAgent.OllamaManager.RequestTimeout)
     else if Canonical = 'pulltimeout' then
       AValue := IntToStr(AAgent.OllamaManager.PullTimeout)
+    else if Canonical = 'modeltimeout' then
+      AValue := IntToStr(AAgent.OllamaManager.ModelTimeout)
     else if Canonical = 'numctx' then
       AValue := IntToStr(AAgent.OllamaManager.NumCtx)
     else if Canonical = 'active' then
@@ -530,6 +556,16 @@ begin
     AValue := BoolToStrValue(AAgent.KeepHistory)
   else if Canonical = 'log' then
     AValue := BoolToStrValue(AAgent.Log)
+  else if Canonical = 'logtoolresult' then
+    AValue := BoolToStrValue(AAgent.LogToolResult)
+  else if Canonical = 'loadagentsmd' then
+    AValue := BoolToStrValue(AAgent.LoadAgentsMd)
+  else if Canonical = 'agentsfilename' then
+    AValue := AAgent.AgentsFileName
+  else if Canonical = 'allowaccesstosystem' then
+    AValue := BoolToStrValue(AAgent.AllowAccessToSystem)
+  else if Canonical = 'blocksensitivefiles' then
+    AValue := BoolToStrValue(AAgent.BlockSensitiveFiles)
   else if Canonical = 'web.searchurl' then
     AValue := AAgent.WebOptions.SearchUrl
   else if Canonical = 'web.useragent' then
@@ -587,7 +623,7 @@ begin
   // Manager-owned properties
   if (Canonical = 'baseurl') or (Canonical = 'keepalive') or (Canonical = 'autorefresh') or
     (Canonical = 'connectiontimeout') or (Canonical = 'manager.timeout') or (Canonical = 'pulltimeout') or
-    (Canonical = 'numctx') or (Canonical = 'active') then
+    (Canonical = 'modeltimeout') or (Canonical = 'numctx') or (Canonical = 'active') then
   begin
     if not Assigned(AAgent.OllamaManager) then
     begin
@@ -647,6 +683,15 @@ begin
         Exit;
       end;
       AAgent.OllamaManager.PullTimeout := IntVal;
+    end
+    else if Canonical = 'modeltimeout' then
+    begin
+      if not TryStrToInt(Value, IntVal) or (IntVal < 0) then
+      begin
+        AError := 'modeltimeout must be a non-negative integer';
+        Exit;
+      end;
+      AAgent.OllamaManager.ModelTimeout := IntVal;
     end
     else if Canonical = 'numctx' then
     begin
@@ -769,6 +814,51 @@ begin
       Exit;
     end;
     AAgent.Log := BoolVal;
+  end
+  else if Canonical = 'logtoolresult' then
+  begin
+    if not ParseBoolValue(Value, BoolVal) then
+    begin
+      AError := 'logtoolresult must be on/off, true/false, yes/no';
+      Exit;
+    end;
+    AAgent.LogToolResult := BoolVal;
+  end
+  else if Canonical = 'loadagentsmd' then
+  begin
+    if not ParseBoolValue(Value, BoolVal) then
+    begin
+      AError := 'loadagentsmd must be on/off, true/false, yes/no';
+      Exit;
+    end;
+    AAgent.LoadAgentsMd := BoolVal;
+  end
+  else if Canonical = 'agentsfilename' then
+  begin
+    if Value = '' then
+    begin
+      AError := 'agentsfilename cannot be empty';
+      Exit;
+    end;
+    AAgent.AgentsFileName := Value;
+  end
+  else if Canonical = 'allowaccesstosystem' then
+  begin
+    if not ParseBoolValue(Value, BoolVal) then
+    begin
+      AError := 'allowaccesstosystem must be on/off, true/false, yes/no';
+      Exit;
+    end;
+    AAgent.AllowAccessToSystem := BoolVal;
+  end
+  else if Canonical = 'blocksensitivefiles' then
+  begin
+    if not ParseBoolValue(Value, BoolVal) then
+    begin
+      AError := 'blocksensitivefiles must be on/off, true/false, yes/no';
+      Exit;
+    end;
+    AAgent.BlockSensitiveFiles := BoolVal;
   end
   else if Canonical = 'web.searchurl' then
     AAgent.WebOptions.SearchUrl := Value
