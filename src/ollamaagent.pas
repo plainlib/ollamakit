@@ -811,6 +811,30 @@ begin
   Result := AHost <> '';
 end;
 
+// Returns True when the file contains binary data or cannot be inspected
+function IsBinaryFile(const AFileName: string): boolean;
+var
+  Stream: TFileStream;
+  Buffer: array of byte = nil;
+  ReadCount, I: integer;
+begin
+  Result := False;
+  try
+    Stream := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(Buffer, 4096);
+      ReadCount := Stream.Read(Buffer[0], Length(Buffer));
+      for I := 0 to ReadCount - 1 do
+        if Buffer[I] = 0 then
+          Exit(True);
+    finally
+      Stream.Free;
+    end;
+  except
+    Result := True;
+  end;
+end;
+
 // Decodes &#NNN; and &#xHH; entities to UTF-8 bytes
 function DecodeNumericEntities(const AText: string): string;
 var
@@ -2978,8 +3002,8 @@ begin
         '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"}},"required":["path"]}');
       AddTool(Arr, 'read_file',
         'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
-        'prefer read_file_preview or read_file_lines for large ones.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"}},"required":["path"]}');
+        'prefer read_file_preview or read_file_lines for large ones. Set allow_binary=true only when binary data must be read as text.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"},"allow_binary":{"type":"boolean","description":"Allow reading binary files as text, default false"}},"required":["path"]}');
       AddTool(Arr, 'write_file', 'Write contents to a file, creates parent directories',
         '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
       AddTool(Arr, 'list_files',
@@ -3191,6 +3215,7 @@ var
   ReadCount, FullSize: int64;
   MaxBytes: int64;
   TotalLines, I, LinesShown: integer;
+  AllowBinary: boolean;
 begin
   Result := '{"error": "invalid arguments"}';
   Content := '';
@@ -3214,6 +3239,12 @@ begin
   if not FileExists(FullPath) then
   begin
     Result := BuildFileNotFoundError(FullPath, RelPath);
+    Exit;
+  end;
+  AllowBinary := GetBoolArg(AArgs, 'allow_binary', False);
+  if not AllowBinary and IsBinaryFile(FullPath) then
+  begin
+    Result := '{"error": "binary file detected, set allow_binary=true to read it as text"}';
     Exit;
   end;
   MaxBytes := GetIntArg(AArgs, 'max_bytes', DEFAULT_MAX_BYTES);
@@ -3257,7 +3288,6 @@ var
   Size, BytesRead: int64;
   Buf: TStringBuilder;
   Stream: TFileStream;
-  RawBuf: TBytes = nil;
   Content: string;
 begin
   Result := '{"error": "invalid arguments"}';
@@ -3296,26 +3326,11 @@ begin
       ' bytes), use read_file_lines with start_line and end_line"}';
     Exit;
   end;
-  // Detect binary files by scanning the first 512 bytes for null bytes
-  HeadCount := 0;
-  try
-    Stream := TFileStream.Create(FullPath, fmOpenRead or fmShareDenyNone);
-    try
-      SetLength(RawBuf, Min(Size, 512));
-      if Length(RawBuf) > 0 then
-        HeadCount := Stream.Read(RawBuf[0], Length(RawBuf));
-    finally
-      Stream.Free;
-    end;
-  except
-    HeadCount := 0;
+  if IsBinaryFile(FullPath) then
+  begin
+    Result := '{"error": "binary file detected, use read_file with allow_binary=true if needed"}';
+    Exit;
   end;
-  for I := 0 to HeadCount - 1 do
-    if RawBuf[I] = 0 then
-    begin
-      Result := '{"error": "binary file detected (null bytes found), use exec_command for this file type"}';
-      Exit;
-    end;
   HeadCount := integer(GetIntArg(AArgs, 'head', DEFAULT_HEAD));
   TailCount := integer(GetIntArg(AArgs, 'tail', DEFAULT_TAIL));
   if HeadCount < 1 then
@@ -3551,6 +3566,8 @@ begin
         Truncated := True;
         Break;
       end;
+      if IsBinaryFile(Files[I]) then
+        Continue;
       FileLines := TStringList.Create;
       try
         try
@@ -3631,6 +3648,11 @@ begin
     Result := BuildFileNotFoundError(FullPath, RelPath);
     Exit;
   end;
+  if IsBinaryFile(FullPath) then
+  begin
+    Result := '{"error": "binary file detected, use read_file with allow_binary=true if needed"}';
+    Exit;
+  end;
   StartLine := integer(GetIntArg(AArgs, 'start_line', 1));
   EndLine := integer(GetIntArg(AArgs, 'end_line', -1));
   if StartLine < 1 then
@@ -3700,6 +3722,11 @@ begin
   if not FileExists(FullPath) then
   begin
     Result := BuildFileNotFoundError(FullPath, RelPath);
+    Exit;
+  end;
+  if IsBinaryFile(FullPath) then
+  begin
+    Result := '{"error": "binary file detected, cannot edit binary files"}';
     Exit;
   end;
   if not ReadTextFileSafe(FullPath, Content) then
@@ -4055,30 +4082,6 @@ var
       (Pos('/build/', Low) > 0) or (Pos('/target/', Low) > 0);
   end;
 
-  // Returns True when the file contains binary data or cannot be inspected
-  function IsBinaryFile(const AFileName: string): boolean;
-  var
-    Stream: TFileStream;
-    Buffer: array of byte = nil;
-    ReadCount, I: integer;
-  begin
-    Result := False;
-    try
-      Stream := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyNone);
-      try
-        SetLength(Buffer, 4096);
-        ReadCount := Stream.Read(Buffer[0], Length(Buffer));
-        for I := 0 to ReadCount - 1 do
-          if Buffer[I] = 0 then
-            Exit(True);
-      finally
-        Stream.Free;
-      end;
-    except
-      Result := True;
-    end;
-  end;
-
   // Scans one file, appending matches to the shared Matches array
   procedure ScanFile(const AFullPath, ARelPath: string);
   var
@@ -4315,6 +4318,12 @@ begin
   if FoundPath = '' then
   begin
     Result := '{"found": false, "note": "no ' + FAgentsFileName + ' found for "' + RelPath + '" within the workspace"}';
+    Exit;
+  end;
+  if IsBinaryFile(FoundPath) then
+  begin
+    Result := '{"found": true, "path": ' + TJSONString.Create(RelativeToRoot(Root, FoundPath)).AsJSON +
+      ', "error": "binary file detected"}';
     Exit;
   end;
   if not ReadTextFileSafe(FoundPath, Content) then
