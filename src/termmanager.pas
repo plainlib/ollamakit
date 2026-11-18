@@ -4121,7 +4121,8 @@ begin
           end
           else
           begin
-            ConWriteUtf8(LineEnding);
+            // Move below all visual rows occupied by the input
+            ConGotoXY(1, PromptRow + LastRedrawRows);
             FLastCharWasNewLine := True;
             Break;
           end;
