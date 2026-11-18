@@ -235,6 +235,10 @@ type
     function ReadSmallTextFile(const APath: string): string;
     // Formats a byte count as human-readable string like "23.4 GB"
     function BytesToHumanText(const ABytes: int64): string;
+    // Restores terminal buffers and output of the active chat
+    procedure RestoreActiveChat;
+    // Removes the last terminal input and its conversation exchange
+    function RemoveLastInput: boolean;
   protected
     // Clears agent reference when it is removed at runtime
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -287,6 +291,8 @@ type
     function BuildShellContext: string; virtual;
     // Returns True for cls, clear, exit and quit which should not be logged
     function IsMetaCommand(const ACommand: string): boolean; virtual;
+    // Returns True for commands that control the chat interface
+    function IsChatControlCommand(const ACommand: string): boolean; virtual;
     // Executes agent shell command through configured shell and returns output
     procedure HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
     // Prompts the user with a question and returns the typed answer
@@ -717,6 +723,7 @@ begin
   FBuiltinCommands.Add('cd');
   FBuiltinCommands.Add('pwd');
   FBuiltinCommands.Add('cls');
+  FBuiltinCommands.Add('new');
   FBuiltinCommands.Add('clear');
   FBuiltinCommands.Add('help');
   FBuiltinCommands.Add('h');
@@ -857,20 +864,7 @@ begin
   if not FAgent.SwitchChat(ADelta) then
     Exit;
 
-  // Restore terminal command history and shell context for the selected chat
-  FHistory.Assign(FAgent.ActiveChat.TerminalHistory);
-  FShellLog.Assign(FAgent.ActiveChat.ShellLog);
-
-  ClearScreen;
-
-  // Replay the saved terminal output without recording it a second time
-  FRestoringChat := True;
-  try
-    ReplayChatOutput(FAgent.ActiveChat.TerminalOutput);
-  finally
-    FRestoringChat := False;
-  end;
-
+  RestoreActiveChat;
   Result := True;
 end;
 
@@ -1130,16 +1124,38 @@ end;
 
 function TCustomTermManager.IsMetaCommand(const ACommand: string): boolean;
 var
-  Cmd: string;
+  Cmd, SubCmd: string;
   P: integer;
 begin
   P := Pos(' ', ACommand);
   if P > 0 then
-    Cmd := LowerCase(Copy(ACommand, 1, P - 1))
+  begin
+    Cmd := LowerCase(Copy(ACommand, 1, P - 1));
+    SubCmd := LowerCase(Trim(Copy(ACommand, P + 1, MaxInt)));
+  end
   else
+  begin
     Cmd := LowerCase(ACommand);
-  Result := (Cmd = 'cls') or (Cmd = 'clear') or (Cmd = 'exit') or (Cmd = 'quit') or (Cmd = 'help') or
-    (Cmd = 'h') or (Cmd = '?') or (Cmd = 'config') or (Cmd = 'settings') or (Cmd = 'get') or (Cmd = 'history');
+    SubCmd := string.Empty;
+  end;
+
+  Result := (Cmd = 'cls') or (Cmd = 'clear') or (Cmd = 'new') or (Cmd = 'exit') or (Cmd = 'quit') or
+    (Cmd = 'help') or (Cmd = 'h') or (Cmd = '?') or (Cmd = 'config') or (Cmd = 'settings') or (Cmd = 'get') or
+    (Cmd = 'history') or ((Cmd = 'set') and (SubCmd = 'chat'));
+end;
+
+function TCustomTermManager.IsChatControlCommand(const ACommand: string): boolean;
+var
+  Cmd: string;
+  P: integer;
+begin
+  P := Pos(' ', Trim(ACommand));
+  if P > 0 then
+    Cmd := LowerCase(Copy(Trim(ACommand), 1, P - 1))
+  else
+    Cmd := LowerCase(Trim(ACommand));
+
+  Result := (Cmd = 'cls') or (Cmd = 'clear') or (Cmd = 'new');
 end;
 
 function TCustomTermManager.BuildShellContext: string;
@@ -1680,16 +1696,34 @@ begin
   begin
     if Assigned(FAgent) then
     begin
-      // Start a new chat without modifying the previous one
-      if not Assigned(FAgent.NewChat(string.Empty)) then
-        Exit;
-      FHistory.Clear;
-      FShellLog.Clear;
+      // Clear the current chat without creating a new one
+      FAgent.ClearHistory;
       FAgent.ResetUsage;
-    end
-    else
-      FShellLog.Clear;
+      if Assigned(FAgent.ActiveChat) then
+      begin
+        FAgent.ActiveChat.TerminalOutput := string.Empty;
+        FAgent.ActiveChat.TerminalHistory.Clear;
+        FAgent.ActiveChat.ShellLog.Clear;
+      end;
+    end;
 
+    FHistory.Clear;
+    FShellLog.Clear;
+    ClearScreen;
+  end
+  else if Cmd = 'new' then
+  begin
+    if not Assigned(FAgent) then
+    begin
+      DoOutput('error: agent is not attached' + LineEnding, True);
+      Exit;
+    end;
+
+    if not Assigned(FAgent.NewChat(string.Empty)) then
+      Exit;
+
+    FHistory.Clear;
+    FShellLog.Clear;
     ClearScreen;
   end
   else if Cmd = 'history' then
@@ -1780,7 +1814,7 @@ begin
   else
   begin
     DoOutput('Commands' + LineEnding, False);
-    Group('shell', 'cd  pwd  cls  clear  history  exit  quit');
+    Group('shell', 'cd  pwd  cls  clear  new  history  exit  quit');
     Group('settings', 'set  get  config');
     Group('models', 'models  ollama');
     Group('help', 'help  help agent  help term  ?');
@@ -1816,6 +1850,11 @@ begin
       Item('set <name> <value>', 'change a property');
       Item('get <name>', 'inspect a property');
       Item('config', 'full settings dump');
+      Item('cls', 'clear the current chat');
+      Item('new', 'start a new chat');
+      Item('set chat <name>', 'rename the active chat');
+      Item('Ctrl+Shift+Del', 'delete the active chat');
+      Item('Ctrl+Backspace', 'remove the last input and result');
       Item('ollama help', 'model management commands');
       Item('', '');
     end
@@ -1858,8 +1897,29 @@ begin
     PropName := Trim(AArg);
     PropValue := '';
   end;
+  if LowerCase(PropName) = 'chat' then
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    begin
+      DoOutput('error: agent is not attached' + LineEnding, True);
+      Exit;
+    end;
+
+    if PropValue = string.Empty then
+    begin
+      DoOutput('usage: set chat <name>' + LineEnding, True);
+      Exit;
+    end;
+
+    // Strip surrounding quotes from the chat name
+    if (Length(PropValue) >= 2) and (PropValue[1] = '"') and (PropValue[Length(PropValue)] = '"') then
+      PropValue := Copy(PropValue, 2, Length(PropValue) - 2);
+
+    FAgent.ActiveChat.Name := PropValue;
+    DoOutput('chat = ' + PropValue + LineEnding, False);
+  end
   // term.* properties are handled locally, everything else goes to the agent
-  if LowerCase(Copy(PropName, 1, 5)) = 'term.' then
+  else if LowerCase(Copy(PropName, 1, 5)) = 'term.' then
     HandleTermSet(Copy(PropName, 6, MaxInt), PropValue)
   else if SetAgentProperty(FAgent, PropName, PropValue, ErrMsg) then
     DoOutput(PropName + ' = ' + PropValue + LineEnding, False)
@@ -2317,6 +2377,79 @@ begin
     Result := FormatFloat('0.0', ABytes / 1024.0) + ' KB'
   else
     Result := IntToStr(ABytes) + ' B';
+end;
+
+procedure TCustomTermManager.RestoreActiveChat;
+begin
+  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    Exit;
+
+  FHistory.Assign(FAgent.ActiveChat.TerminalHistory);
+  FShellLog.Assign(FAgent.ActiveChat.ShellLog);
+
+  ClearScreen;
+
+  // Replay the saved terminal output without recording it a second time
+  FRestoringChat := True;
+  try
+    ReplayChatOutput(FAgent.ActiveChat.TerminalOutput);
+  finally
+    FRestoringChat := False;
+  end;
+end;
+
+function TCustomTermManager.RemoveLastInput: boolean;
+var
+  LastInput, Payload, SearchText, OutputText: string;
+  Kind: TTermInputKind;
+  I, SearchFrom, MatchPos, StartPos: integer;
+begin
+  Result := False;
+  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or (FHistory.Count = 0) then
+    Exit;
+
+  LastInput := FHistory[FHistory.Count - 1];
+  Kind := ClassifyLine(LastInput, Payload);
+
+  // Remove the conversation exchange when the last input was sent to the agent
+  if (Kind = tikAgent) and not FAgent.RemoveLastExchange then
+    Exit;
+
+  // Remove the last shell operation when the last input was an external command
+  if (Kind = tikCommand) and (FShellLog.Count > 0) then
+  begin
+    FShellLog.Delete(FShellLog.Count - 1);
+    FAgent.ActiveChat.ShellLog.Assign(FShellLog);
+  end;
+
+  // Locate the last occurrence of the submitted input in the terminal transcript
+  OutputText := FAgent.ActiveChat.TerminalOutput;
+  SearchText := LastInput + LineEnding;
+  SearchFrom := 1;
+  MatchPos := 0;
+
+  while SearchFrom <= Length(OutputText) do
+  begin
+    I := Pos(SearchText, Copy(OutputText, SearchFrom, MaxInt));
+    if I = 0 then
+      Break;
+    MatchPos := SearchFrom + I - 1;
+    SearchFrom := MatchPos + 1;
+  end;
+
+  if MatchPos > 0 then
+  begin
+    StartPos := MatchPos;
+    while (StartPos > 1) and not (OutputText[StartPos - 1] in [#10, #13]) do
+      Dec(StartPos);
+
+    Delete(OutputText, StartPos, MaxInt);
+    FAgent.ActiveChat.TerminalOutput := OutputText;
+  end;
+
+  FHistory.Delete(FHistory.Count - 1);
+  FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+  Result := True;
 end;
 
 procedure TCustomTermManager.HandleOllamaPs;
@@ -4163,6 +4296,25 @@ var
     Result := Length(Line);
   end;
 
+    // Reset the input buffer and redraw the prompt
+  procedure ResetInput;
+  begin
+    Line := string.Empty;
+    CursorPos := 0;
+    HistIndex := FHistory.Count;
+    ClearSelection;
+
+    PromptText := GetPromptText;
+    ConWriteUtf8(PromptText);
+    FLastCharWasNewLine := False;
+    PromptRow := ConWhereY;
+    ScreenInfo := Default(TConsoleScreenBufferInfo);
+    PromptCol := 0;
+    if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
+      PromptCol := ScreenInfo.dwCursorPosition.X;
+    LastRedrawRows := 1;
+  end;
+
 begin
   Result := '';
   Rec := Default(INPUT_RECORD);
@@ -4217,6 +4369,18 @@ begin
     ShiftPressed := (Rec.Event.KeyEvent.dwControlKeyState and SHIFT_PRESSED) <> 0;
     CtrlPressed := (Rec.Event.KeyEvent.dwControlKeyState and
       (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+
+    // Delete the active chat with Ctrl+Shift+Delete
+    if CtrlPressed and ShiftPressed and
+      (Rec.Event.KeyEvent.wVirtualKeyCode = VK_DELETE) then
+    begin
+      if Assigned(FAgent) and FAgent.DeleteActiveChat then
+      begin
+        RestoreActiveChat;
+        ResetInput;
+        Continue;
+      end;
+    end;
 
     // Switch chats with Ctrl+Left and Ctrl+Right
     if CtrlPressed and
@@ -4289,6 +4453,14 @@ begin
         end;
       VK_BACK:
         begin
+          // Remove the previous input and its result with Ctrl+Backspace
+          if CtrlPressed and RemoveLastInput then
+          begin
+            RestoreActiveChat;
+            ResetInput;
+            Continue;
+          end;
+
           if HasSelection then
           begin
             Delete(Line, SelStart + 1, SelEnd - SelStart);
@@ -4587,7 +4759,9 @@ begin
 
   Result := Line;
   AddToHistory(Result);
-  AppendChatOutput(string(PromptText) + string(Line) + LineEnding);
+
+  if not IsChatControlCommand(Result) then
+    AppendChatOutput(string(PromptText) + string(Line) + LineEnding);
 end;
 
 {$ELSE}
@@ -4635,7 +4809,9 @@ begin
   ReadLn(S);
   Result := S;
   AddToHistory(S);
-  AppendChatOutput(PromptText + S + LineEnding);
+
+  if not IsChatControlCommand(Result) then
+    AppendChatOutput(PromptText + S + LineEnding);
 end;
 
 {$ENDIF}

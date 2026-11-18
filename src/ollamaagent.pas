@@ -272,6 +272,10 @@ type
     procedure Cancel;
     // Clears accumulated history of the active chat
     procedure ClearHistory;
+    // Removes the last user message and all following messages
+    function RemoveLastExchange: boolean;
+    // Deletes the active chat and activates the next available chat
+    function DeleteActiveChat: boolean;
     // Creates and activates a new chat
     function NewChat(const AName: string = ''): TAgentChat;
     // Switches to the adjacent chat, negative values select older chats
@@ -2846,6 +2850,49 @@ begin
   Result := True;
 end;
 
+function TCustomOllamaAgent.DeleteActiveChat: boolean;
+var
+  CurrentIndex, TargetIndex: integer;
+  Chat: TAgentChat;
+begin
+  Result := False;
+  if not FDone or not Assigned(FActiveChat) then
+    Exit;
+
+  CurrentIndex := FChats.IndexOf(FActiveChat);
+  if CurrentIndex < 0 then
+    Exit;
+
+  // Save the current chat state before deleting it
+  FActiveChat.ContextUsed := FContextUsed;
+  FActiveChat.ContextTotal := FContextTotal;
+
+  Chat := FActiveChat;
+  FChats.Delete(CurrentIndex);
+  FActiveChat := nil;
+  Chat.Free;
+
+  if FChats.Count = 0 then
+  begin
+    FHistory := string.Empty;
+    FContextUsed := 0;
+    FContextTotal := 0;
+    Result := Assigned(NewChat);
+    Exit;
+  end;
+
+  // Activate the next chat, or the previous one if there is no next chat
+  TargetIndex := CurrentIndex;
+  if TargetIndex >= FChats.Count then
+    TargetIndex := FChats.Count - 1;
+
+  FActiveChat := TAgentChat(FChats[TargetIndex]);
+  FHistory := FActiveChat.History;
+  FContextUsed := FActiveChat.ContextUsed;
+  FContextTotal := FActiveChat.ContextTotal;
+  Result := True;
+end;
+
 function TCustomOllamaAgent.SaveChatsToFile(const AFileName: string): boolean;
 var
   Root, ChatObj: TJSONObject;
@@ -3178,6 +3225,62 @@ begin
   FHistory := string.Empty;
   if Assigned(FActiveChat) then
     FActiveChat.History := string.Empty;
+end;
+
+function TCustomOllamaAgent.RemoveLastExchange: boolean;
+var
+  Data: TJSONData;
+  Messages: TJSONArray;
+  I, UserIndex: integer;
+begin
+  Result := False;
+  if not FDone or (FHistory = string.Empty) then
+    Exit;
+
+  Data := nil;
+  try
+    try
+      Data := GetJSON(FHistory);
+      if (Data = nil) or (Data.JSONType <> jtArray) then
+        Exit;
+
+      Messages := TJSONArray(Data);
+      UserIndex := -1;
+
+      // Find the last user message
+      for I := Messages.Count - 1 downto 0 do
+      begin
+        if Messages.Items[I].JSONType <> jtObject then
+          Continue;
+        if TJSONObject(Messages.Items[I]).Get('role', '') = 'user' then
+        begin
+          UserIndex := I;
+          Break;
+        end;
+      end;
+
+      if UserIndex < 0 then
+        Exit;
+
+      // Remove the user message and all following assistant and tool messages
+      while Messages.Count > UserIndex do
+        Messages.Delete(UserIndex);
+
+      FHistory := Messages.AsJSON;
+      if Assigned(FActiveChat) then
+      begin
+        FActiveChat.History := FHistory;
+        FActiveChat.ContextUsed := 0;
+      end;
+
+      FContextUsed := 0;
+      Result := True;
+    except
+      Result := False;
+    end;
+  finally
+    Data.Free;
+  end;
 end;
 
 function TCustomOllamaAgent.BuildSystemPrompt: string;
