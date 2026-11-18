@@ -3521,8 +3521,8 @@ var
   Rec, NextRec: INPUT_RECORD;
   N: DWORD = 0;
   Line, PromptText: RawByteString;
-  CursorPos, HistIndex, PromptRow: Integer;
-  LastCursorRow: Integer;
+  CursorPos, HistIndex, PromptRow, PromptCol: Integer;
+  ScreenInfo: TConsoleScreenBufferInfo;
   C: WideChar;
   Wide: UnicodeString;
   LastRedrawRows: Integer;
@@ -3754,7 +3754,7 @@ var
     Inc(CursorPos, Length(Utf8));
   end;
 
-  // Moves cursor vertically within the current input, returns False at edges
+  // Moves cursor vertically within logical lines, returns False at edges
   function MoveCursorVertical(ADelta: Integer): Boolean;
   var
     I, Idx, LineStart, TargetStart, TargetLen, Col: Integer;
@@ -3768,7 +3768,6 @@ var
     try
       if Lines.Count < 2 then
         Exit;
-      // Locate the current line by cursor byte position
       Idx := -1;
       LineStart := 0;
       for I := 0 to Lines.Count - 1 do
@@ -3784,16 +3783,13 @@ var
         Exit;
       if (Idx + ADelta < 0) or (Idx + ADelta >= Lines.Count) then
         Exit;
-      // Compute target line byte offset
       TargetStart := 0;
       for I := 0 to Idx + ADelta - 1 do
         Inc(TargetStart, Length(Lines[I]) + 2);
-      // Preserve character column instead of UTF-8 byte offset
       Col := Utf8CharCount(Copy(Lines[Idx], 1, CursorPos - LineStart));
       TargetLen := Utf8CharCount(Lines[Idx + ADelta]);
       if Col > TargetLen then
         Col := TargetLen;
-      // Convert target character column to UTF-8 byte offset
       TargetPos := 1;
       TargetBytePos := 0;
       for I := 1 to Col do
@@ -3806,6 +3802,48 @@ var
     finally
       Lines.Free;
     end;
+  end;
+
+  // Moves cursor vertically within a visually wrapped line
+  function MoveCursorWrapped(ADelta: Integer): Boolean;
+  var
+    Info: TConsoleScreenBufferInfo;
+    Width, CharCol, TotalChars, CurrentRow, CurrentCol: Integer;
+    TargetRow, TargetCharCol, TargetBytePos, I: Integer;
+  begin
+    Result := False;
+    if (Length(Line) = 0) or (Pos(LineEnding, Line) > 0) then
+      Exit;
+    Info := Default(TConsoleScreenBufferInfo);
+    if not GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+      Exit;
+    Width := Info.dwSize.X;
+    if Width <= 0 then
+      Exit;
+    CharCol := Utf8CharCount(Copy(Line, 1, CursorPos));
+    TotalChars := Utf8CharCount(Line);
+    CurrentRow := (PromptCol + CharCol) div Width;
+    CurrentCol := (PromptCol + CharCol) mod Width;
+    TargetRow := CurrentRow + ADelta;
+    if TargetRow < 0 then
+      Exit;
+    // Do not move beyond the last visual row
+    if TargetRow > (PromptCol + TotalChars - 1) div Width then
+      Exit;
+    TargetCharCol := TargetRow * Width + CurrentCol - PromptCol;
+    if TargetCharCol < 0 then
+      TargetCharCol := 0;
+    if TargetCharCol > TotalChars then
+      TargetCharCol := TotalChars;
+    TargetBytePos := 0;
+    I := 0;
+    while (I < TargetCharCol) and (TargetBytePos < Length(Line)) do
+    begin
+      TargetBytePos := Utf8NextPos(Line, TargetBytePos + 1) - 1;
+      Inc(I);
+    end;
+    CursorPos := TargetBytePos;
+    Result := True;
   end;
 
   // Inserts a UTF-8 char at the cursor, replacing the selection when active
@@ -3962,7 +4000,6 @@ var
 
     ConGotoXY(CurCol, CurRow);
     ShowConsoleCursor;
-    LastCursorRow := CurRow;
   end;
 
     // Returns byte offset of the start of the logical line containing APos
@@ -4023,8 +4060,11 @@ begin
   ConWriteUtf8(PromptText);
   FLastCharWasNewLine := False;
   PromptRow := ConWhereY;
+  ScreenInfo := Default(TConsoleScreenBufferInfo);
+  PromptCol := 0;
+  if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
+    PromptCol := ScreenInfo.dwCursorPosition.X;
   LastRedrawRows := 1;
-  LastCursorRow := PromptRow;
 
   while FRunning do
   begin
@@ -4182,35 +4222,82 @@ begin
         end;
       VK_HOME:
         begin
-          if ShiftPressed and not HasSelection then
-            SelAnchor := CursorPos
-          else if not ShiftPressed then
-            ClearSelection;
-          // Jump to start of the current logical line, not the buffer
-          CursorPos := FindLineStart(CursorPos);
-          if ShiftPressed then
-            UpdateSelection;
+          if CtrlPressed then
+          begin
+            if FHistory.Count > 0 then
+            begin
+              HistIndex := 0;
+              Line := FHistory[HistIndex];
+              SetCodePage(Line, CP_UTF8, False);
+              CursorPos := Length(Line);
+              ClearSelection;
+            end;
+          end
+          else
+          begin
+            if ShiftPressed and not HasSelection then
+              SelAnchor := CursorPos
+            else if not ShiftPressed then
+              ClearSelection;
+            // Jump to start of the current logical line, not the buffer
+            CursorPos := FindLineStart(CursorPos);
+            if ShiftPressed then
+              UpdateSelection;
+          end;
         end;
       VK_END:
         begin
-          if ShiftPressed and not HasSelection then
-            SelAnchor := CursorPos
-          else if not ShiftPressed then
-            ClearSelection;
-          // Jump to end of the current logical line, not the buffer
-          CursorPos := FindLineEnd(CursorPos);
-          if ShiftPressed then
-            UpdateSelection;
+          if CtrlPressed then
+          begin
+            if FHistory.Count > 0 then
+            begin
+              HistIndex := FHistory.Count - 1;
+              Line := FHistory[HistIndex];
+              SetCodePage(Line, CP_UTF8, False);
+              CursorPos := Length(Line);
+              ClearSelection;
+            end;
+          end
+          else
+          begin
+            if ShiftPressed and not HasSelection then
+              SelAnchor := CursorPos
+            else if not ShiftPressed then
+              ClearSelection;
+            // Jump to end of the current logical line, not the buffer
+            CursorPos := FindLineEnd(CursorPos);
+            if ShiftPressed then
+              UpdateSelection;
+          end;
         end;
       VK_UP:
+        if CtrlPressed then
+        begin
+          if HistIndex = FHistory.Count then
+          begin
+            if Line <> '' then
+              AddToHistory(Line);
+            HistIndex := FHistory.Count - 1;
+          end
+          else if HistIndex > 0 then
+            Dec(HistIndex);
+
+          if (HistIndex >= 0) and (HistIndex < FHistory.Count) then
+          begin
+            Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
+            CursorPos := Length(Line);
+          end;
+        end
+        else
         begin
           ClearSelection;
-          // When a single logical line is wrapped by the console, first jump
-          // to the start of that line so typed text is not lost to history
-          if (Length(Line) > 0) and (Pos(LineEnding, Line) = 0) and (LastCursorRow > PromptRow) then
-            CursorPos := FindLineStart(CursorPos)
-          // Move within multiline input first, fall back to history at top
-          else if not MoveCursorVertical(-1) then
+          // Move within visual or logical lines first, fall back to history at top
+          if Pos(LineEnding, Line) = 0 then
+            HasMore := MoveCursorWrapped(-1)
+          else
+            HasMore := MoveCursorVertical(-1);
+          if not HasMore then
           begin
             if HistIndex = FHistory.Count then
             begin
@@ -4236,10 +4323,31 @@ begin
           end;
         end;
       VK_DOWN:
+        if CtrlPressed then
+        begin
+          if HistIndex < FHistory.Count - 1 then
+          begin
+            Inc(HistIndex);
+            Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
+            CursorPos := Length(Line);
+          end
+          else if HistIndex = FHistory.Count - 1 then
+          begin
+            HistIndex := FHistory.Count;
+            Line := '';
+            CursorPos := 0;
+          end;
+        end
+        else
         begin
           ClearSelection;
-          // Move within multiline input first, fall back to history at bottom
-          if not MoveCursorVertical(1) then
+          // Move within visual or logical lines first, fall back to history at bottom
+          if Pos(LineEnding, Line) = 0 then
+            HasMore := MoveCursorWrapped(1)
+          else
+            HasMore := MoveCursorVertical(1);
+          if not HasMore then
           begin
             if HistIndex < FHistory.Count - 1 then
             begin
