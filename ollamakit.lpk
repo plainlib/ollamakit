@@ -63,7 +63,7 @@ SOFTWARE.
       </Item>
       <Item>
         <Filename Value="src\agentconfig.pas"/>
-        <UnitName Value="agentconfig"/>
+        <UnitName Value="AgentConfig"/>
       </Item>
       <Item>
         <Filename Value="ollamakitregister.pas"/>
@@ -76,13 +76,13 @@ SOFTWARE.
         <PackageName Value="LCLBase"/>
       </Item>
       <Item>
-        <PackageName Value="translator"/>
-      </Item>
-      <Item>
-        <PackageName Value="toolkit"/>
+        <PackageName Value="IDEIntf"/>
       </Item>
       <Item>
         <PackageName Value="helpers"/>
+      </Item>
+      <Item>
+        <PackageName Value="toolkit"/>
       </Item>
     </RequiredPkgs>
     <UsageOptions>
