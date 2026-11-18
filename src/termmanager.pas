@@ -853,6 +853,7 @@ procedure TCustomTermManager.CloseThinking;
 begin
   if FInThinking then
   begin
+    SetColor(tcDefault);
     // Close the last thinking line if it was not terminated
     if not FLastCharWasNewLine then
       WriteLine('', True);
@@ -871,7 +872,9 @@ begin
   if not FInThinking then
   begin
     SetColor(tcThinkingBadge);
-    WriteLine(FThinkingLabel, True);
+    WriteText(FThinkingLabel, True);
+    SetColor(tcDefault);
+    WriteLine('', True);
     // Switch to thinking text color for the reasoning body
     SetColor(tcDim);
     FInThinking := True;
@@ -899,8 +902,9 @@ begin
     if not FLastCharWasNewLine then
       WriteLine('', True);
     SetColor(tcToolBadge);
-    WriteLine('[finish]', True);
+    WriteText('[finish]', True);
     SetColor(tcDefault);
+    WriteLine('', True);
     if Assigned(FPrevAgentOnToolCall) then
       FPrevAgentOnToolCall(Sender, AName, AArgsJson);
     Exit;
@@ -944,8 +948,9 @@ begin
   if not FLastCharWasNewLine then
     WriteLine('', True);
   SetColor(tcToolBadge);
-  WriteLine(LabelText, True);
+  WriteText(LabelText, True);
   SetColor(tcDefault);
+  WriteLine('', True);
   // No blank line here, the tool result preview follows immediately
   if Assigned(FPrevAgentOnToolCall) then
     FPrevAgentOnToolCall(Sender, AName, AArgsJson);
@@ -965,8 +970,9 @@ begin
   if not FLastCharWasNewLine then
     WriteLine('', True);
   SetColor(tcDim);
-  WriteLine(AText, True);
+  WriteText(AText, True);
   SetColor(tcDefault);
+  WriteLine('', True);
 end;
 
 procedure TCustomTermManager.HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
@@ -984,8 +990,9 @@ begin
       if AAnswer = '' then
       begin
         SetColor(tcWarnBadge);
-        WriteLine('[empty response from model]', True);
+        WriteText('[empty response from model]', True);
         SetColor(tcDefault);
+        WriteLine('', True);
       end
       else if not Streamed then
         WriteLine(AAnswer, False)
@@ -997,20 +1004,23 @@ begin
     afrMaxSteps:
     begin
       SetColor(tcWarnBadge);
-      WriteLine('[max steps reached]', True);
+      WriteText('[max steps reached]', True);
       SetColor(tcDefault);
+      WriteLine('', True);
     end;
     afrError:
     begin
       SetColor(tcErrorBadge);
-      WriteLine('[error: ' + AErrorMsg + ']', True);
+      WriteText('[error: ' + AErrorMsg + ']', True);
       SetColor(tcDefault);
+      WriteLine('', True);
     end;
     afrModelNotSet:
     begin
       SetColor(tcErrorBadge);
-      WriteLine('[agent not configured: ' + AErrorMsg + ']', True);
+      WriteText('[agent not configured: ' + AErrorMsg + ']', True);
       SetColor(tcDefault);
+      WriteLine('', True);
     end;
     else
       ;
