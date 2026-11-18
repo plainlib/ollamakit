@@ -1772,10 +1772,8 @@ begin
 end;
 
 procedure TCustomTermManager.HandleGetCommand(const AArg: string);
-const
-  MAX_PREVIEW = 500;
 var
-  Value, ErrMsg, Display, Tail: string;
+  Value, ErrMsg: string;
 begin
   if Trim(AArg) = '' then
   begin
@@ -1794,17 +1792,7 @@ begin
     DoOutput('error: ' + ErrMsg + LineEnding, True);
     Exit;
   end;
-  // Collapse newlines and truncate long values for display
-  Display := StringReplace(Value, #13#10, ' ', [rfReplaceAll]);
-  Display := StringReplace(Display, #10, ' ', [rfReplaceAll]);
-  Display := StringReplace(Display, #13, ' ', [rfReplaceAll]);
-  Tail := '';
-  if Length(Display) > MAX_PREVIEW then
-  begin
-    Display := Copy(Display, 1, MAX_PREVIEW);
-    Tail := ' ... [' + IntToStr(Length(Value)) + ' chars total, truncated]';
-  end;
-  DoOutput(AArg + ' = ' + Display + Tail + LineEnding, False);
+  DoOutput(AArg + ' = ' + Value + LineEnding, False);
 end;
 
 procedure TCustomTermManager.HandleTermSet(const AName, AValue: string);
