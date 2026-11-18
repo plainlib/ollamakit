@@ -969,6 +969,8 @@ procedure TCustomOllamaManager.ProcessRefreshData(const TagsJson, PsJson: string
   const ErrorMsg: string; AGen: integer);
 var
   NewInstalled, NewRunning: TStringList;
+  ModelsChanged: boolean;
+  I: integer;
 begin
   if FShutdown then
     Exit;
@@ -990,19 +992,41 @@ begin
 
   NewInstalled := nil;
   NewRunning := nil;
+  ModelsChanged := False;
   try
     try
       NewInstalled := ParseModels(TagsJson, nil);
       NewRunning := ParseModels(PsJson, FRunningDetails);
+
+      ModelsChanged := (FInstalledModels.Count <> NewInstalled.Count) or (FRunningModels.Count <> NewRunning.Count);
+
+      if not ModelsChanged then
+        for I := 0 to NewInstalled.Count - 1 do
+          if FInstalledModels[I] <> NewInstalled[I] then
+          begin
+            ModelsChanged := True;
+            Break;
+          end;
+
+      if not ModelsChanged then
+        for I := 0 to NewRunning.Count - 1 do
+          if FRunningModels[I] <> NewRunning[I] then
+          begin
+            ModelsChanged := True;
+            Break;
+          end;
+
       FInstalledModels.Assign(NewInstalled);
       FRunningModels.Assign(NewRunning);
       FConnected := True;
+
       if Assigned(FOnConnected) then
       try
         FOnConnected(Self);
       except
         ; // Ignore user handler exceptions
       end;
+
       if Assigned(FOnModelsRefreshed) then
       try
         FOnModelsRefreshed(Self, FInstalledModels);
@@ -1018,10 +1042,8 @@ begin
     NewRunning.Free;
   end;
 
-  // Rebuilding the popup while it is still visible causes a visible flicker
-  // on some platforms. Skip the rebuild unless the connection state changed
-  // or the menu was opened more than 500 ms ago.
-  if Assigned(FPopupMenu) and ((FConnected <> FWasConnectedAtPopup) or (GetTickCount64 - FLastPopupTick > 500)) then
+  // Rebuild the popup only when the connection state or model lists change
+  if Assigned(FPopupMenu) and ((FConnected <> FWasConnectedAtPopup) or ModelsChanged) then
     BuildPopupMenu;
 end;
 
@@ -2325,8 +2347,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2394,8 +2416,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
