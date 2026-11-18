@@ -55,6 +55,31 @@ type
 type
   TCustomOllamaAgent = class;
 
+  // Stores all conversation and terminal data for one chat
+  TAgentChat = class
+  private
+    FID: integer;
+    FName: string;
+    FHistory: string;
+    FTerminalHistory: TStringList;
+    FShellLog: TStringList;
+    FTerminalOutput: string;
+    FContextUsed: integer;
+    FContextTotal: integer;
+  public
+    constructor Create(AID: integer; const AName: string);
+    destructor Destroy; override;
+
+    property ID: integer read FID;
+    property Name: string read FName write FName;
+    property History: string read FHistory write FHistory;
+    property TerminalHistory: TStringList read FTerminalHistory;
+    property ShellLog: TStringList read FShellLog;
+    property TerminalOutput: string read FTerminalOutput write FTerminalOutput;
+    property ContextUsed: integer read FContextUsed write FContextUsed;
+    property ContextTotal: integer read FContextTotal write FContextTotal;
+  end;
+
   // Web access options used by web_fetch and web_search tools
   TAgentWebOptions = class(TPersistent)
   private
@@ -137,6 +162,9 @@ type
     FWebOptions: TAgentWebOptions;
     FKeepHistory: boolean;
     FHistory: string;
+    FChats: TList;
+    FActiveChat: TAgentChat;
+    FNextChatID: integer;
     FDone: boolean;
     FCancelled: boolean;
     FFinalAnswer: string;
@@ -179,6 +207,9 @@ type
     procedure SetRootPath(const AValue: string);
     function GetHistory: string;
     procedure SetHistory(const AValue: string);
+    function GetChatCount: integer;
+    function GetChat(AIndex: integer): TAgentChat;
+    function GetChatIndexByID(AID: integer): integer;
     function GetContextPercent: integer;
     function GetContextUsedKb: integer;
     function GetContextTotalKb: integer;
@@ -239,8 +270,20 @@ type
     function Run(const AText: string): string;
     // Requests cancellation, effective between steps and inside streaming
     procedure Cancel;
-    // Clears accumulated history
+    // Clears accumulated history of the active chat
     procedure ClearHistory;
+    // Creates and activates a new chat
+    function NewChat(const AName: string = ''): TAgentChat;
+    // Switches to the adjacent chat, negative values select older chats
+    function SwitchChat(ADelta: integer): boolean;
+    // Saves all chats to a JSON file
+    function SaveChatsToFile(const AFileName: string): boolean;
+    // Loads all chats from a JSON file
+    function LoadChatsFromFile(const AFileName: string): boolean;
+    // Saves the active chat to a separate JSON file
+    function SaveChatToFile(const AFileName: string): boolean;
+    // Loads a chat from a separate JSON file and activates it
+    function LoadChatFromFile(const AFileName: string): TAgentChat;
     // Dispatches one tool call, called by the worker thread
     function DispatchTool(const AName, AArgsJson: string): string; virtual;
     // Builds an actionable error listing available tools and hints
@@ -275,6 +318,9 @@ type
     property AllowAccessToSystem: boolean read FAllowAccessToSystem write FAllowAccessToSystem default True;
     property BlockSensitiveFiles: boolean read FBlockSensitiveFiles write FBlockSensitiveFiles default True;
     property History: string read GetHistory write SetHistory;
+    property ActiveChat: TAgentChat read FActiveChat;
+    property ChatCount: integer read GetChatCount;
+    property Chats[AIndex: integer]: TAgentChat read GetChat;
     property ContextUsed: integer read FContextUsed;
     property ContextTotal: integer read FContextTotal write FContextTotal;
     property ContextPercent: integer read GetContextPercent;
@@ -1834,6 +1880,7 @@ var
   AllParallelSafe: boolean;
   Threads: TList;
   SupportsTools: boolean;
+  StoredHistory: TJSONArray;
 begin
   Reason := afrError;
   ErrMsg := '';
@@ -2375,53 +2422,92 @@ begin
     if FinalContent = '' then
       FinalContent := FCurrentContent;
     FAgent.FFinalAnswer := FinalContent;
-    if FAgent.KeepHistory then
-    begin
-      try
-        // Resolve orphaned tool calls for both cancelled and error paths,
-        // otherwise the next run sends assistant tool_calls without replies
-        if (Reason = afrCancelled) or (Reason = afrError) then
+    try
+      // Resolve orphaned tool calls for both cancelled and error paths,
+      // otherwise the next run sends assistant tool_calls without replies
+      if (Reason = afrCancelled) or (Reason = afrError) then
+      begin
+        if (MessagesArr.Count > 0) and (MessagesArr.Items[MessagesArr.Count - 1].JSONType = jtObject) then
         begin
-          if (MessagesArr.Count > 0) and (MessagesArr.Items[MessagesArr.Count - 1].JSONType = jtObject) then
+          Data := TJSONObject(MessagesArr.Items[MessagesArr.Count - 1]).Find('tool_calls');
+          if (Data <> nil) and (Data.JSONType = jtArray) then
           begin
-            Data := TJSONObject(MessagesArr.Items[MessagesArr.Count - 1]).Find('tool_calls');
-            if (Data <> nil) and (Data.JSONType = jtArray) then
+            for I := 0 to TJSONArray(Data).Count - 1 do
             begin
-              for I := 0 to TJSONArray(Data).Count - 1 do
-              begin
-                MsgObj := TJSONObject.Create;
-                MsgObj.Add('role', 'tool');
-                if Reason = afrCancelled then
-                  MsgObj.Add('content', '{"error": "cancelled by user before execution"}')
-                else
-                  MsgObj.Add('content', '{"error": "aborted by error before execution"}');
-                MessagesArr.Add(MsgObj);
-              end;
+              MsgObj := TJSONObject.Create;
+              MsgObj.Add('role', 'tool');
+              if Reason = afrCancelled then
+                MsgObj.Add('content', '{"error": "cancelled by user before execution"}')
+              else
+                MsgObj.Add('content', '{"error": "aborted by error before execution"}');
+              MessagesArr.Add(MsgObj);
             end;
-            // Do not free Data, it is owned by the parent message object
-            Data := nil;
           end;
+          // Do not free Data, it is owned by the parent message object
+          Data := nil;
         end;
-        // Close a cancelled turn with partial content and a cancel marker
-        if Reason = afrCancelled then
-        begin
-          MsgObj := TJSONObject.Create;
-          MsgObj.Add('role', 'assistant');
-          if FinalContent <> '' then
-            MsgObj.Add('content', FinalContent + #10#10 +
-              '[cancelled by user, partial answer above may be incomplete, user may refer to it]')
-          else
-            MsgObj.Add('content', '[cancelled by user before any answer was produced, user may refer to this request]');
-          MessagesArr.Add(MsgObj);
-        end;
-        // Strip leading system message, it is rebuilt on each run
-        if (MessagesArr.Count > 0) and (MessagesArr.Items[0].JSONType = jtObject) and
-          (TJSONObject(MessagesArr.Items[0]).Get('role', '') = 'system') then
-          MessagesArr.Delete(0);
-        FAgent.FHistory := MessagesArr.AsJSON;
-      except
-        ; // Ignore history save errors
       end;
+
+      // Close a cancelled turn with partial content and a cancel marker
+      if Reason = afrCancelled then
+      begin
+        MsgObj := TJSONObject.Create;
+        MsgObj.Add('role', 'assistant');
+        if FinalContent <> '' then
+          MsgObj.Add('content', FinalContent + #10#10 +
+            '[cancelled by user, partial answer above may be incomplete, user may refer to it]')
+        else
+          MsgObj.Add('content', '[cancelled by user before any answer was produced, user may refer to this request]');
+        MessagesArr.Add(MsgObj);
+      end;
+
+      // Strip leading system message, it is rebuilt on each run
+      if (MessagesArr.Count > 0) and (MessagesArr.Items[0].JSONType = jtObject) and
+        (TJSONObject(MessagesArr.Items[0]).Get('role', '') = 'system') then
+        MessagesArr.Delete(0);
+
+      if FAgent.KeepHistory then
+        FAgent.FHistory := MessagesArr.AsJSON
+      else
+      begin
+        // Preserve previous messages without sending them to the model
+        StoredHistory := TJSONArray.Create;
+        try
+          if FAgent.FHistory <> string.Empty then
+          begin
+            Data := nil;
+            try
+              try
+                Data := GetJSON(FAgent.FHistory);
+                if (Data <> nil) and (Data.JSONType = jtArray) then
+                  for I := 0 to TJSONArray(Data).Count - 1 do
+                    StoredHistory.Add(TJSONArray(Data).Items[I].Clone);
+              except
+                ; // Ignore invalid stored history
+              end;
+            finally
+              Data.Free;
+            end;
+          end;
+
+          // Append messages from the current run
+          for I := 0 to MessagesArr.Count - 1 do
+            StoredHistory.Add(MessagesArr.Items[I].Clone);
+
+          FAgent.FHistory := StoredHistory.AsJSON;
+        finally
+          StoredHistory.Free;
+        end;
+      end;
+
+      if Assigned(FAgent.FActiveChat) then
+      begin
+        FAgent.FActiveChat.History := FAgent.FHistory;
+        FAgent.FActiveChat.ContextUsed := FAgent.FContextUsed;
+        FAgent.FActiveChat.ContextTotal := FAgent.FContextTotal;
+      end;
+    except
+      ; // Ignore history save errors
     end;
     MessagesArr.Free;
     QueueFinish(Reason, FAgent.FFinalAnswer, ErrMsg);
@@ -2459,6 +2545,26 @@ begin
   Result := TAgentTool(inherited Add);
 end;
 
+constructor TAgentChat.Create(AID: integer; const AName: string);
+begin
+  inherited Create;
+  FID := AID;
+  FName := AName;
+  FHistory := string.Empty;
+  FTerminalHistory := TStringList.Create;
+  FShellLog := TStringList.Create;
+  FTerminalOutput := string.Empty;
+  FContextUsed := 0;
+  FContextTotal := 0;
+end;
+
+destructor TAgentChat.Destroy;
+begin
+  FTerminalHistory.Free;
+  FShellLog.Free;
+  inherited Destroy;
+end;
+
 { TCustomOllamaAgent }
 
 constructor TCustomOllamaAgent.Create(AOwner: TComponent);
@@ -2473,6 +2579,9 @@ begin
   FRootPath := '';
   FKeepHistory := False;
   FHistory := '';
+  FChats := TList.Create;
+  FActiveChat := nil;
+  FNextChatID := 0;
   FDone := True;
   FCancelled := False;
   FFinalAnswer := '';
@@ -2491,6 +2600,7 @@ begin
   FCapabilitiesCache.NameValueSeparator := '=';
   FTools := TAgentTools.Create(Self);
   FWebOptions := TAgentWebOptions.Create;
+  NewChat;
 end;
 
 destructor TCustomOllamaAgent.Destroy;
@@ -2503,6 +2613,12 @@ begin
   FCapabilitiesCache.Free;
   FWebOptions.Free;
   FTools.Free;
+  while FChats.Count > 0 do
+  begin
+    TAgentChat(FChats[FChats.Count - 1]).Free;
+    FChats.Delete(FChats.Count - 1);
+  end;
+  FChats.Free;
   inherited Destroy;
 end;
 
@@ -2548,18 +2664,397 @@ end;
 
 function TCustomOllamaAgent.GetHistory: string;
 begin
-  Result := FHistory;
+  if Assigned(FActiveChat) then
+    Result := FActiveChat.History
+  else
+    Result := FHistory;
 end;
 
 procedure TCustomOllamaAgent.SetHistory(const AValue: string);
 begin
   FHistory := AValue;
+  if Assigned(FActiveChat) then
+    FActiveChat.History := AValue;
+end;
+
+function TCustomOllamaAgent.GetChatCount: integer;
+begin
+  Result := FChats.Count;
+end;
+
+function TCustomOllamaAgent.GetChat(AIndex: integer): TAgentChat;
+begin
+  Result := nil;
+  if (AIndex >= 0) and (AIndex < FChats.Count) then
+    Result := TAgentChat(FChats[AIndex]);
+end;
+
+function TCustomOllamaAgent.GetChatIndexByID(AID: integer): integer;
+var
+  I: integer;
+begin
+  Result := -1;
+  for I := 0 to FChats.Count - 1 do
+    if TAgentChat(FChats[I]).ID = AID then
+      Exit(I);
+end;
+
+function TCustomOllamaAgent.NewChat(const AName: string): TAgentChat;
+var
+  ChatName: string;
+begin
+  Result := nil;
+  if not FDone then
+    Exit;
+
+  Inc(FNextChatID);
+  ChatName := AName;
+  if ChatName = string.Empty then
+    ChatName := 'Chat ' + IntToStr(FNextChatID);
+
+  // Save context counters of the previous chat
+  if Assigned(FActiveChat) then
+  begin
+    FActiveChat.ContextUsed := FContextUsed;
+    FActiveChat.ContextTotal := FContextTotal;
+  end;
+
+  Result := TAgentChat.Create(FNextChatID, ChatName);
+  FChats.Add(Result);
+  FActiveChat := Result;
+  FHistory := Result.History;
+  FContextUsed := Result.ContextUsed;
+  FContextTotal := Result.ContextTotal;
+end;
+
+function TCustomOllamaAgent.SwitchChat(ADelta: integer): boolean;
+var
+  CurrentIndex, TargetIndex: integer;
+begin
+  Result := False;
+  if not FDone or (ADelta = 0) or not Assigned(FActiveChat) then
+    Exit;
+
+  CurrentIndex := FChats.IndexOf(FActiveChat);
+  if CurrentIndex < 0 then
+    Exit;
+
+  TargetIndex := CurrentIndex + ADelta;
+  if (TargetIndex < 0) or (TargetIndex >= FChats.Count) then
+    Exit;
+
+  // Save the current chat state before switching
+  FActiveChat.ContextUsed := FContextUsed;
+  FActiveChat.ContextTotal := FContextTotal;
+
+  FActiveChat := TAgentChat(FChats[TargetIndex]);
+  FHistory := FActiveChat.History;
+  FContextUsed := FActiveChat.ContextUsed;
+  FContextTotal := FActiveChat.ContextTotal;
+  Result := True;
+end;
+
+function TCustomOllamaAgent.SaveChatsToFile(const AFileName: string): boolean;
+var
+  Root, ChatObj: TJSONObject;
+  ChatsArray, HistoryArray, ShellArray: TJSONArray;
+  Chat: TAgentChat;
+  I, J: integer;
+  Data: TStringList;
+begin
+  Result := False;
+  if Trim(AFileName) = string.Empty then
+    Exit;
+
+  Root := TJSONObject.Create;
+  try
+    Root.Add('version', 1);
+    if Assigned(FActiveChat) then
+      Root.Add('active_chat_id', FActiveChat.ID)
+    else
+      Root.Add('active_chat_id', 0);
+
+    ChatsArray := TJSONArray.Create;
+    Root.Add('chats', ChatsArray);
+
+    for I := 0 to FChats.Count - 1 do
+    begin
+      Chat := TAgentChat(FChats[I]);
+      ChatObj := TJSONObject.Create;
+      ChatObj.Add('id', Chat.ID);
+      ChatObj.Add('name', Chat.Name);
+      ChatObj.Add('history', Chat.History);
+      ChatObj.Add('context_used', Chat.ContextUsed);
+      ChatObj.Add('context_total', Chat.ContextTotal);
+      ChatObj.Add('terminal_output', Chat.TerminalOutput);
+
+      HistoryArray := TJSONArray.Create;
+      for J := 0 to Chat.TerminalHistory.Count - 1 do
+        HistoryArray.Add(Chat.TerminalHistory[J]);
+      ChatObj.Add('terminal_history', HistoryArray);
+
+      ShellArray := TJSONArray.Create;
+      for J := 0 to Chat.ShellLog.Count - 1 do
+        ShellArray.Add(Chat.ShellLog[J]);
+      ChatObj.Add('shell_log', ShellArray);
+
+      ChatsArray.Add(ChatObj);
+    end;
+
+    Data := TStringList.Create;
+    try
+      Data.Text := Root.AsJSON;
+      Data.SaveToFile(AFileName);
+      Result := True;
+    finally
+      Data.Free;
+    end;
+  except
+    Result := False;
+  end;
+  Root.Free;
+end;
+
+function TCustomOllamaAgent.LoadChatsFromFile(const AFileName: string): boolean;
+var
+  Data: TJSONData;
+  Root, ChatObj: TJSONObject;
+  ChatsArray, HistoryArray, ShellArray: TJSONArray;
+  Item: TJSONData;
+  NewChats: TList;
+  Chat: TAgentChat;
+  FileData: TStringList;
+  I, J, ChatID, ActiveID, MaxID: integer;
+begin
+  Result := False;
+  if not FDone or (Trim(AFileName) = string.Empty) then
+    Exit;
+
+  Data := nil;
+  NewChats := TList.Create;
+  FileData := TStringList.Create;
+  try
+    try
+      FileData.LoadFromFile(AFileName);
+      Data := GetJSON(FileData.Text);
+      if not (Data is TJSONObject) then
+        Exit;
+
+      Root := TJSONObject(Data);
+      Item := Root.Find('chats');
+      if not (Item is TJSONArray) then
+        Exit;
+      ChatsArray := TJSONArray(Item);
+
+      ActiveID := Root.Get('active_chat_id', 0);
+      MaxID := 0;
+
+      for I := 0 to ChatsArray.Count - 1 do
+      begin
+        if not (ChatsArray.Items[I] is TJSONObject) then
+          Continue;
+
+        ChatObj := TJSONObject(ChatsArray.Items[I]);
+        ChatID := ChatObj.Get('id', I + 1);
+        if ChatID <= 0 then
+          ChatID := I + 1;
+
+        Chat := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
+        Chat.History := ChatObj.Get('history', string.Empty);
+        Chat.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
+        Chat.ContextUsed := ChatObj.Get('context_used', 0);
+        Chat.ContextTotal := ChatObj.Get('context_total', 0);
+
+        Item := ChatObj.Find('terminal_history');
+        if Item is TJSONArray then
+        begin
+          HistoryArray := TJSONArray(Item);
+          for J := 0 to HistoryArray.Count - 1 do
+            Chat.TerminalHistory.Add(HistoryArray.Items[J].AsString);
+        end;
+
+        Item := ChatObj.Find('shell_log');
+        if Item is TJSONArray then
+        begin
+          ShellArray := TJSONArray(Item);
+          for J := 0 to ShellArray.Count - 1 do
+            Chat.ShellLog.Add(ShellArray.Items[J].AsString);
+        end;
+
+        NewChats.Add(Chat);
+        if ChatID > MaxID then
+          MaxID := ChatID;
+      end;
+
+      if NewChats.Count = 0 then
+      begin
+        Chat := TAgentChat.Create(1, 'Chat 1');
+        NewChats.Add(Chat);
+        MaxID := 1;
+      end;
+
+      // Replace current chats only after the file has been parsed successfully
+      for I := 0 to FChats.Count - 1 do
+        TAgentChat(FChats[I]).Free;
+      FChats.Clear;
+
+      for I := 0 to NewChats.Count - 1 do
+        FChats.Add(NewChats[I]);
+      NewChats.Clear;
+
+      FActiveChat := TAgentChat(FChats[0]);
+      for I := 0 to FChats.Count - 1 do
+        if TAgentChat(FChats[I]).ID = ActiveID then
+        begin
+          FActiveChat := TAgentChat(FChats[I]);
+          Break;
+        end;
+
+      FNextChatID := MaxID;
+      FHistory := FActiveChat.History;
+      FContextUsed := FActiveChat.ContextUsed;
+      FContextTotal := FActiveChat.ContextTotal;
+      Result := True;
+    except
+      Result := False;
+    end;
+  finally
+    for I := 0 to NewChats.Count - 1 do
+      TAgentChat(NewChats[I]).Free;
+    NewChats.Free;
+    FileData.Free;
+    Data.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.SaveChatToFile(const AFileName: string): boolean;
+var
+  Root, ChatObj: TJSONObject;
+  HistoryArray, ShellArray: TJSONArray;
+  Data: TStringList;
+  I: integer;
+begin
+  Result := False;
+  if not Assigned(FActiveChat) or (Trim(AFileName) = string.Empty) then
+    Exit;
+
+  Root := TJSONObject.Create;
+  try
+    ChatObj := TJSONObject.Create;
+    ChatObj.Add('id', FActiveChat.ID);
+    ChatObj.Add('name', FActiveChat.Name);
+    ChatObj.Add('history', FActiveChat.History);
+    ChatObj.Add('context_used', FActiveChat.ContextUsed);
+    ChatObj.Add('context_total', FActiveChat.ContextTotal);
+    ChatObj.Add('terminal_output', FActiveChat.TerminalOutput);
+
+    HistoryArray := TJSONArray.Create;
+    for I := 0 to FActiveChat.TerminalHistory.Count - 1 do
+      HistoryArray.Add(FActiveChat.TerminalHistory[I]);
+    ChatObj.Add('terminal_history', HistoryArray);
+
+    ShellArray := TJSONArray.Create;
+    for I := 0 to FActiveChat.ShellLog.Count - 1 do
+      ShellArray.Add(FActiveChat.ShellLog[I]);
+    ChatObj.Add('shell_log', ShellArray);
+
+    Root.Add('version', 1);
+    Root.Add('chat', ChatObj);
+
+    Data := TStringList.Create;
+    try
+      Data.Text := Root.AsJSON;
+      Data.SaveToFile(AFileName);
+      Result := True;
+    finally
+      Data.Free;
+    end;
+  except
+    Result := False;
+  end;
+  Root.Free;
+end;
+
+function TCustomOllamaAgent.LoadChatFromFile(const AFileName: string): TAgentChat;
+var
+  Data: TJSONData;
+  Root, ChatObj: TJSONObject;
+  Item: TJSONData;
+  HistoryArray, ShellArray: TJSONArray;
+  FileData: TStringList;
+  I, ChatID: integer;
+begin
+  Result := nil;
+  if not FDone or (Trim(AFileName) = string.Empty) then
+    Exit;
+
+  Data := nil;
+  FileData := TStringList.Create;
+  try
+    try
+      FileData.LoadFromFile(AFileName);
+      Data := GetJSON(FileData.Text);
+      if not (Data is TJSONObject) then
+        Exit;
+
+      Root := TJSONObject(Data);
+      Item := Root.Find('chat');
+      if Item is TJSONObject then
+        ChatObj := TJSONObject(Item)
+      else
+        ChatObj := Root;
+
+      ChatID := ChatObj.Get('id', 0);
+      if (ChatID <= 0) or (GetChatIndexByID(ChatID) >= 0) then
+      begin
+        Inc(FNextChatID);
+        ChatID := FNextChatID;
+      end
+      else if ChatID > FNextChatID then
+        FNextChatID := ChatID;
+
+      Result := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
+      Result.History := ChatObj.Get('history', string.Empty);
+      Result.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
+      Result.ContextUsed := ChatObj.Get('context_used', 0);
+      Result.ContextTotal := ChatObj.Get('context_total', 0);
+
+      Item := ChatObj.Find('terminal_history');
+      if Item is TJSONArray then
+      begin
+        HistoryArray := TJSONArray(Item);
+        for I := 0 to HistoryArray.Count - 1 do
+          Result.TerminalHistory.Add(HistoryArray.Items[I].AsString);
+      end;
+
+      Item := ChatObj.Find('shell_log');
+      if Item is TJSONArray then
+      begin
+        ShellArray := TJSONArray(Item);
+        for I := 0 to ShellArray.Count - 1 do
+          Result.ShellLog.Add(ShellArray.Items[I].AsString);
+      end;
+
+      FChats.Add(Result);
+      FActiveChat := Result;
+      FHistory := Result.History;
+      FContextUsed := Result.ContextUsed;
+      FContextTotal := Result.ContextTotal;
+    except
+      FreeAndNil(Result);
+    end;
+  finally
+    FileData.Free;
+    Data.Free;
+  end;
 end;
 
 procedure TCustomOllamaAgent.RunAsync(const AText: string);
 begin
   if not FDone then
     Exit;
+  if Assigned(FActiveChat) then
+    FHistory := FActiveChat.History;
   FDone := False;
   FCancelled := False;
   FFinalAnswer := '';
@@ -2588,7 +3083,9 @@ end;
 
 procedure TCustomOllamaAgent.ClearHistory;
 begin
-  FHistory := '';
+  FHistory := string.Empty;
+  if Assigned(FActiveChat) then
+    FActiveChat.History := string.Empty;
 end;
 
 function TCustomOllamaAgent.BuildSystemPrompt: string;
@@ -2602,6 +3099,10 @@ begin
   Result := string(FSystemPrompt);
   Result := StringReplace(Result, '{path}', GetEffectiveRootPath, [rfReplaceAll]);
   Result := StringReplace(Result, '{model}', FModelName, [rfReplaceAll]);
+  if Assigned(FActiveChat) then
+    Result := StringReplace(Result, '{chat}', FActiveChat.Name, [rfReplaceAll])
+  else
+    Result := StringReplace(Result, '{chat}', string.Empty, [rfReplaceAll]);
   ToolList := BuildToolsNames;
   if ToolList = '' then
     ToolList := 'none';

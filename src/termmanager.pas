@@ -144,6 +144,8 @@ type
     FLastExitCode: integer;
     // Attached agent used to answer agent-classified input
     FAgent: TCustomOllamaAgent;
+    // Prevents restored output from being recorded again
+    FRestoringChat: boolean;
     // Previous agent handlers, restored when agent is detached
     FPrevAgentOnChunk: TAgentChunkEvent;
     FPrevAgentOnLog: TAgentLogEvent;
@@ -190,6 +192,10 @@ type
     procedure SetPath(const AValue: string);
     procedure SetAgent(const AValue: TCustomOllamaAgent);
     procedure SetHistory(const AValue: TStringList);
+    // Switches the active agent chat and restores its terminal state
+    function SwitchActiveChat(ADelta: integer): boolean;
+    // Appends terminal text to the active chat transcript
+    procedure AppendChatOutput(const AText: string);
     procedure SetColors(const AValue: TTermColorScheme);
     procedure SetShellHistory(const AValue: TAgentShellHistory);
     // Handles help, help agent, and ? alias
@@ -234,6 +240,7 @@ type
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
     // Applies a semantic color to subsequent output, no-op on non-Windows
     procedure SetColor(AColor: TTermColor); virtual;
+    procedure ReplayChatOutput(const AText: string);
     // Returns Path or process current directory when Path is empty
     function GetEffectivePath: string; virtual;
     // Returns prompt text with {path} placeholder replaced by Path
@@ -692,6 +699,7 @@ begin
   FColors := TTermColorScheme.Create;
   FDefaultModelLabel := 'plainconsole';
   FAgent := nil;
+  FRestoringChat := False;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
   FPrevAgentOnToolCall := nil;
@@ -795,8 +803,17 @@ procedure TCustomTermManager.SetAgent(const AValue: TCustomOllamaAgent);
 begin
   if FAgent = AValue then
     Exit;
+
+  // Preserve the current chat buffers before detaching the agent
+  if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+  begin
+    FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+    FAgent.ActiveChat.ShellLog.Assign(FShellLog);
+  end;
+
   if Assigned(FAgent) then
     FAgent.RemoveFreeNotification(Self);
+
   FAgent := AValue;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
@@ -807,13 +824,21 @@ begin
   FPrevAgentOnAskUser := nil;
   FPrevAgentOnLog := nil;
   FInThinking := False;
+
   if Assigned(FAgent) then
   begin
     FAgent.FreeNotification(Self);
+
+    if Assigned(FAgent.ActiveChat) then
+    begin
+      FHistory.Assign(FAgent.ActiveChat.TerminalHistory);
+      FShellLog.Assign(FAgent.ActiveChat.ShellLog);
+    end;
+
     // Share terminal directory and shell name with the agent at runtime only
     if not (csDesigning in ComponentState) then
     begin
-      if FAgent.RootPath = '' then
+      if FAgent.RootPath = string.Empty then
         FAgent.RootPath := GetEffectivePath;
       FAgent.ExecShellInfo := FShellExec;
       // Route agent log lines through the terminal so they are colored
@@ -821,6 +846,45 @@ begin
       FAgent.OnLog := @HandleAgentLog;
     end;
   end;
+end;
+
+function TCustomTermManager.SwitchActiveChat(ADelta: integer): boolean;
+begin
+  Result := False;
+  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    Exit;
+
+  if not FAgent.SwitchChat(ADelta) then
+    Exit;
+
+  // Restore terminal command history and shell context for the selected chat
+  FHistory.Assign(FAgent.ActiveChat.TerminalHistory);
+  FShellLog.Assign(FAgent.ActiveChat.ShellLog);
+
+  ClearScreen;
+
+  // Replay the saved terminal output without recording it a second time
+  FRestoringChat := True;
+  try
+    ReplayChatOutput(FAgent.ActiveChat.TerminalOutput);
+  finally
+    FRestoringChat := False;
+  end;
+
+  Result := True;
+end;
+
+procedure TCustomTermManager.AppendChatOutput(const AText: string);
+begin
+  if AText = string.Empty then
+    Exit;
+  if FRestoringChat then
+    Exit;
+  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    Exit;
+
+  FAgent.ActiveChat.TerminalOutput :=
+    FAgent.ActiveChat.TerminalOutput + AText;
 end;
 
 procedure TCustomTermManager.SetHistory(const AValue: TStringList);
@@ -1059,6 +1123,9 @@ begin
   FShellLog.Add(Line);
   while FShellLog.Count > FShellHistory.MaxEntries do
     FShellLog.Delete(0);
+
+  if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+    FAgent.ActiveChat.ShellLog.Assign(FShellLog);
 end;
 
 function TCustomTermManager.IsMetaCommand(const ACommand: string): boolean;
@@ -1308,6 +1375,7 @@ begin
     // Strip may fail on malformed UTF-8, fall back to raw text
     Sanitized := AText;
   end;
+  AppendChatOutput(Sanitized);
   Utf8 := UTF8Encode(Sanitized);
   {$IFDEF WINDOWS}
   try
@@ -1335,7 +1403,7 @@ begin
   end;
   {$ENDIF}
   FLastCharWasNewLine := AText[Length(AText)] in [#10, #13];
-  if Assigned(FOnOutput) then
+  if Assigned(FOnOutput) and not FRestoringChat then
   try
     FOnOutput(Self, AText, AIsStderr);
   except
@@ -1365,7 +1433,7 @@ end;
 function TCustomTermManager.GetPromptText: string;
 var
   ModelName, DefaultLabel, CtxUsed, CtxTotal, CtxPercent, Ctx, CtxKb, CtxUsedKb, CtxTotalKb: string;
-  InfoLabel, InfoCtx: string;
+  InfoLabel, InfoCtx, ChatName: string;
   HasContext: boolean;
 begin
   Result := FPrompt;
@@ -1424,6 +1492,11 @@ begin
   Result := StringReplace(Result, '{context_total_kb}', CtxTotalKb, [rfReplaceAll]);
   Result := StringReplace(Result, '{context_kb}', CtxKb, [rfReplaceAll]);
   Result := StringReplace(Result, '{path}', GetEffectivePath, [rfReplaceAll]);
+
+  ChatName := string.Empty;
+  if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+    ChatName := FAgent.ActiveChat.Name;
+  Result := StringReplace(Result, '{chat}', ChatName, [rfReplaceAll]);
 end;
 
 procedure TCustomTermManager.DoRoute(const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean);
@@ -1605,13 +1678,18 @@ begin
     DoOutput(GetEffectivePath + LineEnding, False)
   else if (Cmd = 'cls') or (Cmd = 'clear') then
   begin
-    // Clear agent conversation history, usage counters and shell log together with the screen
     if Assigned(FAgent) then
     begin
-      FAgent.ClearHistory;
+      // Start a new chat without modifying the previous one
+      if not Assigned(FAgent.NewChat(string.Empty)) then
+        Exit;
+      FHistory.Clear;
+      FShellLog.Clear;
       FAgent.ResetUsage;
-    end;
-    FShellLog.Clear;
+    end
+    else
+      FShellLog.Clear;
+
     ClearScreen;
   end
   else if Cmd = 'history' then
@@ -3106,6 +3184,9 @@ begin
   FHistory.Add(Tagged);
   while FHistory.Count > FHistoryMax do
     FHistory.Delete(0);
+
+  if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+    FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
 end;
 
 procedure TCustomTermManager.Run;
@@ -3200,7 +3281,11 @@ begin
               else
                 FAgent.ContextPrelude := BuildShellContext;
               if FShellHistory.ClearOnAgentRun then
+              begin
                 FShellLog.Clear;
+                if Assigned(FAgent.ActiveChat) then
+                  FAgent.ActiveChat.ShellLog.Clear;
+              end;
             end;
             // Save user handlers, install our own for the duration of the run
             FPrevAgentOnChunk := FAgent.OnChunk;
@@ -3342,8 +3427,12 @@ var
   end;
 
 begin
+  // Store color changes as control markers for chat history replay
+  AppendChatOutput(#2 + Chr(Ord(AColor)));
+
   if not FColorOutput then
     Exit;
+
   case AColor of
     tcDim: Attr := ColorToAttr(FColors.ThinkingText);
     tcWelcome: Attr := PairAttr(FColors.WelcomeBadge);
@@ -3355,6 +3444,40 @@ begin
       Attr := ColorToAttr(FColors.DefaultText);
   end;
   SetConsoleColor(Attr);
+end;
+
+procedure TCustomTermManager.ReplayChatOutput(const AText: string);
+var
+  I, StartPos: integer;
+  ColorValue: integer;
+begin
+  StartPos := 1;
+  I := 1;
+
+  while I <= Length(AText) do
+  begin
+    if (AText[I] = #2) and (I < Length(AText)) then
+    begin
+      // Write text accumulated before the color marker
+      if I > StartPos then
+        WriteText(Copy(AText, StartPos, I - StartPos), False);
+
+      ColorValue := Ord(AText[I + 1]);
+      if ColorValue <= Ord(High(TTermColor)) then
+        SetColor(TTermColor(ColorValue));
+
+      Inc(I, 2);
+      StartPos := I;
+    end
+    else
+      Inc(I);
+  end;
+
+  // Write the remaining text
+  if StartPos <= Length(AText) then
+    WriteText(Copy(AText, StartPos, MaxInt), False);
+
+  SetColor(tcDefault);
 end;
 
 // Writes UTF-8 bytes directly to handle bypassing codepage conversion
@@ -4095,6 +4218,35 @@ begin
     CtrlPressed := (Rec.Event.KeyEvent.dwControlKeyState and
       (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
 
+    // Switch chats with Ctrl+Left and Ctrl+Right
+    if CtrlPressed and
+      (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
+    begin
+      if Rec.Event.KeyEvent.wVirtualKeyCode = VK_LEFT then
+        HasMore := SwitchActiveChat(-1)
+      else
+        HasMore := SwitchActiveChat(1);
+
+      if HasMore then
+      begin
+        Line := string.Empty;
+        CursorPos := 0;
+        HistIndex := FHistory.Count;
+        ClearSelection;
+
+        PromptText := GetPromptText;
+        ConWriteUtf8(PromptText);
+        FLastCharWasNewLine := False;
+        PromptRow := ConWhereY;
+        ScreenInfo := Default(TConsoleScreenBufferInfo);
+        PromptCol := 0;
+        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
+          PromptCol := ScreenInfo.dwCursorPosition.X;
+        LastRedrawRows := 1;
+        Continue;
+      end;
+    end;
+
     case Rec.Event.KeyEvent.wVirtualKeyCode of
       VK_RETURN:
         begin
@@ -4435,14 +4587,15 @@ begin
 
   Result := Line;
   AddToHistory(Result);
+  AppendChatOutput(string(PromptText) + string(Line) + LineEnding);
 end;
 
 {$ELSE}
 
 procedure TCustomTermManager.SetColor(AColor: TTermColor);
 begin
-  // No-op on non-Windows, override to emit ANSI escape sequences
-  ;
+  // Store color changes for chat history replay
+  AppendChatOutput(#2 + Chr(Ord(AColor)));
 end;
 
 procedure ConGotoXY(X, Y: integer);
@@ -4472,15 +4625,17 @@ end;
 
 function TCustomTermManager.ReadLine: string;
 var
-  S: string;
+  S, PromptText: string;
 begin
-  Result := '';
-  Write(GetPromptText);
+  Result := string.Empty;
+  PromptText := GetPromptText;
+  Write(PromptText);
   if not FRunning then
     Exit;
   ReadLn(S);
   Result := S;
   AddToHistory(S);
+  AppendChatOutput(PromptText + S + LineEnding);
 end;
 
 {$ENDIF}
