@@ -2011,7 +2011,7 @@ begin
           end;
         end;
 
-        // Log the last tool result
+        // Log metadata of the last tool result without duplicating its content
         for I := MessagesArr.Count - 1 downto 0 do
         begin
           if MessagesArr.Items[I].JSONType <> jtObject then
@@ -2019,7 +2019,7 @@ begin
           MsgObj := TJSONObject(MessagesArr.Items[I]);
           if MsgObj.Get('role', '') = 'tool' then
           begin
-            FAgent.LogLine('Last tool result: ' + MsgObj.AsJSON);
+            FAgent.LogLine(Format('Last tool result: content_len=%d', [Length(MsgObj.Get('content', ''))]));
             Break;
           end;
         end;
@@ -4021,9 +4021,9 @@ const
   MAX_GREP_MS = 10000;
   // Byte and per-line caps for the total response to the model
   MAX_TOTAL_BYTES = 50000;
-  MAX_MATCH_LINE_CHARS = 500;
+  MAX_MATCH_LINE_CHARS = 300;
 var
-  RelPath, FullPath, Pattern: string;
+  RelPath, FullPath, Pattern, IncludePattern, Content: string;
   Recursive, Literal, LiteralExplicit, AutoRegex, SingleFile, ScanLimited: boolean;
   Files: TStringList;
   Matches: TJSONArray;
@@ -4047,6 +4047,30 @@ var
       (Pos('/build/', Low) > 0) or (Pos('/target/', Low) > 0);
   end;
 
+  // Returns True when the file contains binary data or cannot be inspected
+  function IsBinaryFile(const AFileName: string): boolean;
+  var
+    Stream: TFileStream;
+    Buffer: array of byte = nil;
+    ReadCount, I: integer;
+  begin
+    Result := False;
+    try
+      Stream := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyNone);
+      try
+        SetLength(Buffer, 4096);
+        ReadCount := Stream.Read(Buffer[0], Length(Buffer));
+        for I := 0 to ReadCount - 1 do
+          if Buffer[I] = 0 then
+            Exit(True);
+      finally
+        Stream.Free;
+      end;
+    except
+      Result := True;
+    end;
+  end;
+
   // Scans one file, appending matches to the shared Matches array
   procedure ScanFile(const AFullPath, ARelPath: string);
   var
@@ -4066,13 +4090,16 @@ var
     finally
       FindClose(FR);
     end;
+
+    if IsBinaryFile(AFullPath) then
+      Exit;
+
     Lines := TStringList.Create;
     try
-      try
-        Lines.LoadFromFile(AFullPath);
-      except
+      if not ReadTextFileSafe(AFullPath, Content) then
         Exit;
-      end;
+      Lines.Text := Content;
+
       for J := 0 to Lines.Count - 1 do
       begin
         if Matches.Count >= MAX_MATCHES then
@@ -4112,6 +4139,7 @@ begin
   if AArgs = nil then
     Exit;
   Pattern := AArgs.Get('pattern', '');
+  IncludePattern := Trim(AArgs.Get('include', ''));
   if Pattern = '' then
   begin
     Result := '{"error": "pattern required"}';
@@ -4171,8 +4199,11 @@ begin
     SingleFile := FileExists(FullPath) and not DirectoryExists(FullPath);
     if SingleFile then
     begin
-      Inc(FilesScanned);
-      ScanFile(FullPath, RelativeToRoot(BaseRoot, FullPath));
+      if (IncludePattern = '') or MatchesMask(ExtractFileName(FullPath), IncludePattern) then
+      begin
+        Inc(FilesScanned);
+        ScanFile(FullPath, RelativeToRoot(BaseRoot, FullPath));
+      end;
     end
     else
     begin
@@ -4200,6 +4231,8 @@ begin
         end;
         RelPath := RelativeToRoot(BaseRoot, Files[I]);
         if IsJunkPath(RelPath) or IsIgnoredByGitignore(RelPath, GitPatterns) then
+          Continue;
+        if (IncludePattern <> '') and not MatchesMask(ExtractFileName(Files[I]), IncludePattern) then
           Continue;
         Inc(FilesScanned);
         ScanFile(Files[I], RelPath);
