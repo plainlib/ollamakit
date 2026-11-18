@@ -1712,7 +1712,7 @@ var
   Err: boolean;
   SockErr: boolean;
   Tm: TTimeout;
-  HTTP: THTTPSend;
+  HTTP: TNetworkHTTP;
   ContentType: string;
   ErrJSON: TJSONData;
   ErrTxt: string;
@@ -1767,7 +1767,7 @@ begin
         end;
 
         // Socket errors take priority over HTTP code classification
-        SockErr := (HTTP <> nil) and (HTTP.Sock <> nil) and (HTTP.Sock.LastError <> 0);
+        SockErr := (HTTP <> nil) and (HTTP.LastError <> 0);
         if SockErr then
           Kind := oekConnection
         else if (HTTP <> nil) and (HTTP.ResultCode <> 0) then
@@ -1806,7 +1806,7 @@ begin
         if ErrorMsg = '' then
         begin
           if SockErr then
-            ErrorMsg := Format('Socket error %d: %s', [HTTP.Sock.LastError, Trim(HTTP.Sock.LastErrorDesc)])
+            ErrorMsg := Format('Socket error %d: %s', [HTTP.LastError, Trim(HTTP.LastErrorDesc)])
           else if (HTTP <> nil) and (HTTP.ResultCode <> 0) then
             ErrorMsg := Format(rsHttpError, [HTTP.ResultCode, Trim(HTTP.ResultString)])
           else
