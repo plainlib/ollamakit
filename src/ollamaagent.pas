@@ -203,6 +203,12 @@ type
     function DoSearchText(AArgs: TJSONObject): string; virtual;
     function DoReadFileLines(AArgs: TJSONObject): string; virtual;
     function DoEditFile(AArgs: TJSONObject): string; virtual;
+    // Inserts text before the specified line
+    function DoInsertCode(AArgs: TJSONObject): string; virtual;
+    // Replaces an inclusive range of lines
+    function DoReplaceRange(AArgs: TJSONObject): string; virtual;
+    // Applies a unified diff to a single file
+    function DoApplyPatch(AArgs: TJSONObject): string; virtual;
     function DoDeleteFile(AArgs: TJSONObject): string; virtual;
     function DoMoveFile(AArgs: TJSONObject): string; virtual;
     function DoCopyFile(AArgs: TJSONObject): string; virtual;
@@ -3065,6 +3071,15 @@ begin
       AddTool(Arr, 'edit_file',
         'Replace exact string in a file. old_string must occur exactly once unless replace_all=true',
         '{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}');
+      AddTool(Arr, 'insert_code',
+        'Insert text before a 1-based line number. Use line_count + 1 to append at the end.',
+        '{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer","description":"1-based insertion position, line_count + 1 appends"},"content":{"type":"string"}},"required":["path","line","content"]}');
+      AddTool(Arr, 'replace_range',
+        'Replace an inclusive 1-based line range with the supplied text. Use the same start_line and end_line to replace one line.',
+        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"},"content":{"type":"string","description":"Replacement text, may be empty to delete the range"}},"required":["path","start_line","end_line","content"]}');
+      AddTool(Arr, 'apply_patch',
+        'Apply a unified diff to one existing text file. Supports multiple hunks. The patch must include @@ hunk headers and exact context lines.',
+        '{"type":"object","properties":{"path":{"type":"string"},"patch":{"type":"string","description":"Unified diff for the specified file, without file headers"}},"required":["path","patch"]}');
       AddTool(Arr, 'delete_file', 'Delete a file',
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
       AddTool(Arr, 'move_file', 'Move or rename a file',
@@ -3152,6 +3167,9 @@ begin
       Names.Add('list_files');
       Names.Add('search_text');
       Names.Add('edit_file');
+      Names.Add('insert_code');
+      Names.Add('replace_range');
+      Names.Add('apply_patch');
       Names.Add('delete_file');
       Names.Add('move_file');
       Names.Add('copy_file');
@@ -3824,6 +3842,417 @@ begin
     Exit;
   end;
   Result := '{"ok": true, "replaced": ' + IntToStr(Count) + '}';
+end;
+
+function TCustomOllamaAgent.DoInsertCode(AArgs: TJSONObject): string;
+const
+  MAX_WRITE_BYTES = 16 * 1024 * 1024;
+var
+  RelPath, FullPath, Content: string;
+  Line: integer;
+  Lines, InsertLines: TStringList;
+  I: integer;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+
+  RelPath := AArgs.Get('path', '');
+  Content := AArgs.Get('content', '');
+
+  if AArgs.Find('line') = nil then
+  begin
+    Result := '{"error": "line is required"}';
+    Exit;
+  end;
+
+  Line := AArgs.Get('line', 0);
+  if (Line < 1) then
+  begin
+    Result := '{"error": "line must be greater than zero"}';
+    Exit;
+  end;
+
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := SafePathError;
+    Exit;
+  end;
+
+  if not FileExists(FullPath) then
+  begin
+    Result := BuildFileNotFoundError(FullPath, RelPath);
+    Exit;
+  end;
+
+  if IsBinaryFile(FullPath) then
+  begin
+    Result := '{"error": "binary file detected, cannot edit binary files"}';
+    Exit;
+  end;
+
+  Lines := TStringList.Create;
+  InsertLines := TStringList.Create;
+  try
+    if not ReadTextFileSafe(FullPath, Content) then
+    begin
+      Result := '{"error": "cannot read file"}';
+      Exit;
+    end;
+
+    // Keep the original insertion text separate from the file content
+    InsertLines.Text := AArgs.Get('content', '');
+
+    Lines.Text := Content;
+
+    if Line > Lines.Count + 1 then
+    begin
+      Result := '{"error": "line is beyond the end of the file"}';
+      Exit;
+    end;
+
+    // Insert new lines at the requested 1-based position
+    for I := 0 to InsertLines.Count - 1 do
+      Lines.Insert(Line - 1 + I, InsertLines[I]);
+
+    Content := Lines.Text;
+    if Length(Content) > MAX_WRITE_BYTES then
+    begin
+      Result := '{"error": "content too large"}';
+      Exit;
+    end;
+
+    if not WriteTextFileSafe(FullPath, Content) then
+    begin
+      Result := '{"error": "cannot write file"}';
+      Exit;
+    end;
+
+    Result := '{"ok": true, "inserted_lines": ' + IntToStr(InsertLines.Count) + '}';
+  finally
+    InsertLines.Free;
+    Lines.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.DoReplaceRange(AArgs: TJSONObject): string;
+const
+  MAX_WRITE_BYTES = 16 * 1024 * 1024;
+var
+  RelPath, FullPath, Content: string;
+  StartLine, EndLine: integer;
+  Lines, ReplaceLines: TStringList;
+  I: integer;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+
+  RelPath := AArgs.Get('path', '');
+  Content := AArgs.Get('content', '');
+
+  if (AArgs.Find('start_line') = nil) or (AArgs.Find('end_line') = nil) then
+  begin
+    Result := '{"error": "start_line and end_line are required"}';
+    Exit;
+  end;
+
+  StartLine := AArgs.Get('start_line', 0);
+  EndLine := AArgs.Get('end_line', 0);
+
+  if (StartLine < 1) or (EndLine < StartLine) then
+  begin
+    Result := '{"error": "invalid line range"}';
+    Exit;
+  end;
+
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := SafePathError;
+    Exit;
+  end;
+
+  if not FileExists(FullPath) then
+  begin
+    Result := BuildFileNotFoundError(FullPath, RelPath);
+    Exit;
+  end;
+
+  if IsBinaryFile(FullPath) then
+  begin
+    Result := '{"error": "binary file detected, cannot edit binary files"}';
+    Exit;
+  end;
+
+  Lines := TStringList.Create;
+  ReplaceLines := TStringList.Create;
+  try
+    if not ReadTextFileSafe(FullPath, Content) then
+    begin
+      Result := '{"error": "cannot read file"}';
+      Exit;
+    end;
+
+    // Keep replacement text separate from the original file content
+    ReplaceLines.Text := AArgs.Get('content', '');
+
+    Lines.Text := Content;
+
+    if EndLine > Lines.Count then
+    begin
+      Result := '{"error": "end_line is beyond the end of the file"}';
+      Exit;
+    end;
+
+    // Remove the requested inclusive line range
+    for I := EndLine - 1 downto StartLine - 1 do
+      Lines.Delete(I);
+
+    // Insert replacement lines at the original start position
+    for I := 0 to ReplaceLines.Count - 1 do
+      Lines.Insert(StartLine - 1 + I, ReplaceLines[I]);
+
+    Content := Lines.Text;
+    if Length(Content) > MAX_WRITE_BYTES then
+    begin
+      Result := '{"error": "content too large"}';
+      Exit;
+    end;
+
+    if not WriteTextFileSafe(FullPath, Content) then
+    begin
+      Result := '{"error": "cannot write file"}';
+      Exit;
+    end;
+
+    Result := '{"ok": true, "replaced_lines": ' + IntToStr(EndLine - StartLine + 1) + ', "inserted_lines": ' +
+      IntToStr(ReplaceLines.Count) + '}';
+  finally
+    ReplaceLines.Free;
+    Lines.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.DoApplyPatch(AArgs: TJSONObject): string;
+const
+  MAX_WRITE_BYTES = 16 * 1024 * 1024;
+var
+  RelPath, FullPath, Patch, FileContent: string;
+  Lines, PatchLines, NewLines: TStringList;
+  OldBlock, NewBlock: TStringList;
+  Regex: TRegExpr;
+  I, J, OldStart, OldCount, NewStart, NewCount: integer;
+  OldIndex, Offset, HunkCount: integer;
+  PatchLine: string;
+  Valid: boolean;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+
+  RelPath := AArgs.Get('path', '');
+  Patch := AArgs.Get('patch', '');
+
+  if Patch = '' then
+  begin
+    Result := '{"error": "patch is required"}';
+    Exit;
+  end;
+
+  if Length(Patch) > MAX_WRITE_BYTES then
+  begin
+    Result := '{"error": "patch too large"}';
+    Exit;
+  end;
+
+  FullPath := SafePath(RelPath);
+  if FullPath = '' then
+  begin
+    Result := SafePathError;
+    Exit;
+  end;
+
+  if not FileExists(FullPath) then
+  begin
+    Result := BuildFileNotFoundError(FullPath, RelPath);
+    Exit;
+  end;
+
+  if IsBinaryFile(FullPath) then
+  begin
+    Result := '{"error": "binary file detected, cannot edit binary files"}';
+    Exit;
+  end;
+
+  if not ReadTextFileSafe(FullPath, FileContent) then
+  begin
+    Result := '{"error": "cannot read file"}';
+    Exit;
+  end;
+
+  Lines := TStringList.Create;
+  PatchLines := TStringList.Create;
+  NewLines := TStringList.Create;
+  OldBlock := TStringList.Create;
+  NewBlock := TStringList.Create;
+  Regex := TRegExpr.Create;
+  try
+    Lines.Text := FileContent;
+    PatchLines.Text := Patch;
+    NewLines.Assign(Lines);
+
+    // Parse unified diff hunk headers
+    Regex.Expression := '^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@';
+
+    Offset := 0;
+    HunkCount := 0;
+    I := 0;
+
+    while I < PatchLines.Count do
+    begin
+      PatchLine := PatchLines[I];
+
+      // Skip optional file headers
+      if (Copy(PatchLine, 1, 4) = '--- ') or (Copy(PatchLine, 1, 4) = '+++ ') then
+      begin
+        Inc(I);
+        Continue;
+      end;
+
+      if not Regex.Exec(PatchLine) then
+      begin
+        if Trim(PatchLine) = '' then
+        begin
+          Inc(I);
+          Continue;
+        end;
+
+        Result := '{"error": "invalid unified diff header at line ' + IntToStr(I + 1) + '"}';
+        Exit;
+      end;
+
+      OldStart := StrToIntDef(Regex.Match[1], -1);
+      OldCount := StrToIntDef(Regex.Match[3], 1);
+      NewStart := StrToIntDef(Regex.Match[4], -1);
+      NewCount := StrToIntDef(Regex.Match[6], 1);
+
+      if (OldStart < 0) or (NewStart < 0) or (OldCount < 0) or (NewCount < 0) then
+      begin
+        Result := '{"error": "invalid unified diff line numbers"}';
+        Exit;
+      end;
+
+      Inc(I);
+      OldBlock.Clear;
+      NewBlock.Clear;
+
+      // Build the original and replacement blocks
+      while I < PatchLines.Count do
+      begin
+        PatchLine := PatchLines[I];
+
+        if Regex.Exec(PatchLine) then
+          Break;
+
+        if PatchLine = '\ No newline at end of file' then
+        begin
+          Inc(I);
+          Continue;
+        end;
+
+        if (Length(PatchLine) = 0) or not (PatchLine[1] in [' ', '+', '-']) then
+          Break;
+
+        case PatchLine[1] of
+          ' ':
+          begin
+            OldBlock.Add(Copy(PatchLine, 2, MaxInt));
+            NewBlock.Add(Copy(PatchLine, 2, MaxInt));
+          end;
+          '-':
+            OldBlock.Add(Copy(PatchLine, 2, MaxInt));
+          '+':
+            NewBlock.Add(Copy(PatchLine, 2, MaxInt));
+        end;
+
+        Inc(I);
+      end;
+
+      if (OldBlock.Count <> OldCount) or (NewBlock.Count <> NewCount) then
+      begin
+        Result := '{"error": "unified diff hunk line counts do not match header"}';
+        Exit;
+      end;
+
+      // Convert original file coordinates to current result coordinates
+      if OldCount = 0 then
+        OldIndex := OldStart + Offset
+      else
+        OldIndex := OldStart - 1 + Offset;
+
+      if (OldIndex < 0) or (OldIndex > NewLines.Count) or (OldIndex + OldCount > NewLines.Count) then
+      begin
+        Result := '{"error": "hunk position is outside the file range"}';
+        Exit;
+      end;
+
+      // Verify every original line before applying the hunk
+      Valid := True;
+      for J := 0 to OldBlock.Count - 1 do
+      begin
+        if NewLines[OldIndex + J] <> OldBlock[J] then
+        begin
+          Valid := False;
+          Break;
+        end;
+      end;
+
+      if not Valid then
+      begin
+        Result := '{"error": "patch context does not match file at hunk ' + IntToStr(HunkCount + 1) + '"}';
+        Exit;
+      end;
+
+      // Replace the verified block
+      for J := OldCount - 1 downto 0 do
+        NewLines.Delete(OldIndex + J);
+
+      for J := 0 to NewBlock.Count - 1 do
+        NewLines.Insert(OldIndex + J, NewBlock[J]);
+
+      Offset := Offset + NewCount - OldCount;
+      Inc(HunkCount);
+    end;
+
+    if HunkCount = 0 then
+    begin
+      Result := '{"error": "no unified diff hunks found"}';
+      Exit;
+    end;
+
+    if Length(NewLines.Text) > MAX_WRITE_BYTES then
+    begin
+      Result := '{"error": "resulting file is too large"}';
+      Exit;
+    end;
+
+    if not WriteTextFileSafe(FullPath, NewLines.Text) then
+    begin
+      Result := '{"error": "cannot write file"}';
+      Exit;
+    end;
+
+    Result := '{"ok": true, "hunks_applied": ' + IntToStr(HunkCount) + '}';
+  finally
+    Regex.Free;
+    NewBlock.Free;
+    OldBlock.Free;
+    NewLines.Free;
+    PatchLines.Free;
+    Lines.Free;
+  end;
 end;
 
 function TCustomOllamaAgent.DoDeleteFile(AArgs: TJSONObject): string;
@@ -4722,6 +5151,12 @@ begin
         Exit(DoReadFileLines(Args))
       else if CleanName = 'edit_file' then
         Exit(DoEditFile(Args))
+      else if CleanName = 'insert_code' then
+        Exit(DoInsertCode(Args))
+      else if CleanName = 'replace_range' then
+        Exit(DoReplaceRange(Args))
+      else if CleanName = 'apply_patch' then
+        Exit(DoApplyPatch(Args))
       else if CleanName = 'delete_file' then
         Exit(DoDeleteFile(Args))
       else if CleanName = 'move_file' then
