@@ -764,6 +764,9 @@ begin
   if AValue = '' then
   begin
     FPath := '';
+    // Keep agent workspace in sync with terminal directory
+    if Assigned(FAgent) and not (csDesigning in ComponentState) then
+      FAgent.RootPath := GetEffectivePath;
     Exit;
   end;
   NewPath := ExpandFileName(AValue);
@@ -775,6 +778,9 @@ begin
       NewPath := NewPath + PathDelim;
     {$ENDIF}
     FPath := NewPath;
+    // Keep agent workspace in sync with terminal directory
+    if Assigned(FAgent) and not (csDesigning in ComponentState) then
+      FAgent.RootPath := GetEffectivePath;
   end;
 end;
 
@@ -804,9 +810,11 @@ begin
   if Assigned(FAgent) then
   begin
     FAgent.FreeNotification(Self);
-    // Share shell name with the agent at runtime only
+    // Share terminal directory and shell name with the agent at runtime only
     if not (csDesigning in ComponentState) then
     begin
+      if FAgent.RootPath = '' then
+        FAgent.RootPath := GetEffectivePath;
       FAgent.ExecShellInfo := FShellExec;
       // Route agent log lines through the terminal so they are colored
       FPrevAgentOnLog := FAgent.OnLog;
