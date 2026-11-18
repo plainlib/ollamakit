@@ -3758,6 +3758,7 @@ var
   function MoveCursorVertical(ADelta: Integer): Boolean;
   var
     I, Idx, LineStart, TargetStart, TargetLen, Col: Integer;
+    TargetPos, TargetBytePos: Integer;
     Lines: TStringList;
   begin
     Result := False;
@@ -3787,12 +3788,20 @@ var
       TargetStart := 0;
       for I := 0 to Idx + ADelta - 1 do
         Inc(TargetStart, Length(Lines[I]) + 2);
-      TargetLen := Length(Lines[Idx + ADelta]);
-      // Preserve column clamped to target line length
-      Col := CursorPos - LineStart;
+      // Preserve character column instead of UTF-8 byte offset
+      Col := Utf8CharCount(Copy(Lines[Idx], 1, CursorPos - LineStart));
+      TargetLen := Utf8CharCount(Lines[Idx + ADelta]);
       if Col > TargetLen then
         Col := TargetLen;
-      CursorPos := TargetStart + Col;
+      // Convert target character column to UTF-8 byte offset
+      TargetPos := 1;
+      TargetBytePos := 0;
+      for I := 1 to Col do
+      begin
+        TargetBytePos := Utf8NextPos(Lines[Idx + ADelta], TargetPos) - 1;
+        TargetPos := TargetBytePos + 1;
+      end;
+      CursorPos := TargetStart + TargetBytePos;
       Result := True;
     finally
       Lines.Free;
