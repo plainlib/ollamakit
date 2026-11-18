@@ -429,9 +429,7 @@ end;
 function Utf8PrevPos(const S: string; APos: integer): integer;
 begin
   Result := APos - 1;
-  while (Result > 0) and ((byte(S[Result]) and $C0) = $80) do
-    Dec(Result);
-  if (Result > 0) and (byte(S[Result]) >= $C0) then
+  while (Result > 0) and ((byte(S[Result + 1]) and $C0) = $80) do
     Dec(Result);
 end;
 
