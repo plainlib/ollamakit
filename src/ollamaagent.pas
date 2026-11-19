@@ -202,6 +202,8 @@ type
     FAllowAccessToSystem: boolean;
     // Reject access to well-known secret files like .ssh/, .env, *.key
     FBlockSensitiveFiles: boolean;
+    FToolPathAliases: TStringList;
+    procedure SetToolPathAliases(const AValue: TStringList);
     procedure SetOllamaManager(const AValue: TOllamaManager);
     procedure SetTools(const AValue: TAgentTools);
     procedure SetWebOptions(const AValue: TAgentWebOptions);
@@ -219,6 +221,8 @@ type
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
     // Returns absolute root path for sandboxed file tools
     function GetEffectiveRootPath: string; virtual;
+    // Resolves virtual tool paths using configured aliases
+    function NormalizeToolPath(const APath: string): string; virtual;
     // Resolves a relative path inside RootPath, returns '' when escaping
     function SafePath(const ARelPath: string): string; virtual;
     // Builds the JSON error for a rejected path, depends on sandbox mode
@@ -348,6 +352,7 @@ type
     property EnabledTools: TAgentFeatures read FFeatures write FFeatures default [afFileTools];
     property Streaming: boolean read FStreaming write FStreaming default True;
     property RootPath: string read GetRootPath write SetRootPath;
+    property ToolPathAliases: TStringList read FToolPathAliases write SetToolPathAliases;
     property Tools: TAgentTools read FTools write SetTools;
     property WebOptions: TAgentWebOptions read FWebOptions write SetWebOptions;
     property KeepHistory: boolean read FKeepHistory write FKeepHistory default False;
@@ -383,6 +388,8 @@ type
     property EnabledTools;
     // Sandbox directory for file tools, empty means process cwd
     property RootPath;
+    // Virtual path aliases resolved relative to RootPath
+    property ToolPathAliases;
     // Collection of user-defined tools
     property Tools;
     // Web tools configuration, expand to adjust search URL, timeout, whitelist
@@ -2703,6 +2710,8 @@ begin
   FAgentsFileName := 'AGENTS.md';
   FAllowAccessToSystem := True;
   FBlockSensitiveFiles := True;
+  FToolPathAliases := TStringList.Create;
+  FToolPathAliases.CaseSensitive := False;
   FCapabilitiesCache := TStringList.Create;
   FCapabilitiesCache.NameValueSeparator := '=';
   FTools := TAgentTools.Create(Self);
@@ -2718,6 +2727,7 @@ begin
   // Drain any queued events so they do not fire after Free
   CheckSynchronize(0);
   FCapabilitiesCache.Free;
+  FToolPathAliases.Free;
   FWebOptions.Free;
   FTools.Free;
   while FChats.Count > 0 do
@@ -2743,6 +2753,12 @@ end;
 procedure TCustomOllamaAgent.SetTools(const AValue: TAgentTools);
 begin
   FTools.Assign(AValue);
+end;
+
+procedure TCustomOllamaAgent.SetToolPathAliases(const AValue: TStringList);
+begin
+  if AValue <> nil then
+    FToolPathAliases.Assign(AValue);
 end;
 
 procedure TCustomOllamaAgent.SetWebOptions(const AValue: TAgentWebOptions);
@@ -3736,14 +3752,69 @@ begin
     Result := GetCurrentDir;
 end;
 
+function TCustomOllamaAgent.NormalizeToolPath(const APath: string): string;
+var
+  InputPath, AliasPath, TargetPath, Suffix, BasePath: string;
+  I, P, BestLength: integer;
+begin
+  Result := APath;
+  InputPath := StringReplace(Trim(APath), '/', PathDelim, [rfReplaceAll]);
+  BestLength := 0;
+  TargetPath := string.Empty;
+
+  // Find the longest matching virtual path alias
+  for I := 0 to FToolPathAliases.Count - 1 do
+  begin
+    P := Pos('=', FToolPathAliases[I]);
+    if P <= 1 then
+      Continue;
+
+    AliasPath := StringReplace(Trim(Copy(FToolPathAliases[I], 1, P - 1)), '/', PathDelim, [rfReplaceAll]);
+    AliasPath := ExcludeTrailingPathDelimiter(AliasPath);
+
+    if AliasPath = string.Empty then
+      Continue;
+
+    if (Length(AliasPath) > BestLength) and SameText(Copy(InputPath, 1, Length(AliasPath)), AliasPath) and
+      ((Length(InputPath) = Length(AliasPath)) or (InputPath[Length(AliasPath) + 1] = PathDelim)) then
+    begin
+      BestLength := Length(AliasPath);
+      TargetPath := Trim(Copy(FToolPathAliases[I], P + 1, MaxInt));
+    end;
+  end;
+
+  if BestLength = 0 then
+    Exit;
+
+  // Resolve the alias target relative to RootPath
+  TargetPath := StringReplace(TargetPath, '/', PathDelim, [rfReplaceAll]);
+  if TargetPath = string.Empty then
+    TargetPath := '.';
+
+  if IsPathAbsolute(TargetPath) then
+    BasePath := ExpandFileName(TargetPath)
+  else
+    BasePath := ExpandFileName(IncludeTrailingPathDelimiter(GetEffectiveRootPath) + TargetPath);
+
+  // Append the remaining path after the matched alias
+  Suffix := Copy(InputPath, BestLength + 1, MaxInt);
+  while (Length(Suffix) > 0) and (Suffix[1] = PathDelim) do
+    Delete(Suffix, 1, 1);
+
+  if Suffix <> string.Empty then
+    Result := IncludeTrailingPathDelimiter(BasePath) + Suffix
+  else
+    Result := BasePath;
+end;
+
 function TCustomOllamaAgent.SafePath(const ARelPath: string): string;
 var
   Root, Full, Normalized: string;
 begin
   Result := '';
   Root := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
-  // Normalize forward slashes so absolute detection works on Windows
-  Normalized := StringReplace(Trim(ARelPath), '/', PathDelim, [rfReplaceAll]);
+  // Normalize virtual paths and forward slashes
+  Normalized := StringReplace(NormalizeToolPath(ARelPath), '/', PathDelim, [rfReplaceAll]);
   // Collapse duplicate separators for local paths, preserve UNC prefix
   if (Length(Normalized) >= 2) and ((Normalized[1] <> PathDelim) or (Normalized[2] <> PathDelim)) then
     while Pos(PathDelim + PathDelim, Normalized) > 0 do
@@ -5685,7 +5756,7 @@ begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
     Exit;
-  RelPath := AArgs.Get('path', '');
+  RelPath := NormalizeToolPath(AArgs.Get('path', ''));
   Root := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
   // Normalize input to a directory, treat files as their parent directory
   SearchPath := StringReplace(Trim(RelPath), '/', PathDelim, [rfReplaceAll]);
