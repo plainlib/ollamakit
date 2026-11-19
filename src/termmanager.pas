@@ -1618,41 +1618,75 @@ end;
 function TCustomTermManager.IsExternalCommand(const AName: string): boolean;
 const
   {$IFDEF WINDOWS}
-  CMD_BUILTINS: array[0..27] of string = (
-    'dir', 'copy', 'del', 'erase', 'type', 'echo', 'set', 'md',
-    'mkdir', 'rd', 'rmdir', 'ren', 'rename', 'move', 'ver', 'vol',
-    'date', 'time', 'pause', 'call', 'goto', 'title', 'color',
-    'prompt', 'start', 'pushd', 'popd', 'setlocal');
+  CMD_BUILTINS =
+    '|assoc|break|call|cd|chcp|chdir|cls|color|copy|date|del|dir|doskey|' +
+    'echo|endlocal|erase|exit|for|ftype|goto|if|md|mkdir|mklink|move|' +
+    'path|pause|popd|prompt|pushd|rd|rem|ren|rename|rmdir|set|setlocal|' + 'shift|start|time|title|type|ver|verify|vol|';
+
+  POWERSHELL_BUILTINS =
+    '|begin|break|catch|class|continue|do|else|elseif|end|exit|filter|' +
+    'finally|for|foreach|function|if|in|param|process|return|switch|' + 'throw|trap|try|until|while|' +
+    'get-childitem|gci|dir|ls|get-content|gc|set-content|sc|' + 'get-location|gl|pwd|set-location|sl|cd|push-location|pushd|' +
+    'pop-location|popd|write-output|echo|write-host|write-error|' + 'write-warning|write-verbose|write-debug|select-object|select|' +
+    'where-object|where|foreach-object|%|new-item|ni|remove-item|ri|' +
+    'copy-item|copy|move-item|move|test-path|resolve-path|get-command|' +
+    'get-process|gps|stop-process|kill|get-service|start-service|' +
+    'stop-service|export-csv|import-csv|convertto-json|convertfrom-json|' +
+    'measure-object|sort-object|group-object|format-table|ft|format-list|fl|' +
+    'clear-host|cls|help|man|history|h|set-variable|sv|get-variable|gv|' +
+    'remove-variable|rv|set-alias|sal|get-alias|gal|remove-alias|';
+  {$ELSE}
+  UNIX_BUILTINS =
+    '|alias|bg|bind|break|builtin|caller|cd|command|compgen|complete|' +
+    'continue|declare|dirs|disown|echo|enable|eval|exec|exit|export|' +
+    'false|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|' +
+    'mapfile|popd|printf|pushd|pwd|read|readonly|return|set|shift|' + 'shopt|source|suspend|test|times|trap|true|type|typeset|ulimit|' +
+    'umask|unalias|unset|wait|';
   {$ENDIF}
 var
-  I: integer;
-  EnvPath: string;
+  EnvPath, ShellName, KnownCommands: string;
 begin
+  ShellName := LowerCase(ExtractFileName(FShellExec));
+
   {$IFDEF WINDOWS}
-  for I := Low(CMD_BUILTINS) to High(CMD_BUILTINS) do
-    if CMD_BUILTINS[I] = AName then
-      Exit(True);
+  if (ShellName = 'powershell.exe') or (ShellName = 'powershell') or
+    (ShellName = 'pwsh.exe') or (ShellName = 'pwsh') then
+    KnownCommands := POWERSHELL_BUILTINS
+  else
+    KnownCommands := CMD_BUILTINS;
+  {$ELSE}
+  KnownCommands := UNIX_BUILTINS;
   {$ENDIF}
+
+  // Check shell-specific builtins first
+  if Pos('|' + LowerCase(AName) + '|', KnownCommands) > 0 then
+    Exit(True);
+
   EnvPath := SysUtils.GetEnvironmentVariable('PATH');
-  Result := (FileSearch(AName, EnvPath) <> '')
+
+  // Search executable files in PATH
+  Result := FileSearch(AName, EnvPath) <> '';
+
   {$IFDEF WINDOWS}
-    or (FileSearch(AName + '.exe', EnvPath) <> '')
-    or (FileSearch(AName + '.bat', EnvPath) <> '')
-    or (FileSearch(AName + '.cmd', EnvPath) <> '')
-    or (FileSearch(AName + '.com', EnvPath) <> '')
+  Result := Result or (FileSearch(AName + '.exe', EnvPath) <> '') or
+    (FileSearch(AName + '.bat', EnvPath) <> '') or
+    (FileSearch(AName + '.cmd', EnvPath) <> '') or
+    (FileSearch(AName + '.com', EnvPath) <> '');
   {$ENDIF}
-  ;
 end;
 
 function TCustomTermManager.ClassifyLine(const ALine: string; out APayload: string): TTermInputKind;
 var
-  S, First: string;
+  S, FirstLine, First: string;
   P: integer;
+  HasMultipleLines: boolean;
 begin
   APayload := '';
   S := Trim(ALine);
   if S = '' then
     Exit(tikEmpty);
+
+  HasMultipleLines := (Pos(#10, S) > 0) or (Pos(#13, S) > 0);
 
   // Special case: bare "?" shows agent help, "? text" still routes to agent
   if FUsePrefixes and (S = '?') then
@@ -1677,15 +1711,45 @@ begin
   end;
 
   APayload := S;
-  P := Pos(' ', S);
+
+  // Classify using only the first line of a pasted block
+  FirstLine := S;
+  P := Pos(#10, FirstLine);
   if P > 0 then
-    First := LowerCase(Copy(S, 1, P - 1))
+    SetLength(FirstLine, P - 1);
+  FirstLine := Trim(FirstLine);
+
+  // Extract the first command token, including quoted executable paths
+  if (FirstLine <> '') and (FirstLine[1] = '"') then
+  begin
+    P := Pos('"', Copy(FirstLine, 2, MaxInt));
+    if P > 0 then
+      First := Copy(FirstLine, 2, P - 1)
+    else
+      First := Copy(FirstLine, 2, MaxInt);
+  end
   else
-    First := LowerCase(S);
+  begin
+    P := 1;
+    while (P <= Length(FirstLine)) and not (FirstLine[P] in [#9, ' ']) do
+      Inc(P);
+    First := Copy(FirstLine, 1, P - 1);
+  end;
+
+  First := LowerCase(First);
+
+  // Support batch commands prefixed with @
+  while (First <> '') and (First[1] = '@') do
+    Delete(First, 1, 1);
+
+  First := ExtractFileName(StringReplace(First, '\', '/', [rfReplaceAll]));
 
   // Handle glued cd variants like cd.., cd\, cd/ the same way cmd.exe does
   if (Length(First) > 2) and (Copy(First, 1, 2) = 'cd') and (First[3] in ['.', PathDelim, '/']) then
   begin
+    if HasMultipleLines then
+      Exit(tikCommand);
+
     APayload := 'cd ' + Copy(S, 3, MaxInt);
     Exit(tikBuiltin);
   end;
@@ -1694,9 +1758,16 @@ begin
   if (Length(First) >= 2) and (First[2] = ':') and (First[1] in ['a'..'z']) and ((Length(First) = 2) or
     (First[3] in [PathDelim, '/'])) then
   begin
+    if HasMultipleLines then
+      Exit(tikCommand);
+
     APayload := S;
     Exit(tikBuiltin);
   end;
+
+  // Multi-line shell input must take precedence over application commands
+  if HasMultipleLines and FSearchPath and IsExternalCommand(First) then
+    Exit(tikCommand);
 
   if FBuiltinCommands.IndexOf(First) >= 0 then
     Exit(tikBuiltin);
@@ -3048,10 +3119,15 @@ var
   CommandName: string;
   P: integer;
   IsInteractive: boolean;
+  HasMultipleLines: boolean;
   {$IFDEF WINDOWS}
   InHandle: THandle;
   InMode: DWORD = 0;
   InModeSaved: boolean;
+  ScriptFileName: string;
+  ScriptData: RawByteString;
+  ScriptStream: TFileStream;
+  TempFileName: string;
   {$ENDIF}
 begin
   Result := -1;
@@ -3085,6 +3161,14 @@ begin
 
   // Detect commands that require direct console access
   CommandText := TrimLeft(ACommand);
+  HasMultipleLines := (Pos(#10, CommandText) > 0) or (Pos(#13, CommandText) > 0);
+
+  // Use only the first line when identifying the command
+  P := Pos(#10, CommandText);
+  if P > 0 then
+    SetLength(CommandText, P - 1);
+  CommandText := TrimRight(CommandText);
+
   if (CommandText <> '') and (CommandText[1] = '"') then
   begin
     P := Pos('"', Copy(CommandText, 2, MaxInt));
@@ -3096,6 +3180,8 @@ begin
   else
   begin
     P := Pos(' ', CommandText);
+    if P = 0 then
+      P := Pos(#9, CommandText);
     if P > 0 then
       CommandName := Copy(CommandText, 1, P - 1)
     else
@@ -3103,9 +3189,12 @@ begin
   end;
 
   CommandName := LowerCase(ExtractFileName(StringReplace(CommandName, '\', '/', [rfReplaceAll])));
-  IsInteractive := Pos('|' + CommandName + '|', INTERACTIVE_COMMANDS) > 0;
+
+  // Multi-line scripts always capture output through the terminal
+  IsInteractive := not HasMultipleLines and (Pos('|' + CommandName + '|', INTERACTIVE_COMMANDS) > 0);
 
   RawData := '';
+  ScriptFileName := string.Empty;
   Process := TProcess.Create(nil);
   {$IFDEF WINDOWS}
   InModeSaved := False;
@@ -3114,7 +3203,34 @@ begin
     Process.Executable := FShellExec;
     {$IFDEF WINDOWS}
     Process.Parameters.Add('/c');
-    Process.Parameters.Add('chcp 65001 > nul & ' + ACommand);
+
+    if HasMultipleLines then
+    begin
+      // Create a temporary batch file for multi-line scripts
+      TempFileName := SysUtils.GetTempFileName;
+      ScriptFileName := ChangeFileExt(TempFileName, '.cmd');
+
+      // Create the temporary file before renaming it
+      ScriptStream := TFileStream.Create(TempFileName, fmCreate);
+      ScriptStream.Free;
+
+      if not RenameFile(TempFileName, ScriptFileName) then
+        raise Exception.Create('Cannot create temporary batch file');
+
+      ScriptData := RawByteString('@chcp 65001 > nul' + LineEnding + ACommand + LineEnding);
+
+      ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
+      try
+        if Length(ScriptData) > 0 then
+          ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
+      finally
+        ScriptStream.Free;
+      end;
+
+      Process.Parameters.Add('"' + ScriptFileName + '"');
+    end
+    else
+      Process.Parameters.Add('chcp 65001 > nul & ' + ACommand);
     {$ELSE}
     Process.Parameters.Add('-c');
     Process.Parameters.Add(ACommand);
@@ -3238,10 +3354,15 @@ begin
     Result := Process.ExitStatus;
   finally
     {$IFDEF WINDOWS}
-    if IsInteractive and InModeSaved then
-      SetConsoleMode(InHandle, InMode);
+      if IsInteractive and InModeSaved then
+        SetConsoleMode(InHandle, InMode);
     {$ENDIF}
     Process.Free;
+    {$IFDEF WINDOWS}
+      // Remove the temporary batch file after execution
+      if (ScriptFileName <> '') and FileExists(ScriptFileName) then
+        SysUtils.DeleteFile(ScriptFileName);
+    {$ENDIF}
   end;
 end;
 
