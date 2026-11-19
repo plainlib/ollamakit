@@ -11,7 +11,7 @@ unit TermManager;
 interface
 
 uses
-  Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser, TypInfo,
+  Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser, TypInfo, StringHelper,
   OllamaManager, OllamaAgent, AgentConfig{$IFDEF WINDOWS}, Windows{$ENDIF};
 
 type
@@ -1429,6 +1429,9 @@ begin
     // Strip may fail on malformed UTF-8, fall back to raw text
     Sanitized := AText;
   end;
+
+  Sanitized := Sanitized.NormalizeTerminalText;
+
   AppendChatOutput(Sanitized);
   Utf8 := UTF8Encode(Sanitized);
   {$IFDEF WINDOWS}
