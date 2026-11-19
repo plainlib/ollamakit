@@ -276,6 +276,8 @@ type
     function RemoveLastExchange: boolean;
     // Deletes the active chat and activates the next available chat
     function DeleteActiveChat: boolean;
+    // Deletes all chats without creating a new one
+    procedure ClearChats;
     // Creates and activates a new chat
     function NewChat(const AName: string = ''): TAgentChat;
     // Switches to the adjacent chat, negative values select older chats
@@ -284,6 +286,8 @@ type
     function SaveChatsToFile(const AFileName: string): boolean;
     // Loads all chats from a JSON file
     function LoadChatsFromFile(const AFileName: string): boolean;
+    // Saves the specified chat to a separate JSON file
+    function SaveChatToFile(AChat: TAgentChat; const AFileName: string): boolean;
     // Saves the active chat to a separate JSON file
     function SaveChatToFile(const AFileName: string): boolean;
     // Loads a chat from a separate JSON file and activates it
@@ -2893,6 +2897,26 @@ begin
   Result := True;
 end;
 
+procedure TCustomOllamaAgent.ClearChats;
+var
+  I: integer;
+begin
+  if not FDone then
+    Exit;
+
+  // Release all chat objects
+  for I := 0 to FChats.Count - 1 do
+    TAgentChat(FChats[I]).Free;
+
+  FChats.Clear;
+  FActiveChat := nil;
+  FNextChatID := 0;
+  FHistory := string.Empty;
+  FContextUsed := 0;
+  FContextTotal := 0;
+  FFinalAnswer := string.Empty;
+end;
+
 function TCustomOllamaAgent.SaveChatsToFile(const AFileName: string): boolean;
 var
   Root, ChatObj: TJSONObject;
@@ -3066,7 +3090,7 @@ begin
   end;
 end;
 
-function TCustomOllamaAgent.SaveChatToFile(const AFileName: string): boolean;
+function TCustomOllamaAgent.SaveChatToFile(AChat: TAgentChat; const AFileName: string): boolean;
 var
   Root, ChatObj: TJSONObject;
   HistoryArray, ShellArray: TJSONArray;
@@ -3074,27 +3098,27 @@ var
   I: integer;
 begin
   Result := False;
-  if not Assigned(FActiveChat) or (Trim(AFileName) = string.Empty) then
+  if not Assigned(AChat) or (Trim(AFileName) = string.Empty) then
     Exit;
 
   Root := TJSONObject.Create;
   try
     ChatObj := TJSONObject.Create;
-    ChatObj.Add('id', FActiveChat.ID);
-    ChatObj.Add('name', FActiveChat.Name);
-    ChatObj.Add('history', FActiveChat.History);
-    ChatObj.Add('context_used', FActiveChat.ContextUsed);
-    ChatObj.Add('context_total', FActiveChat.ContextTotal);
-    ChatObj.Add('terminal_output', FActiveChat.TerminalOutput);
+    ChatObj.Add('id', AChat.ID);
+    ChatObj.Add('name', AChat.Name);
+    ChatObj.Add('history', AChat.History);
+    ChatObj.Add('context_used', AChat.ContextUsed);
+    ChatObj.Add('context_total', AChat.ContextTotal);
+    ChatObj.Add('terminal_output', AChat.TerminalOutput);
 
     HistoryArray := TJSONArray.Create;
-    for I := 0 to FActiveChat.TerminalHistory.Count - 1 do
-      HistoryArray.Add(FActiveChat.TerminalHistory[I]);
+    for I := 0 to AChat.TerminalHistory.Count - 1 do
+      HistoryArray.Add(AChat.TerminalHistory[I]);
     ChatObj.Add('terminal_history', HistoryArray);
 
     ShellArray := TJSONArray.Create;
-    for I := 0 to FActiveChat.ShellLog.Count - 1 do
-      ShellArray.Add(FActiveChat.ShellLog[I]);
+    for I := 0 to AChat.ShellLog.Count - 1 do
+      ShellArray.Add(AChat.ShellLog[I]);
     ChatObj.Add('shell_log', ShellArray);
 
     Root.Add('version', 1);
@@ -3112,6 +3136,12 @@ begin
     Result := False;
   end;
   Root.Free;
+end;
+
+// Saves the active chat to a separate JSON file
+function TCustomOllamaAgent.SaveChatToFile(const AFileName: string): boolean;
+begin
+  Result := SaveChatToFile(FActiveChat, AFileName);
 end;
 
 function TCustomOllamaAgent.LoadChatFromFile(const AFileName: string): TAgentChat;

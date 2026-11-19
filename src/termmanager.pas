@@ -235,8 +235,6 @@ type
     function ReadSmallTextFile(const APath: string): string;
     // Formats a byte count as human-readable string like "23.4 GB"
     function BytesToHumanText(const ABytes: int64): string;
-    // Restores terminal buffers and output of the active chat
-    procedure RestoreActiveChat;
     // Removes the last terminal input and its conversation exchange
     function RemoveLastInput: boolean;
   protected
@@ -314,6 +312,8 @@ type
     function FormatTermHelp: string; virtual;
     // Returns multi-line current values of term.* properties
     function FormatTermConfig: string; virtual;
+    // Restores terminal buffers and output of the active chat
+    procedure RestoreActiveChat;
 
     property Path: string read FPath write SetPath;
     property Prompt: string read FPrompt write FPrompt;
@@ -802,8 +802,21 @@ end;
 procedure TCustomTermManager.Notification(AComponent: TComponent; Operation: TOperation);
 begin
   inherited Notification(AComponent, Operation);
+
+  // Clear references when the agent is being destroyed
   if (Operation = opRemove) and (AComponent = FAgent) then
-    SetAgent(nil);
+  begin
+    FAgent := nil;
+    FPrevAgentOnChunk := nil;
+    FPrevAgentOnThinking := nil;
+    FPrevAgentOnToolCall := nil;
+    FPrevAgentOnToolResult := nil;
+    FPrevAgentOnFinish := nil;
+    FPrevAgentOnExecCommand := nil;
+    FPrevAgentOnAskUser := nil;
+    FPrevAgentOnLog := nil;
+    FInThinking := False;
+  end;
 end;
 
 procedure TCustomTermManager.SetAgent(const AValue: TCustomOllamaAgent);
@@ -3352,13 +3365,19 @@ begin
   {$ENDIF}
   // Start with explicit default color so prompt and banner match scheme
   SetColor(tcDefault);
-  // Print banner in welcome color, then restore default for prompt
+
+  // Show the welcome banner only when the active chat has no history
   if FWelcome <> '' then
   begin
-    SetColor(tcWelcome);
-    DoOutput(FWelcome + LineEnding, False);
-    SetColor(tcDefault);
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or ((FAgent.ActiveChat.History = string.Empty) and
+      (FAgent.ActiveChat.TerminalOutput = string.Empty)) then
+    begin
+      SetColor(tcWelcome);
+      DoOutput(FWelcome + LineEnding, False);
+      SetColor(tcDefault);
+    end;
   end;
+
   FRunning := True;
   FLastExitCode := 0;
   try
