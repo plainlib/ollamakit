@@ -255,6 +255,7 @@ type
     function DoListFiles(AArgs: TJSONObject): string; virtual;
     function DoSearchText(AArgs: TJSONObject): string; virtual;
     function DoReadFileLines(AArgs: TJSONObject): string; virtual;
+    function DoOpenFile(AArgs: TJSONObject): string; virtual;
     function DoEditFile(AArgs: TJSONObject): string; virtual;
     // Inserts text before the specified line
     function DoInsertCode(AArgs: TJSONObject): string; virtual;
@@ -3538,7 +3539,7 @@ begin
           Result.ShellLog.Add(ShellArray.Items[I].AsString);
       end;
 
-            // Restore terminal output operation boundaries
+      // Restore terminal output operation boundaries
       Item := ChatObj.Find('output_marks');
       if Item is TJSONArray then
       begin
@@ -3567,10 +3568,8 @@ begin
           if Item <> nil then
             Mark.ShellLogCount := Item.AsInteger;
 
-          if (Mark.OutputStart < 0) or
-            (Mark.OutputStart > Length(Result.TerminalOutput)) or
-            (Mark.InputKind < 0) or (Mark.InputKind > 3) or
-            (Mark.ShellLogCount < 0) then
+          if (Mark.OutputStart < 0) or (Mark.OutputStart > Length(Result.TerminalOutput)) or
+            (Mark.InputKind < 0) or (Mark.InputKind > 3) or (Mark.ShellLogCount < 0) then
             Continue;
 
           Result.AddOutputMark(Mark);
@@ -4214,6 +4213,9 @@ begin
         'Read a line range. Use for files >50KB or after read_file truncation. ' +
         'Up to 5000 lines per call, use increasing start_line for large files.',
         '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"}},"required":["path"]}');
+      AddTool(Arr, 'open_file',
+        'Open a text file and read a specific range of lines. line is 1-based, line_count is the number of lines to read, maximum 5000.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"line":{"type":"integer","description":"First line, 1-based"},"line_count":{"type":"integer","description":"Number of lines to read, maximum 5000"}},"required":["path","line","line_count"]}');
       AddTool(Arr, 'read_file',
         'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
         'prefer read_file_preview or read_file_lines for large ones. Set allow_binary=true only when binary data must be read as text.',
@@ -4320,6 +4322,7 @@ begin
     begin
       Names.Add('read_file_preview');
       Names.Add('read_file_lines');
+      Names.Add('open_file');
       Names.Add('read_file');
       Names.Add('write_file');
       Names.Add('list_files');
@@ -4844,11 +4847,8 @@ end;
 
 function TCustomOllamaAgent.DoReadFileLines(AArgs: TJSONObject): string;
 var
-  RelPath, FullPath: string;
-  Lines: TStringList;
-  StartLine, EndLine, TotalLines, I: integer;
-  Buf: TStringBuilder;
-  Content: string;
+  RelPath, FullPath, Content: string;
+  StartLine, EndLine, TotalLines: integer;
   BytesRead, FileSize: int64;
   JsonContent: TJSONString;
 begin
@@ -4884,8 +4884,8 @@ begin
   EndLine := integer(GetIntArg(AArgs, 'end_line', -1));
   if StartLine < 1 then
     StartLine := 1;
-  // Unified read, encoding auto-detected
-  if not ReadTextFileSafe(FullPath, Content, feAuto, 0, -1, 0, TotalLines, BytesRead, FileSize) then
+  // Read the requested range directly with automatic encoding detection
+  if not ReadTextFileSafe(FullPath, Content, feAuto, StartLine, EndLine, 0, TotalLines, BytesRead, FileSize) then
   begin
     Result := '{"error": "cannot read file"}';
     Exit;
@@ -4897,29 +4897,52 @@ begin
   // Cap at 5000 lines per call
   if EndLine - StartLine + 1 > 5000 then
     EndLine := StartLine + 4999;
-  Lines := TStringList.Create;
+  // The shared reader returns the selected range as UTF-8
+  JsonContent := TJSONString.Create(Content);
   try
-    Lines.Text := Content;
-    Buf := TStringBuilder.Create;
-    try
-      for I := StartLine - 1 to EndLine - 1 do
-      begin
-        Buf.Append(Lines[I]);
-        if I < EndLine - 1 then
-          Buf.Append(LineEnding);
-      end;
-      JsonContent := TJSONString.Create(Buf.ToString);
-      try
-        Result := '{"content": ' + JsonContent.AsJSON + ', "total_lines": ' + IntToStr(TotalLines) +
-          ', "shown_from": ' + IntToStr(StartLine) + ', "shown_to": ' + IntToStr(EndLine) + '}';
-      finally
-        JsonContent.Free;
-      end;
-    finally
-      Buf.Free;
-    end;
+    Result := '{"content": ' + JsonContent.AsJSON + ', "total_lines": ' + IntToStr(TotalLines) +
+      ', "shown_from": ' + IntToStr(StartLine) + ', "shown_to": ' + IntToStr(EndLine) + '}';
   finally
-    Lines.Free;
+    JsonContent.Free;
+  end;
+end;
+
+function TCustomOllamaAgent.DoOpenFile(AArgs: TJSONObject): string;
+var
+  AdaptedArgs: TJSONObject;
+  Line, LineCount: integer;
+begin
+  Result := '{"error": "invalid arguments"}';
+  if AArgs = nil then
+    Exit;
+
+  if (AArgs.Find('path') = nil) or (AArgs.Find('line') = nil) or (AArgs.Find('line_count') = nil) then
+  begin
+    Result := '{"error": "path, line and line_count are required"}';
+    Exit;
+  end;
+
+  Line := integer(GetIntArg(AArgs, 'line', 1));
+  LineCount := integer(GetIntArg(AArgs, 'line_count', 0));
+
+  if (Line < 1) or (LineCount < 1) then
+  begin
+    Result := '{"error": "line and line_count must be greater than zero"}';
+    Exit;
+  end;
+
+  if LineCount > 5000 then
+    LineCount := 5000;
+
+  // Convert open_file arguments to the shared line reader format
+  AdaptedArgs := TJSONObject.Create;
+  try
+    AdaptedArgs.Add('path', AArgs.Get('path', ''));
+    AdaptedArgs.Add('start_line', Line);
+    AdaptedArgs.Add('end_line', Line + LineCount - 1);
+    Result := DoReadFileLines(AdaptedArgs);
+  finally
+    AdaptedArgs.Free;
   end;
 end;
 
@@ -6315,6 +6338,8 @@ begin
         Exit(DoSearchText(Args))
       else if CleanName = 'read_file_lines' then
         Exit(DoReadFileLines(Args))
+      else if CleanName = 'open_file' then
+        Exit(DoOpenFile(Args))
       else if CleanName = 'edit_file' then
         Exit(DoEditFile(Args))
       else if CleanName = 'insert_code' then
