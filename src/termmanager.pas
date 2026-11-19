@@ -1742,6 +1742,17 @@ begin
   while (First <> '') and (First[1] = '@') do
     Delete(First, 1, 1);
 
+  // Detect drive switches before extracting the executable name
+  if (Length(First) >= 2) and (First[2] = ':') and (First[1] in ['a'..'z']) and ((Length(First) = 2) or
+    ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) then
+  begin
+    if HasMultipleLines then
+      Exit(tikCommand);
+
+    APayload := S;
+    Exit(tikBuiltin);
+  end;
+
   First := ExtractFileName(StringReplace(First, '\', '/', [rfReplaceAll]));
 
   // Handle glued cd variants like cd.., cd\, cd/ the same way cmd.exe does
@@ -1751,17 +1762,6 @@ begin
       Exit(tikCommand);
 
     APayload := 'cd ' + Copy(S, 3, MaxInt);
-    Exit(tikBuiltin);
-  end;
-
-  // Drive switch like "d:", "d:\", "d:\path" is a builtin, not an executable
-  if (Length(First) >= 2) and (First[2] = ':') and (First[1] in ['a'..'z']) and ((Length(First) = 2) or
-    (First[3] in [PathDelim, '/'])) then
-  begin
-    if HasMultipleLines then
-      Exit(tikCommand);
-
-    APayload := S;
     Exit(tikBuiltin);
   end;
 
@@ -3125,6 +3125,8 @@ var
   InMode: DWORD = 0;
   InModeSaved: boolean;
   ScriptFileName: string;
+  CwdFileName: string;
+  CwdPath: string;
   ScriptData: RawByteString;
   ScriptStream: TFileStream;
   TempFileName: string;
@@ -3194,7 +3196,10 @@ begin
   IsInteractive := not HasMultipleLines and (Pos('|' + CommandName + '|', INTERACTIVE_COMMANDS) > 0);
 
   RawData := '';
+  {$IFDEF WINDOWS}
   ScriptFileName := string.Empty;
+  CwdFileName := string.Empty;
+  {$ENDIF}
   Process := TProcess.Create(nil);
   {$IFDEF WINDOWS}
   InModeSaved := False;
@@ -3206,18 +3211,24 @@ begin
 
     if HasMultipleLines then
     begin
-      // Create a temporary batch file for multi-line scripts
+      // Create temporary files for the batch script and working directory
       TempFileName := SysUtils.GetTempFileName;
       ScriptFileName := ChangeFileExt(TempFileName, '.cmd');
+      CwdFileName := SysUtils.GetTempFileName;
 
-      // Create the temporary file before renaming it
+      // Create the temporary files before renaming or using them
       ScriptStream := TFileStream.Create(TempFileName, fmCreate);
+      ScriptStream.Free;
+
+      ScriptStream := TFileStream.Create(CwdFileName, fmCreate);
       ScriptStream.Free;
 
       if not RenameFile(TempFileName, ScriptFileName) then
         raise Exception.Create('Cannot create temporary batch file');
 
-      ScriptData := RawByteString('@chcp 65001 > nul' + LineEnding + ACommand + LineEnding);
+      // Append the final working directory to a separate file
+      ScriptData := RawByteString('@chcp 65001 > nul' + LineEnding + ACommand + LineEnding +
+        '@echo %CD%> "' + CwdFileName + '"' + LineEnding);
 
       ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
       try
@@ -3351,6 +3362,22 @@ begin
     PumpOutput('', False, True);
     PumpOutput('', True, True);
 
+    // Restore the working directory after a multi-line batch script
+    {$IFDEF WINDOWS}
+    if HasMultipleLines and (CwdFileName <> '') and FileExists(CwdFileName) then
+    begin
+      CwdPath := Trim(ReadSmallTextFile(CwdFileName));
+      if DirectoryExists(CwdPath) then
+      begin
+        SetPath(CwdPath);
+
+        // Store the new directory in the active chat
+        if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+          FAgent.ActiveChat.WorkingDirectory := GetEffectivePath;
+      end;
+    end;
+    {$ENDIF}
+
     Result := Process.ExitStatus;
   finally
     {$IFDEF WINDOWS}
@@ -3359,9 +3386,11 @@ begin
     {$ENDIF}
     Process.Free;
     {$IFDEF WINDOWS}
-      // Remove the temporary batch file after execution
+      // Remove temporary files after execution
       if (ScriptFileName <> '') and FileExists(ScriptFileName) then
         SysUtils.DeleteFile(ScriptFileName);
+      if (CwdFileName <> '') and FileExists(CwdFileName) then
+        SysUtils.DeleteFile(CwdFileName);
     {$ENDIF}
   end;
 end;
