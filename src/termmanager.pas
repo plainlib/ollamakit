@@ -2402,23 +2402,104 @@ end;
 
 function TCustomTermManager.RemoveLastInput: boolean;
 var
-  LastInput, Payload, SearchText, OutputText: string;
+  LastInput, Payload, OutputText, PromptSuffix, LineText: string;
   Kind: TTermInputKind;
-  I, SearchFrom, MatchPos: integer;
+  I, P, LineStart, LineEnd, SuffixPos, SearchFrom, LastVarPos: integer;
+
+// Finds the last submitted input using the stable prompt suffix
+  function FindLastInput(out AInput: string; out ALineStart: integer): boolean;
+  var
+    SearchText: string;
+  begin
+    Result := False;
+    AInput := string.Empty;
+    ALineStart := 0;
+
+    // Skip trailing line endings
+    LineEnd := Length(OutputText);
+    while (LineEnd > 0) and (OutputText[LineEnd] in [#10, #13]) do
+      Dec(LineEnd);
+
+    // Search terminal lines backwards
+    while LineEnd > 0 do
+    begin
+      LineStart := LineEnd;
+      while (LineStart > 1) and not (OutputText[LineStart - 1] in [#10, #13]) do
+        Dec(LineStart);
+
+      LineText := Copy(OutputText, LineStart, LineEnd - LineStart + 1);
+      SuffixPos := Pos(PromptSuffix, LineText);
+
+      if SuffixPos > 0 then
+      begin
+        AInput := Copy(LineText, SuffixPos + Length(PromptSuffix), MaxInt);
+        if AInput <> string.Empty then
+        begin
+          ALineStart := LineStart;
+          Exit(True);
+        end;
+      end;
+
+      // Move to the previous line
+      LineEnd := LineStart - 1;
+      while (LineEnd > 0) and (OutputText[LineEnd] in [#10, #13]) do
+        Dec(LineEnd);
+    end;
+
+    // Fall back to the current prompt when no stable suffix exists
+    SearchText := GetPromptText;
+    if SearchText = string.Empty then
+      Exit;
+
+    SearchFrom := 1;
+    while SearchFrom <= Length(OutputText) do
+    begin
+      P := Pos(SearchText, Copy(OutputText, SearchFrom, MaxInt));
+      if P = 0 then
+        Break;
+
+      SuffixPos := SearchFrom + P - 1;
+      SearchFrom := SuffixPos + 1;
+    end;
+
+    if SuffixPos > 0 then
+    begin
+      ALineStart := SuffixPos;
+      AInput := Copy(OutputText, SuffixPos + Length(SearchText), MaxInt);
+      P := Pos(LineEnding, AInput);
+      if P > 0 then
+        SetLength(AInput, P - 1);
+      Result := AInput <> string.Empty;
+    end;
+  end;
+
 begin
   Result := False;
+
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
     Exit;
 
-  // Restore missing terminal history from the conversation
-  if FHistory.Count = 0 then
-    RestoreTerminalHistory;
-
-  if FHistory.Count = 0 then
+  OutputText := FAgent.ActiveChat.TerminalOutput;
+  if OutputText = string.Empty then
     Exit;
 
-  LastInput := FHistory[FHistory.Count - 1];
+  // Get the stable part of the prompt after its last placeholder
+  LastVarPos := LastDelimiter('}', FPrompt);
+  if LastVarPos > 0 then
+    PromptSuffix := Copy(FPrompt, LastVarPos + 1, MaxInt)
+  else
+    PromptSuffix := FPrompt;
+
+  if PromptSuffix = string.Empty then
+    PromptSuffix := GetPromptText;
+
+  // Find the actual last input in terminal output
+  if not FindLastInput(LastInput, LineStart) then
+    Exit;
+
   Kind := ClassifyLine(LastInput, Payload);
+  if Kind = tikEmpty then
+    Exit;
 
   // Remove the conversation exchange when the last input was sent to the agent
   if (Kind = tikAgent) and not FAgent.RemoveLastExchange then
@@ -2431,30 +2512,13 @@ begin
     FAgent.ActiveChat.ShellLog.Assign(FShellLog);
   end;
 
-  // Locate the submitted input together with its terminal prompt
-  OutputText := FAgent.ActiveChat.TerminalOutput;
-  SearchText := GetPromptText + LastInput + LineEnding;
-  SearchFrom := 1;
-  MatchPos := 0;
+  // Remove the input and all following output
+  Delete(OutputText, LineStart, MaxInt);
+  FAgent.ActiveChat.TerminalOutput := OutputText;
 
-  while SearchFrom <= Length(OutputText) do
-  begin
-    I := Pos(SearchText, Copy(OutputText, SearchFrom, MaxInt));
-    if I = 0 then
-      Break;
-    MatchPos := SearchFrom + I - 1;
-    SearchFrom := MatchPos + 1;
-  end;
-
-  if MatchPos > 0 then
-  begin
-    Delete(OutputText, MatchPos, MaxInt);
-    FAgent.ActiveChat.TerminalOutput := OutputText;
-  end;
-
-  // Remove the terminal input and synchronize the saved history
+  // Remove the terminal history entry only when it matches the deleted input
   // Keep agent input in terminal history so it can be selected again
-  if Kind <> tikAgent then
+  if (Kind <> tikAgent) and (FHistory.Count > 0) and (FHistory[FHistory.Count - 1] = LastInput) then
   begin
     FHistory.Delete(FHistory.Count - 1);
     FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
