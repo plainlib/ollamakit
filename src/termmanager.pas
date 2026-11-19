@@ -3872,7 +3872,7 @@ var
   Rec, NextRec: INPUT_RECORD;
   N: DWORD = 0;
   Line, PromptText: RawByteString;
-  CursorPos, HistIndex, PromptRow, PromptCol: Integer;
+   CursorPos, HistIndex, PromptRow, PromptCol: Integer;
   ScreenInfo: TConsoleScreenBufferInfo;
   C: WideChar;
   Wide: UnicodeString;
@@ -3880,6 +3880,50 @@ var
   HasMore, IsModifier, ShiftPressed, CtrlPressed: Boolean;
   SelAnchor, SelStart, SelEnd: Integer;
   HasSelection: Boolean;
+
+  // Scrolls the console viewport without moving the input cursor
+  procedure ScrollOutput(ADirection: Integer);
+  var
+    Info: TConsoleScreenBufferInfo;
+    Rect: SMALL_RECT;
+    ViewHeight, MaxTop, NewTop: Integer;
+  begin
+    Info := Default(TConsoleScreenBufferInfo);
+    if not GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+      Exit;
+
+    Rect := Info.srWindow;
+    ViewHeight := Rect.Bottom - Rect.Top + 1;
+    if ViewHeight <= 0 then
+      Exit;
+
+    MaxTop := Info.dwSize.Y - ViewHeight;
+    if MaxTop < 0 then
+      MaxTop := 0;
+
+    case ADirection of
+      -2: NewTop := 0;
+       2:
+       begin
+          // Place the current prompt near the middle of the viewport
+         NewTop := Info.dwCursorPosition.Y - ViewHeight div 2;
+       end;
+      -1: NewTop := Rect.Top - ViewHeight;
+      1: NewTop := Rect.Top + ViewHeight;
+      else
+        Exit;
+    end;
+
+    if NewTop < 0 then
+      NewTop := 0
+    else if NewTop > MaxTop then
+      NewTop := MaxTop;
+
+    Rect.Top := NewTop;
+    Rect.Bottom := NewTop + ViewHeight - 1;
+
+    SetConsoleWindowInfo(GetStdHandle(STD_OUTPUT_HANDLE), True, Rect);
+  end;
 
   // Collects full UTF-8 sequence that conhost splits across key events
   procedure CollectBrokenUtf8(var AC: WideChar);
@@ -4669,6 +4713,16 @@ begin
           if ShiftPressed then
             UpdateSelection;
         end;
+      VK_PRIOR:
+        begin
+          ScrollOutput(-1);
+          Continue;
+        end;
+      VK_NEXT:
+        begin
+          ScrollOutput(1);
+          Continue;
+        end;
       VK_HOME:
         begin
           if CtrlPressed then
@@ -4681,6 +4735,11 @@ begin
               CursorPos := Length(Line);
               ClearSelection;
             end;
+          end
+          else if Line = string.Empty then
+          begin
+            ScrollOutput(-2);
+            Continue;
           end
           else
           begin
@@ -4706,6 +4765,11 @@ begin
               CursorPos := Length(Line);
               ClearSelection;
             end;
+          end
+          else if Line = string.Empty then
+          begin
+            ScrollOutput(2);
+            Continue;
           end
           else
           begin
