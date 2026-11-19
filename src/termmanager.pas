@@ -3361,8 +3361,6 @@ begin
   if InModeSaved then
     SetConsoleMode(InHandle, InMode and not (ENABLE_ECHO_INPUT or ENABLE_LINE_INPUT or ENABLE_PROCESSED_INPUT));
   {$ENDIF}
-  // Start with explicit default color so prompt and banner match scheme
-  SetColor(tcDefault);
 
   // Show the welcome banner only when the active chat is completely empty
   if FWelcome <> '' then
@@ -3370,16 +3368,14 @@ begin
     if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or ((FAgent.ActiveChat.History = string.Empty) and
       (FAgent.ActiveChat.TerminalOutput = string.Empty)) then
     begin
-      FSuppressChatOutput := True;
-      try
-        SetColor(tcWelcome);
-        DoOutput(FWelcome + LineEnding, False);
-        SetColor(tcDefault);
-      finally
-        FSuppressChatOutput := False;
-      end;
+      SetColor(tcWelcome);
+      DoOutput(FWelcome + LineEnding, False);
+      SetColor(tcDefault);
     end;
   end;
+
+  // Start with explicit default color so prompt and banner match scheme
+  SetColor(tcDefault);
 
   FRunning := True;
   FLastExitCode := 0;
