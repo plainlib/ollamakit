@@ -195,6 +195,8 @@ type
     procedure SetHistory(const AValue: TStringList);
     // Switches the active agent chat and restores its terminal state
     function SwitchActiveChat(ADelta: integer): boolean;
+    // Moves the active chat in the list
+    function MoveActiveChat(ADelta: integer): boolean;
     // Appends terminal text to the active chat transcript
     procedure AppendChatOutput(const AText: string);
     procedure SetColors(const AValue: TTermColorScheme);
@@ -881,6 +883,15 @@ begin
 
   RestoreActiveChat;
   Result := True;
+end;
+
+function TCustomTermManager.MoveActiveChat(ADelta: integer): boolean;
+begin
+  Result := False;
+  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    Exit;
+
+  Result := FAgent.MoveActiveChat(ADelta);
 end;
 
 procedure TCustomTermManager.AppendChatOutput(const AText: string);
@@ -4487,8 +4498,37 @@ begin
       end;
     end;
 
+    // Move the active chat with Ctrl+Shift+Left and Ctrl+Shift+Right
+    if CtrlPressed and ShiftPressed and
+      (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
+    begin
+      if Rec.Event.KeyEvent.wVirtualKeyCode = VK_LEFT then
+        HasMore := MoveActiveChat(-1)
+      else
+        HasMore := MoveActiveChat(1);
+
+      if HasMore then
+      begin
+        Line := string.Empty;
+        CursorPos := 0;
+        HistIndex := FHistory.Count;
+        ClearSelection;
+
+        PromptText := GetPromptText;
+        Redraw;
+        FLastCharWasNewLine := False;
+
+        ScreenInfo := Default(TConsoleScreenBufferInfo);
+        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
+          PromptCol := ScreenInfo.dwCursorPosition.X;
+
+        LastRedrawRows := 1;
+      end;
+      Continue;
+    end;
+
     // Switch chats with Ctrl+Left and Ctrl+Right
-    if CtrlPressed and
+    if CtrlPressed and not ShiftPressed and
       (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
     begin
       if Rec.Event.KeyEvent.wVirtualKeyCode = VK_LEFT then

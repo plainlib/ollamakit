@@ -282,6 +282,8 @@ type
     function NewChat(const AName: string = ''): TAgentChat;
     // Switches to the adjacent chat, negative values select older chats
     function SwitchChat(ADelta: integer): boolean;
+    // Moves the active chat in the chat list without switching it
+    function MoveActiveChat(ADelta: integer): boolean;
     // Saves all chats to a JSON file
     function SaveChatsToFile(const AFileName: string): boolean;
     // Loads all chats from a JSON file
@@ -2851,6 +2853,30 @@ begin
   FHistory := FActiveChat.History;
   FContextUsed := FActiveChat.ContextUsed;
   FContextTotal := FActiveChat.ContextTotal;
+  Result := True;
+end;
+
+function TCustomOllamaAgent.MoveActiveChat(ADelta: integer): boolean;
+var
+  CurrentIndex, TargetIndex: integer;
+begin
+  Result := False;
+  if not FDone or (ADelta = 0) or not Assigned(FActiveChat) then
+    Exit;
+
+  CurrentIndex := FChats.IndexOf(FActiveChat);
+  if CurrentIndex < 0 then
+    Exit;
+
+  TargetIndex := CurrentIndex + ADelta;
+  if (TargetIndex < 0) or (TargetIndex >= FChats.Count) then
+    Exit;
+
+  // Save the active chat context before moving it
+  FActiveChat.ContextUsed := FContextUsed;
+  FActiveChat.ContextTotal := FContextTotal;
+
+  FChats.Move(CurrentIndex, TargetIndex);
   Result := True;
 end;
 
