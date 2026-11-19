@@ -382,13 +382,6 @@ begin
     T.Add('  text      single line, or "from <file>"');
     T.Add('  runtime   numctx and active are not saved');
 
-    Header('Examples');
-    T.Add('  set baseurl http://192.168.1.10:11434');
-    T.Add('  set model qwen2.5:7b');
-    T.Add('  set tools filetools, exec');
-    T.Add('  set systemprompt from prompt.txt');
-    T.Add('  get tools');
-
     Result := T.Text;
   finally
     T.Free;

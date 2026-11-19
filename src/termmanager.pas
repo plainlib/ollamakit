@@ -189,6 +189,7 @@ type
     FOllamaPullLastStep: integer;
     FStdOutPending: rawbytestring;
     FStdErrPending: rawbytestring;
+    FSuppressChatOutput: boolean;
     procedure SetPath(const AValue: string);
     procedure SetAgent(const AValue: TCustomOllamaAgent);
     procedure SetHistory(const AValue: TStringList);
@@ -310,8 +311,6 @@ type
     procedure WriteText(const AText: string; AIsStderr: boolean = False); virtual;
     // Writes text followed by a line ending, flushes immediately
     procedure WriteLine(const AText: string; AIsStderr: boolean = False); virtual;
-    // Returns multi-line help for term.* properties
-    function FormatTermHelp: string; virtual;
     // Returns multi-line current values of term.* properties
     function FormatTermConfig: string; virtual;
     // Restores terminal buffers and output of the active chat
@@ -888,7 +887,7 @@ procedure TCustomTermManager.AppendChatOutput(const AText: string);
 begin
   if AText = string.Empty then
     Exit;
-  if FRestoringChat then
+  if FRestoringChat or FSuppressChatOutput then
     Exit;
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
     Exit;
@@ -1769,126 +1768,99 @@ end;
 procedure TCustomTermManager.HandleHelpCommand(const AArg: string);
 var
   Topic: string;
-  BaseUrl, ModelName, MaxSteps, Streaming, Tools: string;
 
-// Writes a command group row with a two-space indent
-  procedure Group(const AName, AValue: string);
-  var
-    Pad: string;
-  begin
-    Pad := '  ' + AName;
-    while Length(Pad) < 14 do
-      Pad := Pad + ' ';
-    DoOutput(Pad + AValue + LineEnding, False);
-  end;
-
-  // Writes a hint row with a label and a short description
+// Writes a hint row with a label and a short description
   procedure Item(const ALabel, ADesc: string);
   var
     Pad: string;
   begin
     Pad := '  ' + ALabel;
-    while Length(Pad) < 26 do
+    while Length(Pad) < 34 do
       Pad := Pad + ' ';
     DoOutput(Pad + ADesc + LineEnding, False);
   end;
 
-  // Returns comma separated short tool names for display in help
-  function BuildToolsList(AFeatures: TAgentFeatures): string;
-  var
-    Parts: TStringList;
-  begin
-    Parts := TStringList.Create;
-    try
-      if afFileTools in AFeatures then
-        Parts.Add('filetools');
-      if afExecCommand in AFeatures then
-        Parts.Add('exec');
-      if afGit in AFeatures then
-        Parts.Add('git');
-      if afInteractive in AFeatures then
-        Parts.Add('interactive');
-      if afFinish in AFeatures then
-        Parts.Add('finish');
-      if afWebTools in AFeatures then
-        Parts.Add('web');
-      if Parts.Count = 0 then
-        Result := 'none'
-      else
-        Result := StringReplace(Parts.CommaText, ',', ', ', [rfReplaceAll]);
-    finally
-      Parts.Free;
-    end;
-  end;
-
 begin
   Topic := LowerCase(Trim(AArg));
-  if (Topic = 'agent') or (Topic = 'set') or (Topic = 'get') or (Topic = 'config') then
-    DoOutput(FormatAgentHelp + LineEnding, False)
-  else if (Topic = 'term') or (Topic = 'terminal') then
-    DoOutput(FormatTermHelp + LineEnding, False)
+
+  if Topic = 'agent' then
+  begin
+    DoOutput('Commands' + LineEnding, False);
+    Item('cd [path]', 'change working directory');
+    Item('pwd', 'show working directory');
+    Item('cls / clear', 'clear the current chat');
+    Item('new', 'start a new chat');
+    Item('history', 'show command history');
+    Item('exit / quit', 'exit the console');
+    Item('set <name> <value>', 'change a property');
+    Item('get <name>', 'inspect a property');
+    Item('set chat <name>', 'rename the active chat');
+    Item('config', 'show current settings');
+    Item('models', 'list available models');
+    Item('ollama help', 'model management commands');
+    Item('help / ?', 'show short help');
+    DoOutput(LineEnding, False);
+
+    DoOutput(FormatAgentHelp + LineEnding, False);
+
+    DoOutput('Terminal settings' + LineEnding, False);
+    Item('term.path', 'working directory');
+    Item('term.shell', 'executable, e.g. cmd.exe or pwsh.exe');
+    Item('term.showthinking', 'on|off, show agent reasoning text');
+    Item('term.commandtimeout', 'ms, user command timeout, 0 = none');
+    Item('term.maxcapturebytes', 'cap on captured output per command');
+    Item('term.agentcommandtimeout', 'timeout for agent commands (ms, 0 = unlimited)');
+    DoOutput(LineEnding, False);
+
+    DoOutput('Examples' + LineEnding, False);
+    DoOutput('  set baseurl http://192.168.1.10:11434' + LineEnding, False);
+    DoOutput('  set model qwen2.5:7b' + LineEnding, False);
+    DoOutput('  set tools filetools, exec' + LineEnding, False);
+    DoOutput('  set systemprompt from prompt.txt' + LineEnding, False);
+    DoOutput('  get tools' + LineEnding, False);
+    DoOutput(LineEnding, False);
+
+    DoOutput('Keyboard shortcuts' + LineEnding, False);
+    Item('Enter', 'submit input');
+    Item('Shift+Enter', 'insert a new line');
+    Item('Ctrl+Enter', 'insert a new line');
+    Item('Ctrl+Left/Right', 'switch between chats');
+    Item('Ctrl+Shift+Del', 'delete the active chat');
+    Item('Ctrl+Backspace', 'remove the last input and result');
+    Item('Ctrl+Up/Down', 'navigate command history');
+    Item('Ctrl+Home/End', 'select first/last history entry');
+    Item('Ctrl+Delete', 'delete the current history entry');
+    Item('Ctrl+A', 'select all input text');
+    Item('Ctrl+C', 'copy selection or cancel current input');
+    Item('Ctrl+V', 'paste from clipboard');
+    Item('Shift+Left/Right', 'select text');
+    Item('Left/Right', 'move cursor');
+    Item('Up/Down', 'move vertically or navigate history');
+    Item('Home/End', 'move to line start/end');
+    Item('Escape', 'clear current input');
+  end
   else
   begin
     DoOutput('Commands' + LineEnding, False);
-    Group('shell', 'cd  pwd  cls  clear  new  history  exit  quit');
-    Group('settings', 'set  get  config');
-    Group('models', 'models  ollama');
-    Group('help', 'help  help agent  help term  ?');
-    DoOutput('' + LineEnding, False);
+    Item('cd  pwd', 'change/show working directory');
+    Item('cls  clear', 'clear the current chat');
+    Item('new', 'start a new chat');
+    Item('history', 'show command history');
+    Item('set  get  config', 'manage and view settings');
+    Item('models  ollama', 'model management');
+    Item('help  help agent  ?', 'show help');
 
-    if Assigned(FAgent) then
-    begin
-      if Assigned(FAgent.OllamaManager) then
-        BaseUrl := FAgent.OllamaManager.BaseURL
-      else
-        BaseUrl := '(no manager)';
-      ModelName := FAgent.ModelName;
-      if ModelName = '' then
-        ModelName := '(not selected)';
-      if FAgent.MaxSteps > 0 then
-        MaxSteps := IntToStr(FAgent.MaxSteps)
-      else
-        MaxSteps := '0 (unlimited)';
-      if FAgent.Streaming then
-        Streaming := 'on'
-      else
-        Streaming := 'off';
-      Tools := BuildToolsList(FAgent.EnabledTools);
+    DoOutput(LineEnding + 'Shortcuts' + LineEnding, False);
+    Item('Ctrl+Left/Right', 'switch between chats');
+    Item('Ctrl+Shift+Del', 'delete the active chat');
+    Item('Ctrl+Backspace', 'remove the last input and result');
 
-      DoOutput('Agent' + LineEnding, False);
-      Group('baseurl', BaseUrl);
-      Group('model', ModelName);
-      Group('maxsteps', MaxSteps);
-      Group('streaming', Streaming);
-      Group('tools', Tools);
-      DoOutput('' + LineEnding, False);
-
-      Item('set <name> <value>', 'change a property');
-      Item('get <name>', 'inspect a property');
-      Item('config', 'full settings dump');
-      Item('cls', 'clear the current chat');
-      Item('new', 'start a new chat');
-      Item('set chat <name>', 'rename the active chat');
-      Item('Ctrl+Shift+Del', 'delete the active chat');
-      Item('Ctrl+Backspace', 'remove the last input and result');
-      Item('ollama help', 'model management commands');
-      Item('', '');
-    end
-    else
-    begin
-      DoOutput('Agent  not attached, chat disabled' + LineEnding, False);
-      DoOutput('' + LineEnding, False);
-      Item('set baseurl <url>', 'server URL, e.g. http://localhost:11434');
-      Item('set model <name>', 'select a model');
-      Item('set maxsteps <n>', 'iteration limit, 0 = unlimited');
-      Item('set streaming on|off', 'real time output');
-      Item('set tools <list>', 'tool groups, "all" or "none"');
-      DoOutput('' + LineEnding, False);
-      Item('config', 'full settings dump');
-      Item('ollama help', 'model management commands');
-      Item('', '');
-    end;
+    DoOutput(LineEnding, False);
+    DoOutput('Type "config" to view current settings.' + LineEnding, False);
+    DoOutput('Type "help agent" for details and all available commands and shortcuts.' + LineEnding, False);
   end;
+
+  DoOutput(LineEnding, False);
 end;
 
 procedure TCustomTermManager.HandleSetCommand(const AArg: string);
@@ -1899,7 +1871,7 @@ begin
   if Trim(AArg) = '' then
   begin
     DoOutput('usage: set <name> <value>' + LineEnding, True);
-    DoOutput('use "help agent" or "help term" for property lists' + LineEnding, True);
+    DoOutput('use "help agent" for property lists' + LineEnding, True);
     Exit;
   end;
   P := Pos(' ', AArg);
@@ -2037,7 +2009,7 @@ begin
   end
   else
   begin
-    DoOutput('error: unknown term property: ' + AName + ', use "help term"' + LineEnding, True);
+    DoOutput('error: unknown term property: ' + AName + ', use "help agent"' + LineEnding, True);
     Exit;
   end;
   DoOutput('term.' + N + ' = ' + V + LineEnding, False);
@@ -2068,49 +2040,10 @@ begin
     Val := IntToStr(FAgentCommandTimeout)
   else
   begin
-    DoOutput('error: unknown term property: ' + AName + ', use "help term"' + LineEnding, True);
+    DoOutput('error: unknown term property: ' + AName + ', use "help agent"' + LineEnding, True);
     Exit;
   end;
   DoOutput('term.' + N + ' = ' + Val + LineEnding, False);
-end;
-
-function TCustomTermManager.FormatTermHelp: string;
-var
-  T: TStringList;
-
-// Adds an aligned settings row with two-space indent
-  procedure Row(const AName, ADesc: string);
-  var
-    Pad: string;
-  begin
-    Pad := '  ' + AName;
-    while Length(Pad) < 24 do
-      Pad := Pad + ' ';
-    T.Add(Pad + ADesc);
-  end;
-
-begin
-  T := TStringList.Create;
-  try
-    T.Add('Terminal settings  prefix "term."');
-    T.Add('');
-    Row('path', 'working directory');
-    Row('shell', 'executable, e.g. cmd.exe or pwsh.exe');
-    Row('showthinking', 'on|off, show agent reasoning text');
-    Row('commandtimeout', 'ms, user command timeout, 0 = none');
-    Row('maxcapturebytes', 'cap on captured output per command');
-    Row('agentcommandtimeout', 'ms, agent exec_command timeout, 0 = none');
-    T.Add('');
-    Row('set term.<name> <value>', 'change a setting');
-    Row('get term.<name>', 'inspect a setting');
-    Row('config', 'full settings dump');
-    T.Add('');
-    T.Add('  example  set term.shell pwsh.exe');
-    T.Add('');
-    Result := T.Text;
-  finally
-    T.Free;
-  end;
 end;
 
 function TCustomTermManager.FormatTermConfig: string;
@@ -2471,7 +2404,7 @@ function TCustomTermManager.RemoveLastInput: boolean;
 var
   LastInput, Payload, SearchText, OutputText: string;
   Kind: TTermInputKind;
-  I, SearchFrom, MatchPos, StartPos: integer;
+  I, SearchFrom, MatchPos: integer;
 begin
   Result := False;
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
@@ -2498,9 +2431,9 @@ begin
     FAgent.ActiveChat.ShellLog.Assign(FShellLog);
   end;
 
-  // Locate the last occurrence of the submitted input in the terminal transcript
+  // Locate the submitted input together with its terminal prompt
   OutputText := FAgent.ActiveChat.TerminalOutput;
-  SearchText := LastInput + LineEnding;
+  SearchText := GetPromptText + LastInput + LineEnding;
   SearchFrom := 1;
   MatchPos := 0;
 
@@ -2515,11 +2448,7 @@ begin
 
   if MatchPos > 0 then
   begin
-    StartPos := MatchPos;
-    while (StartPos > 1) and not (OutputText[StartPos - 1] in [#10, #13]) do
-      Dec(StartPos);
-
-    Delete(OutputText, StartPos, MaxInt);
+    Delete(OutputText, MatchPos, MaxInt);
     FAgent.ActiveChat.TerminalOutput := OutputText;
   end;
 
@@ -3435,14 +3364,20 @@ begin
   // Start with explicit default color so prompt and banner match scheme
   SetColor(tcDefault);
 
-  // Show the welcome banner only when the active chat has no conversation history
+  // Show the welcome banner only when the active chat is completely empty
   if FWelcome <> '' then
   begin
-    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or (FAgent.ActiveChat.History = string.Empty) then
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or ((FAgent.ActiveChat.History = string.Empty) and
+      (FAgent.ActiveChat.TerminalOutput = string.Empty)) then
     begin
-      SetColor(tcWelcome);
-      DoOutput(FWelcome + LineEnding, False);
-      SetColor(tcDefault);
+      FSuppressChatOutput := True;
+      try
+        SetColor(tcWelcome);
+        DoOutput(FWelcome + LineEnding, False);
+        SetColor(tcDefault);
+      finally
+        FSuppressChatOutput := False;
+      end;
     end;
   end;
 
@@ -3761,8 +3696,12 @@ begin
   begin
     Count := Info.dwSize.X - Info.dwCursorPosition.X;
     if Count > 0 then
+    begin
       FillConsoleOutputCharacter(GetStdHandle(STD_OUTPUT_HANDLE), ' ', Count,
         Info.dwCursorPosition, Written);
+      FillConsoleOutputAttribute(GetStdHandle(STD_OUTPUT_HANDLE), Info.wAttributes,
+        Count, Info.dwCursorPosition, Written);
+    end;
   end;
 end;
 
