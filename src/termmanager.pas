@@ -1947,6 +1947,7 @@ begin
     Item('Enter', 'submit input');
     Item('Shift+Enter', 'insert a new line');
     Item('Ctrl+Enter', 'insert a new line');
+    Item('Ctrl+N', 'start a new chat');
     Item('Ctrl+Left/Right', 'switch between chats');
     Item('Ctrl+Shift+Del', 'delete the active chat');
     Item('Ctrl+Backspace', 'remove the last input and result');
@@ -1974,6 +1975,7 @@ begin
     Item('help  help agent  ?', 'show help');
 
     DoOutput(LineEnding + 'Shortcuts' + LineEnding, False);
+    Item('Ctrl+N', 'start a new chat');
     Item('Ctrl+Left/Right', 'switch between chats');
     Item('Ctrl+Shift+Del', 'delete the active chat');
     Item('Ctrl+Backspace', 'remove the last input and result');
@@ -2188,12 +2190,12 @@ begin
   T := TStringList.Create;
   try
     T.Add('Terminal');
-    Row('path', GetEffectivePath);
-    Row('shell', FShellExec);
-    Row('showthinking', BoolToStr(FShowThinking, 'on', 'off'));
-    Row('commandtimeout', IntToStr(FCommandTimeout));
-    Row('maxcapturebytes', IntToStr(FMaxCaptureBytes));
-    Row('agentcommandtimeout', IntToStr(FAgentCommandTimeout));
+    Row('term.path', GetEffectivePath);
+    Row('term.shell', FShellExec);
+    Row('term.showthinking', BoolToStr(FShowThinking, 'on', 'off'));
+    Row('term.commandtimeout', IntToStr(FCommandTimeout));
+    Row('term.maxcapturebytes', IntToStr(FMaxCaptureBytes));
+    Row('term.agentcommandtimeout', IntToStr(FAgentCommandTimeout));
     Result := T.Text;
   finally
     T.Free;
@@ -5078,6 +5080,15 @@ begin
           CursorPos := 0;
           ClearSelection;
         end;
+      VK_N:
+        if CtrlPressed then
+        begin
+          HandleBuiltin('new');
+          ResetInput;
+          Continue;
+        end
+        else if Ord(C) >= 32 then
+          InsertTypedChar(WideCharToUtf8(C));
       VK_V:
         if CtrlPressed then
           PasteText(ReadClipboardText)
