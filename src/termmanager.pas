@@ -190,6 +190,8 @@ type
     FStdOutPending: rawbytestring;
     FStdErrPending: rawbytestring;
     FSuppressChatOutput: boolean;
+    FPendingOutputStart: SizeInt;
+    FCurrentOutputMark: boolean;
     procedure SetPath(const AValue: string);
     procedure SetAgent(const AValue: TCustomOllamaAgent);
     procedure SetHistory(const AValue: TStringList);
@@ -708,7 +710,8 @@ begin
   FColors := TTermColorScheme.Create;
   FDefaultModelLabel := 'plainconsole';
   FAgent := nil;
-  FRestoringChat := False;
+  FPendingOutputStart := -1;
+  FCurrentOutputMark := False;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
   FPrevAgentOnToolCall := nil;
@@ -1149,7 +1152,12 @@ begin
     FShellLog.Delete(0);
 
   if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+  begin
+    if FCurrentOutputMark then
+      FAgent.ActiveChat.IncrementLastOutputMarkShellLogCount;
+
     FAgent.ActiveChat.ShellLog.Assign(FShellLog);
+  end;
 end;
 
 function TCustomTermManager.IsMetaCommand(const ACommand: string): boolean;
@@ -2451,127 +2459,47 @@ end;
 
 function TCustomTermManager.RemoveLastInput: boolean;
 var
-  LastInput, Payload, OutputText, PromptSuffix, LineText: string;
-  Kind: TTermInputKind;
-  P, LineStart, LineEnd, SuffixPos, SearchFrom, LastVarPos: integer;
-
-// Finds the last submitted input using the stable prompt suffix
-  function FindLastInput(out AInput: string; out ALineStart: integer): boolean;
-  var
-    SearchText: string;
-  begin
-    Result := False;
-    AInput := string.Empty;
-    ALineStart := 0;
-
-    // Skip trailing line endings
-    LineEnd := Length(OutputText);
-    while (LineEnd > 0) and (OutputText[LineEnd] in [#10, #13]) do
-      Dec(LineEnd);
-
-    // Search terminal lines backwards
-    while LineEnd > 0 do
-    begin
-      LineStart := LineEnd;
-      while (LineStart > 1) and not (OutputText[LineStart - 1] in [#10, #13]) do
-        Dec(LineStart);
-
-      LineText := Copy(OutputText, LineStart, LineEnd - LineStart + 1);
-      SuffixPos := Pos(PromptSuffix, LineText);
-
-      if SuffixPos > 0 then
-      begin
-        AInput := Copy(LineText, SuffixPos + Length(PromptSuffix), MaxInt);
-        if AInput <> string.Empty then
-        begin
-          ALineStart := LineStart;
-          Exit(True);
-        end;
-      end;
-
-      // Move to the previous line
-      LineEnd := LineStart - 1;
-      while (LineEnd > 0) and (OutputText[LineEnd] in [#10, #13]) do
-        Dec(LineEnd);
-    end;
-
-    // Fall back to the current prompt when no stable suffix exists
-    SearchText := GetPromptText;
-    if SearchText = string.Empty then
-      Exit;
-
-    SearchFrom := 1;
-    while SearchFrom <= Length(OutputText) do
-    begin
-      P := Pos(SearchText, Copy(OutputText, SearchFrom, MaxInt));
-      if P = 0 then
-        Break;
-
-      SuffixPos := SearchFrom + P - 1;
-      SearchFrom := SuffixPos + 1;
-    end;
-
-    if SuffixPos > 0 then
-    begin
-      ALineStart := SuffixPos;
-      AInput := Copy(OutputText, SuffixPos + Length(SearchText), MaxInt);
-      P := Pos(LineEnding, AInput);
-      if P > 0 then
-        SetLength(AInput, P - 1);
-      Result := AInput <> string.Empty;
-    end;
-  end;
-
+  Chat: TAgentChat;
+  Mark: TTerminalOutputMark;
+  I: integer;
 begin
   Result := False;
 
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
     Exit;
 
-  OutputText := FAgent.ActiveChat.TerminalOutput;
-  if OutputText = string.Empty then
+  Chat := FAgent.ActiveChat;
+
+  // Get the last operation boundary
+  if not Chat.GetLastOutputMark(Mark) then
     Exit;
 
-  // Get the stable part of the prompt after its last placeholder
-  LastVarPos := LastDelimiter('}', FPrompt);
-  if LastVarPos > 0 then
-    PromptSuffix := Copy(FPrompt, LastVarPos + 1, MaxInt)
-  else
-    PromptSuffix := FPrompt;
-
-  if PromptSuffix = string.Empty then
-    PromptSuffix := GetPromptText;
-
-  // Find the actual last input in terminal output
-  if not FindLastInput(LastInput, LineStart) then
+  if (Mark.OutputStart < 0) or (Mark.OutputStart > Length(Chat.TerminalOutput)) then
     Exit;
 
-  Kind := ClassifyLine(LastInput, Payload);
-  if Kind = tikEmpty then
+  if (Mark.InputKind < Ord(Low(TTermInputKind))) or
+    (Mark.InputKind > Ord(High(TTermInputKind))) then
     Exit;
 
-  // Remove the conversation exchange when the last input was sent to the agent
-  if (Kind = tikAgent) and not FAgent.RemoveLastExchange then
+  // Remove the last agent exchange, including tool messages
+  if (Mark.InputKind = Ord(tikAgent)) and not FAgent.RemoveLastExchange then
     Exit;
 
-  // Remove the last shell operation when the last input was an external command
-  if (Kind = tikCommand) and (FShellLog.Count > 0) then
+  // Remove shell log entries created by this operation
+  for I := 1 to Mark.ShellLogCount do
   begin
+    if FShellLog.Count = 0 then
+      Break;
     FShellLog.Delete(FShellLog.Count - 1);
-    FAgent.ActiveChat.ShellLog.Assign(FShellLog);
   end;
 
-  // Remove the input and all following output
-  Delete(OutputText, LineStart, MaxInt);
-  FAgent.ActiveChat.TerminalOutput := OutputText;
+  Chat.ShellLog.Assign(FShellLog);
 
-  // Remove the terminal history entry only when it matches the deleted input
-  // Keep agent input in terminal history so it can be selected again
-  if (Kind <> tikAgent) and (FHistory.Count > 0) and (FHistory[FHistory.Count - 1] = LastInput) then
-  begin
-    FHistory.Delete(FHistory.Count - 1);
-    FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
-  end;
+  // Remove terminal output starting from the saved position
+  Chat.TerminalOutput := Copy(Chat.TerminalOutput, 1, Mark.OutputStart);
+
+  // Remove the completed operation mark
+  Chat.DeleteLastOutputMark;
 
   Result := True;
 end;
@@ -3457,6 +3385,7 @@ var
   CancelledShown: boolean;
   WaitShown: boolean;
   StartTick: QWord;
+  Mark: TTerminalOutputMark;
   {$IFDEF WINDOWS}
   InHandle: THandle;
   InMode: DWORD = 0;
@@ -3508,6 +3437,22 @@ begin
       DoRoute(Line, Payload, Kind, Allow);
       if not Allow then
         Continue;
+
+      FCurrentOutputMark := False;
+
+      // Store the accepted input in the active chat output stack
+      if Assigned(FAgent) and Assigned(FAgent.ActiveChat) and (FPendingOutputStart >= 0) and (Kind <> tikEmpty) then
+      begin
+        Mark := Default(TTerminalOutputMark);
+        Mark.OutputStart := FPendingOutputStart;
+        Mark.InputKind := Ord(Kind);
+        Mark.ShellLogCount := 0;
+        FAgent.ActiveChat.AddOutputMark(Mark);
+        FCurrentOutputMark := True;
+      end;
+
+      FPendingOutputStart := -1;
+
       case Kind of
         tikBuiltin:
         begin
@@ -3629,6 +3574,8 @@ begin
         else
           ;
       end;
+
+      FCurrentOutputMark := False;
     end;
   finally
     {$IFDEF WINDOWS}
@@ -4926,9 +4873,15 @@ begin
 
   Result := Line;
   AddToHistory(Result);
+  FPendingOutputStart := -1;
 
   if not IsChatControlCommand(Result) then
+  begin
+    if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+      FPendingOutputStart := Length(FAgent.ActiveChat.TerminalOutput);
+
     AppendChatOutput(string(PromptText) + string(Line) + LineEnding);
+  end;
 end;
 
 {$ELSE}
@@ -4976,9 +4929,15 @@ begin
   ReadLn(S);
   Result := S;
   AddToHistory(S);
+  FPendingOutputStart := -1;
 
   if not IsChatControlCommand(Result) then
+  begin
+    if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+      FPendingOutputStart := Length(FAgent.ActiveChat.TerminalOutput);
+
     AppendChatOutput(PromptText + S + LineEnding);
+  end;
 end;
 
 {$ENDIF}

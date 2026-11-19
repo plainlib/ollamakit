@@ -35,6 +35,15 @@ type
     );
   TAgentFeatures = set of TAgentFeature;
 
+  // Stores the boundaries of one terminal operation
+  TTerminalOutputMark = record
+    OutputStart: SizeInt;
+    InputKind: integer;
+    ShellLogCount: integer;
+  end;
+
+  TTerminalOutputMarks = array of TTerminalOutputMark;
+
   // Operation kind passed to OnRoute before each action
   TAgentOperation = (aoChat, aoToolCall);
 
@@ -67,6 +76,7 @@ type
     FTerminalOutput: string;
     FContextUsed: integer;
     FContextTotal: integer;
+    FOutputMarks: TTerminalOutputMarks;
   public
     constructor Create(AID: integer; const AName: string);
     destructor Destroy; override;
@@ -78,6 +88,12 @@ type
     property TerminalHistory: TStringList read FTerminalHistory;
     property ShellLog: TStringList read FShellLog;
     property TerminalOutput: string read FTerminalOutput write FTerminalOutput;
+    procedure AddOutputMark(const AMark: TTerminalOutputMark);
+    procedure IncrementLastOutputMarkShellLogCount;
+    function GetLastOutputMark(out AMark: TTerminalOutputMark): boolean;
+    procedure DeleteLastOutputMark;
+
+    property OutputMarks: TTerminalOutputMarks read FOutputMarks;
     property ContextUsed: integer read FContextUsed write FContextUsed;
     property ContextTotal: integer read FContextTotal write FContextTotal;
   end;
@@ -2670,13 +2686,52 @@ begin
   FTerminalOutput := string.Empty;
   FContextUsed := 0;
   FContextTotal := 0;
+  FOutputMarks := nil;
 end;
 
 destructor TAgentChat.Destroy;
 begin
   FTerminalHistory.Free;
   FShellLog.Free;
+  FOutputMarks := nil;
   inherited Destroy;
+end;
+
+procedure TAgentChat.AddOutputMark(const AMark: TTerminalOutputMark);
+var
+  Index: integer;
+begin
+  Index := Length(FOutputMarks);
+  SetLength(FOutputMarks, Index + 1);
+  FOutputMarks[Index] := AMark;
+end;
+
+procedure TAgentChat.IncrementLastOutputMarkShellLogCount;
+var
+  Index: integer;
+begin
+  Index := Length(FOutputMarks) - 1;
+  if Index >= 0 then
+    Inc(FOutputMarks[Index].ShellLogCount);
+end;
+
+function TAgentChat.GetLastOutputMark(out AMark: TTerminalOutputMark): boolean;
+var
+  Index: integer;
+begin
+  Index := Length(FOutputMarks) - 1;
+  Result := Index >= 0;
+  if Result then
+    AMark := FOutputMarks[Index];
+end;
+
+procedure TAgentChat.DeleteLastOutputMark;
+var
+  Count: integer;
+begin
+  Count := Length(FOutputMarks);
+  if Count > 0 then
+    SetLength(FOutputMarks, Count - 1);
 end;
 
 { TCustomOllamaAgent }
@@ -2987,7 +3042,9 @@ end;
 function TCustomOllamaAgent.SaveChatsToFile(const AFileName: string): boolean;
 var
   Root, ChatObj: TJSONObject;
-  ChatsArray, HistoryArray, ShellArray: TJSONArray;
+  ChatsArray, HistoryArray, ShellArray, OutputMarksArray: TJSONArray;
+  MarkObj: TJSONObject;
+  Mark: TTerminalOutputMark;
   Chat: TAgentChat;
   I, J: integer;
   Data: TStringList;
@@ -3029,6 +3086,19 @@ begin
         ShellArray.Add(Chat.ShellLog[J]);
       ChatObj.Add('shell_log', ShellArray);
 
+      // Save terminal output operation boundaries
+      OutputMarksArray := TJSONArray.Create;
+      for J := 0 to Length(Chat.OutputMarks) - 1 do
+      begin
+        Mark := Chat.OutputMarks[J];
+        MarkObj := TJSONObject.Create;
+        MarkObj.Add('output_start', int64(Mark.OutputStart));
+        MarkObj.Add('input_kind', Mark.InputKind);
+        MarkObj.Add('shell_log_count', Mark.ShellLogCount);
+        OutputMarksArray.Add(MarkObj);
+      end;
+      ChatObj.Add('output_marks', OutputMarksArray);
+
       ChatsArray.Add(ChatObj);
     end;
 
@@ -3050,13 +3120,15 @@ function TCustomOllamaAgent.LoadChatsFromFile(const AFileName: string): boolean;
 var
   Data: TJSONData;
   Root, ChatObj: TJSONObject;
-  ChatsArray, HistoryArray, ShellArray: TJSONArray;
+  ChatsArray, HistoryArray, ShellArray, OutputMarksArray: TJSONArray;
   Item: TJSONData;
   NewChats: TList;
   Chat: TAgentChat;
   FileData: TStringList;
   I, J, ChatID, MaxID, ChatIndex: integer;
   LaunchDirectory, ChatDirectory, ChatName: string;
+  MarkObj: TJSONObject;
+  Mark: TTerminalOutputMark;
 begin
   Result := False;
   if not FDone or (Trim(AFileName) = string.Empty) then
@@ -3111,6 +3183,43 @@ begin
           ShellArray := TJSONArray(Item);
           for J := 0 to ShellArray.Count - 1 do
             Chat.ShellLog.Add(ShellArray.Items[J].AsString);
+        end;
+
+        // Restore terminal output operation boundaries
+        Item := ChatObj.Find('output_marks');
+        if Item is TJSONArray then
+        begin
+          OutputMarksArray := TJSONArray(Item);
+          for J := 0 to OutputMarksArray.Count - 1 do
+          begin
+            if not (OutputMarksArray.Items[J] is TJSONObject) then
+              Continue;
+
+            MarkObj := TJSONObject(OutputMarksArray.Items[J]);
+            Mark.OutputStart := -1;
+            Mark.InputKind := -1;
+            Mark.ShellLogCount := 0;
+
+            Item := MarkObj.Find('output_start');
+            if Item = nil then
+              Continue;
+            Mark.OutputStart := SizeInt(Item.AsInt64);
+
+            Item := MarkObj.Find('input_kind');
+            if Item = nil then
+              Continue;
+            Mark.InputKind := Item.AsInteger;
+
+            Item := MarkObj.Find('shell_log_count');
+            if Item <> nil then
+              Mark.ShellLogCount := Item.AsInteger;
+
+            if (Mark.OutputStart < 0) or (Mark.OutputStart > Length(Chat.TerminalOutput)) or
+              (Mark.InputKind < 0) or (Mark.InputKind > 3) or (Mark.ShellLogCount < 0) then
+              Continue;
+
+            Chat.AddOutputMark(Mark);
+          end;
         end;
 
         NewChats.Add(Chat);
@@ -3300,6 +3409,9 @@ var
   HistoryArray, ShellArray: TJSONArray;
   Data: TStringList;
   I: integer;
+  OutputMarksArray: TJSONArray;
+  MarkObj: TJSONObject;
+  Mark: TTerminalOutputMark;
 begin
   Result := False;
   if not Assigned(AChat) or (Trim(AFileName) = string.Empty) then
@@ -3325,6 +3437,19 @@ begin
     for I := 0 to AChat.ShellLog.Count - 1 do
       ShellArray.Add(AChat.ShellLog[I]);
     ChatObj.Add('shell_log', ShellArray);
+
+    // Save terminal output operation boundaries
+    OutputMarksArray := TJSONArray.Create;
+    for I := 0 to Length(AChat.OutputMarks) - 1 do
+    begin
+      Mark := AChat.OutputMarks[I];
+      MarkObj := TJSONObject.Create;
+      MarkObj.Add('output_start', int64(Mark.OutputStart));
+      MarkObj.Add('input_kind', Mark.InputKind);
+      MarkObj.Add('shell_log_count', Mark.ShellLogCount);
+      OutputMarksArray.Add(MarkObj);
+    end;
+    ChatObj.Add('output_marks', OutputMarksArray);
 
     Root.Add('version', 1);
     Root.Add('chat', ChatObj);
@@ -3357,6 +3482,9 @@ var
   HistoryArray, ShellArray: TJSONArray;
   FileData: TStringList;
   I, ChatID: integer;
+  OutputMarksArray: TJSONArray;
+  MarkObj: TJSONObject;
+  Mark: TTerminalOutputMark;
 begin
   Result := nil;
   if not FDone or (Trim(AFileName) = string.Empty) then
@@ -3408,6 +3536,45 @@ begin
         ShellArray := TJSONArray(Item);
         for I := 0 to ShellArray.Count - 1 do
           Result.ShellLog.Add(ShellArray.Items[I].AsString);
+      end;
+
+            // Restore terminal output operation boundaries
+      Item := ChatObj.Find('output_marks');
+      if Item is TJSONArray then
+      begin
+        OutputMarksArray := TJSONArray(Item);
+        for I := 0 to OutputMarksArray.Count - 1 do
+        begin
+          if not (OutputMarksArray.Items[I] is TJSONObject) then
+            Continue;
+
+          MarkObj := TJSONObject(OutputMarksArray.Items[I]);
+          Mark.OutputStart := -1;
+          Mark.InputKind := -1;
+          Mark.ShellLogCount := 0;
+
+          Item := MarkObj.Find('output_start');
+          if Item = nil then
+            Continue;
+          Mark.OutputStart := SizeInt(Item.AsInt64);
+
+          Item := MarkObj.Find('input_kind');
+          if Item = nil then
+            Continue;
+          Mark.InputKind := Item.AsInteger;
+
+          Item := MarkObj.Find('shell_log_count');
+          if Item <> nil then
+            Mark.ShellLogCount := Item.AsInteger;
+
+          if (Mark.OutputStart < 0) or
+            (Mark.OutputStart > Length(Result.TerminalOutput)) or
+            (Mark.InputKind < 0) or (Mark.InputKind > 3) or
+            (Mark.ShellLogCount < 0) then
+            Continue;
+
+          Result.AddOutputMark(Mark);
+        end;
       end;
 
       FChats.Add(Result);
