@@ -4922,10 +4922,14 @@ begin
     if CtrlPressed and ShiftPressed and
       (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
     begin
+      // Preserve the current input in the active chat before switching
+      if Line <> string.Empty then
+        AddToHistory(Line);
+
       if Rec.Event.KeyEvent.wVirtualKeyCode = VK_LEFT then
-        HasMore := MoveActiveChat(-1)
+        HasMore := SwitchActiveChat(-1)
       else
-        HasMore := MoveActiveChat(1);
+        HasMore := SwitchActiveChat(1);
 
       if HasMore then
       begin
@@ -4951,6 +4955,10 @@ begin
     if CtrlPressed and not ShiftPressed and
       (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
     begin
+      // Save the current input before changing the active chat
+      if Line <> string.Empty then
+        AddToHistory(Line);
+
       if Rec.Event.KeyEvent.wVirtualKeyCode = VK_LEFT then
         HasMore := SwitchActiveChat(-1)
       else
@@ -5292,6 +5300,10 @@ begin
       VK_N:
         if CtrlPressed then
         begin
+          // Preserve the current input before creating a new chat
+          if Line <> string.Empty then
+            AddToHistory(Line);
+
           HandleBuiltin('new');
           ResetInput;
           Continue;
