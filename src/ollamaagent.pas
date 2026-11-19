@@ -4238,8 +4238,11 @@ begin
         'Replace an inclusive 1-based line range with the supplied text. Use the same start_line and end_line to replace one line.',
         '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"},"content":{"type":"string","description":"Replacement text, may be empty to delete the range"}},"required":["path","start_line","end_line","content"]}');
       AddTool(Arr, 'apply_patch',
-        'Apply a unified diff to one existing text file. Supports multiple hunks. The patch must include @@ hunk headers and exact context lines.',
-        '{"type":"object","properties":{"path":{"type":"string"},"patch":{"type":"string","description":"Unified diff for the specified file, without file headers"}},"required":["path","patch"]}');
+        'Apply a patch to one existing text file. Supports unified diff and Codex patch formats. ' +
+        'Codex format uses *** Begin Patch, *** Update File: path and *** End Patch markers. ' +
+        'For Codex patches, the target path is extracted from the *** Update File header, so path is optional. ' +
+        'For unified diffs, path is required. Supports multiple hunks and requires exact context lines.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative file path. Required for unified diff. For Codex patches, extracted from the *** Update File header if omitted."},"patch":{"type":"string","description":"Unified diff or Codex patch. Codex format must include *** Begin Patch, *** Update File: path and *** End Patch."}},"required":["patch"]}');
       AddTool(Arr, 'delete_file', 'Delete a file',
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
       AddTool(Arr, 'move_file', 'Move or rename a file',
@@ -5226,14 +5229,563 @@ function TCustomOllamaAgent.DoApplyPatch(AArgs: TJSONObject): string;
 const
   MAX_WRITE_BYTES = 16 * 1024 * 1024;
 var
-  RelPath, FullPath, Patch, FileContent: string;
-  Lines, PatchLines, NewLines: TStringList;
-  OldBlock, NewBlock: TStringList;
-  Regex: TRegExpr;
-  I, J, OldStart, OldCount, NewStart, NewCount: integer;
-  OldIndex, Offset, HunkCount: integer;
-  PatchLine: string;
-  Valid: boolean;
+  RelPath: string = '';
+  FullPath: string = '';
+  Patch: string = '';
+  FileContent: string = '';
+  PatchPath: string = '';
+  ExpectedPath: string = '';
+  PatchLine: string = '';
+  ErrorMsg: string = '';
+  TmpText: string = '';
+  OrigLineBreak: string = #10;
+  Lines: TStringList = nil;
+  PatchLines: TStringList = nil;
+  NewLines: TStringList = nil;
+  OldBlock: TStringList = nil;
+  NewBlock: TStringList = nil;
+  Regex: TRegExpr = nil;
+  I: integer = 0;
+  HunkCount: integer = 0;
+  IsCodexPatch: boolean = False;
+  NoNewlineAtEOF: boolean = False;
+  ResultNoNewlineAtEOF: boolean = False;
+
+  function DetectLineBreak(const S: string): string;
+  begin
+    if Pos(#13#10, S) > 0 then
+      Result := #13#10
+    else if Pos(#13, S) > 0 then
+      Result := #13
+    else
+      Result := #10;
+  end;
+
+  function NormalizeLineBreaks(const S, TargetBreak: string): string;
+  begin
+    Result := StringReplace(S, #13#10, #10, [rfReplaceAll]);
+    Result := StringReplace(Result, #13, #10, [rfReplaceAll]);
+    if TargetBreak = #13#10 then
+      Result := StringReplace(Result, #10, #13#10, [rfReplaceAll])
+    else if TargetBreak = #13 then
+      Result := StringReplace(Result, #10, #13, [rfReplaceAll]);
+  end;
+
+  // Removes one trailing line break if present.
+  function StripTrailingNewline(const S: string): string;
+  begin
+    Result := S;
+    if (Length(Result) >= 2) and (Copy(Result, Length(Result) - 1, 2) = #13#10) then
+      Delete(Result, Length(Result) - 1, 2)
+    else if (Length(Result) >= 1) and (Result[Length(Result)] in [#10, #13]) then
+      Delete(Result, Length(Result), 1);
+  end;
+
+  // Returns True when S ends with a line break.
+  function HasTrailingNewline(const S: string): boolean;
+  begin
+    Result := (Length(S) > 0) and (S[Length(S)] in [#10, #13]);
+  end;
+
+  // Escapes an arbitrary string as a JSON string literal.
+  function JSONQuote(const S: string): string;
+  var
+    Tmp: TJSONString = nil;
+  begin
+    Tmp := TJSONString.Create(S);
+    try
+      Result := Tmp.AsJSON;
+    finally
+      Tmp.Free;
+    end;
+  end;
+
+  // Extracts the target path from a Codex patch.
+  function ExtractCodexPatchPath(const APatch: string; out APath: string; out AIsCodexPatch: boolean): boolean;
+  var
+    TempLines: TStringList = nil;
+    LI: integer = 0;
+    LineText: string = '';
+    HasUpdate: boolean = False;
+  begin
+    Result := False;
+    APath := string.Empty;
+    AIsCodexPatch := False;
+
+    TempLines := TStringList.Create;
+    try
+      TempLines.Text := NormalizeLineBreaks(APatch, #10);
+
+      for LI := 0 to TempLines.Count - 1 do
+      begin
+        LineText := Trim(TempLines[LI]);
+        if LineText = '' then
+          Continue;
+
+        AIsCodexPatch := LineText = '*** Begin Patch';
+        Break;
+      end;
+
+      if not AIsCodexPatch then
+        Exit(True);
+
+      for LI := 0 to TempLines.Count - 1 do
+      begin
+        LineText := TempLines[LI];
+
+        if Copy(LineText, 1, Length('*** Update File: ')) = '*** Update File: ' then
+        begin
+          if HasUpdate then
+            Exit;
+
+          APath := Trim(Copy(LineText, Length('*** Update File: ') + 1, MaxInt));
+          HasUpdate := True;
+        end;
+      end;
+
+      Result := HasUpdate and (APath <> string.Empty);
+    finally
+      TempLines.Free;
+    end;
+  end;
+
+  function ApplyCodexPatch(out AError: string): boolean;
+  var
+    LI: integer = 0;
+    K: integer = 0;
+    SearchFrom: integer = 0;
+    FoundIndex: integer = 0;
+    AnchorIndex: integer = 0;
+    Anchor: string = '';
+    LineText: string = '';
+    HeaderPath: string = '';
+    HasBegin: boolean = False;
+    HasEnd: boolean = False;
+    HasUpdate: boolean = False;
+    InHunk: boolean = False;
+
+    function ApplyHunk: boolean;
+    var
+      LI: integer = 0;
+      LJ: integer = 0;
+      SearchIndex: integer = 0;
+      MatchFound: boolean = False;
+    begin
+      Result := True;
+      if not InHunk then
+        Exit;
+
+      SearchIndex := SearchFrom;
+
+      // Resolve the optional context anchor from the @@ header.
+      if Anchor <> '' then
+      begin
+        AnchorIndex := -1;
+        for LI := SearchFrom to NewLines.Count - 1 do
+        begin
+          if Pos(Anchor, NewLines[LI]) > 0 then
+          begin
+            AnchorIndex := LI;
+            Break;
+          end;
+        end;
+
+        if AnchorIndex < 0 then
+        begin
+          AError := 'patch context anchor not found: ' + Anchor;
+          Exit(False);
+        end;
+
+        SearchIndex := AnchorIndex + 1;
+      end;
+
+      FoundIndex := -1;
+
+      if OldBlock.Count = 0 then
+      begin
+        if SearchIndex <= NewLines.Count then
+          FoundIndex := SearchIndex;
+      end
+      else
+      begin
+        for LI := SearchIndex to NewLines.Count - OldBlock.Count do
+        begin
+          MatchFound := True;
+          for LJ := 0 to OldBlock.Count - 1 do
+          begin
+            if NewLines[LI + LJ] <> OldBlock[LJ] then
+            begin
+              MatchFound := False;
+              Break;
+            end;
+          end;
+          if MatchFound then
+          begin
+            FoundIndex := LI;
+            Break;
+          end;
+        end;
+      end;
+
+      if FoundIndex < 0 then
+      begin
+        AError := 'patch context does not match file';
+        Exit(False);
+      end;
+
+      for LI := OldBlock.Count - 1 downto 0 do
+        NewLines.Delete(FoundIndex + LI);
+
+      for LI := 0 to NewBlock.Count - 1 do
+        NewLines.Insert(FoundIndex + LI, NewBlock[LI]);
+
+      SearchFrom := FoundIndex + NewBlock.Count;
+      Inc(HunkCount);
+      OldBlock.Clear;
+      NewBlock.Clear;
+      InHunk := False;
+    end;
+
+  begin
+    Result := False;
+    AError := '';
+    LI := 0;
+
+    while LI < PatchLines.Count do
+    begin
+      LineText := PatchLines[LI];
+
+      // Skip separator blanks only outside a hunk.
+      if (not InHunk) and (Trim(LineText) = '') then
+      begin
+        Inc(LI);
+        Continue;
+      end;
+
+      if Trim(LineText) = '*** Begin Patch' then
+      begin
+        if HasBegin then
+        begin
+          AError := 'duplicate Begin Patch marker';
+          Exit;
+        end;
+        HasBegin := True;
+        Inc(LI);
+        Continue;
+      end;
+
+      if not HasBegin then
+      begin
+        AError := 'missing Begin Patch marker';
+        Exit;
+      end;
+
+      if Copy(LineText, 1, Length('*** Add File: ')) = '*** Add File: ' then
+      begin
+        AError := 'Add File is not supported';
+        Exit;
+      end;
+
+      if Copy(LineText, 1, Length('*** Delete File: ')) = '*** Delete File: ' then
+      begin
+        AError := 'Delete File is not supported';
+        Exit;
+      end;
+
+      if Copy(LineText, 1, Length('*** Move to: ')) = '*** Move to: ' then
+      begin
+        AError := 'Move to is not supported';
+        Exit;
+      end;
+
+      if Copy(LineText, 1, Length('*** Update File: ')) = '*** Update File: ' then
+      begin
+        if HasUpdate then
+        begin
+          AError := 'only one Update File section is supported';
+          Exit;
+        end;
+
+        HeaderPath := Trim(Copy(LineText, Length('*** Update File: ') + 1, MaxInt));
+        PatchPath := StringReplace(NormalizeToolPath(HeaderPath), '\', '/', [rfReplaceAll]);
+        ExpectedPath := StringReplace(NormalizeToolPath(RelPath), '\', '/', [rfReplaceAll]);
+
+        if not SameText(PatchPath, ExpectedPath) then
+        begin
+          AError := 'Update File path does not match the path argument';
+          Exit;
+        end;
+
+        HasUpdate := True;
+        Inc(LI);
+        Continue;
+      end;
+
+      if Trim(LineText) = '*** End Patch' then
+      begin
+        if not ApplyHunk then
+          Exit;
+        HasEnd := True;
+        Inc(LI);
+        Break;
+      end;
+
+      if Trim(LineText) = '*** End of File' then
+      begin
+        if not ApplyHunk then
+          Exit;
+
+        if SearchFrom <> NewLines.Count then
+        begin
+          AError := 'End of File marker does not match file position';
+          Exit;
+        end;
+
+        Inc(LI);
+        Continue;
+      end;
+
+      if Copy(LineText, 1, 2) = '@@' then
+      begin
+        if not ApplyHunk then
+          Exit;
+        Anchor := Trim(Copy(LineText, 3, MaxInt));
+        InHunk := True;
+        Inc(LI);
+        Continue;
+      end;
+
+      if not InHunk then
+      begin
+        AError := 'unexpected line outside a patch hunk';
+        Exit;
+      end;
+
+      if Length(LineText) = 0 then
+      begin
+        AError := 'invalid patch line prefix';
+        Exit;
+      end;
+
+      case LineText[1] of
+        ' ':
+        begin
+          OldBlock.Add(Copy(LineText, 2, MaxInt));
+          NewBlock.Add(Copy(LineText, 2, MaxInt));
+        end;
+        '-':
+          OldBlock.Add(Copy(LineText, 2, MaxInt));
+        '+':
+          NewBlock.Add(Copy(LineText, 2, MaxInt));
+        else
+        begin
+          AError := 'invalid patch line prefix';
+          Exit;
+        end;
+      end;
+
+      Inc(LI);
+    end;
+
+    if not HasEnd then
+    begin
+      AError := 'missing End Patch marker';
+      Exit;
+    end;
+
+    if not HasUpdate then
+    begin
+      AError := 'missing Update File section';
+      Exit;
+    end;
+
+    // Reject unexpected trailing content after End Patch.
+    for K := LI to PatchLines.Count - 1 do
+    begin
+      if Trim(PatchLines[K]) <> '' then
+      begin
+        AError := 'unexpected content after End Patch';
+        Exit;
+      end;
+    end;
+
+    if HunkCount = 0 then
+    begin
+      AError := 'no patch hunks found';
+      Exit;
+    end;
+
+    Result := True;
+  end;
+
+  function ApplyUnifiedDiff(out AError: string): boolean;
+  var
+    LI: integer = 0;
+    LJ: integer = 0;
+    LocalOffset: integer = 0;
+    LocalOldStart: integer = 0;
+    LocalOldCount: integer = 0;
+    LocalNewCount: integer = 0;
+    LocalOldIndex: integer = 0;
+    PrevPrefix: char = ' ';
+    HunkNoNewline: boolean = False;
+  begin
+    Result := False;
+    AError := '';
+    LocalOffset := 0;
+    HunkCount := 0;
+
+    Regex.Expression := '^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@(.*)$';
+    LI := 0;
+
+    while LI < PatchLines.Count do
+    begin
+      PatchLine := PatchLines[LI];
+
+      // Skip file headers and git extended headers.
+      if (Copy(PatchLine, 1, 4) = '--- ') or (Copy(PatchLine, 1, 4) = '+++ ') or (Copy(PatchLine, 1, 11) = 'diff --git ') or
+        (Copy(PatchLine, 1, 6) = 'index ') or (Copy(PatchLine, 1, 15) = 'new file mode ') or
+        (Copy(PatchLine, 1, 19) = 'deleted file mode ') or (Copy(PatchLine, 1, 16) = 'similarity index ') or
+        (Copy(PatchLine, 1, 9) = 'old mode ') or (Copy(PatchLine, 1, 9) = 'new mode ') or
+        (Copy(PatchLine, 1, 10) = 'rename from ') or (Copy(PatchLine, 1, 8) = 'rename to ') or
+        (Copy(PatchLine, 1, 8) = 'copy from ') or (Copy(PatchLine, 1, 6) = 'copy to ') then
+      begin
+        Inc(LI);
+        Continue;
+      end;
+
+      if not Regex.Exec(PatchLine) then
+      begin
+        if Trim(PatchLine) = '' then
+        begin
+          Inc(LI);
+          Continue;
+        end;
+        AError := 'invalid unified diff header at line ' + IntToStr(LI + 1);
+        Exit;
+      end;
+
+      LocalOldStart := StrToIntDef(Regex.Match[1], -1);
+      LocalOldCount := StrToIntDef(Regex.Match[3], 1);
+      LocalNewCount := StrToIntDef(Regex.Match[6], 1);
+
+      if (LocalOldStart < 0) or (LocalOldCount < 0) or (LocalNewCount < 0) then
+      begin
+        AError := 'invalid unified diff line numbers';
+        Exit;
+      end;
+
+      Inc(LI);
+      OldBlock.Clear;
+      NewBlock.Clear;
+      PrevPrefix := ' ';
+      HunkNoNewline := False;
+
+      while LI < PatchLines.Count do
+      begin
+        PatchLine := PatchLines[LI];
+
+        if Regex.Exec(PatchLine) then
+          Break;
+
+        if PatchLine = '\ No newline at end of file' then
+        begin
+          // The marker must follow the final line of the hunk.
+          if (LI + 1 < PatchLines.Count) and (Length(PatchLines[LI + 1]) > 0) and
+            (PatchLines[LI + 1][1] in [' ', '+', '-']) then
+          begin
+            AError := 'newline marker must follow the final hunk line';
+            Exit;
+          end;
+
+          if PrevPrefix in ['+', ' '] then
+            HunkNoNewline := True;
+          Inc(LI);
+          Continue;
+        end;
+
+        if (Length(PatchLine) = 0) or not (PatchLine[1] in [' ', '+', '-']) then
+          Break;
+
+        PrevPrefix := PatchLine[1];
+
+        case PatchLine[1] of
+          ' ':
+          begin
+            OldBlock.Add(Copy(PatchLine, 2, MaxInt));
+            NewBlock.Add(Copy(PatchLine, 2, MaxInt));
+          end;
+          '-':
+            OldBlock.Add(Copy(PatchLine, 2, MaxInt));
+          '+':
+            NewBlock.Add(Copy(PatchLine, 2, MaxInt));
+          else
+            ;
+        end;
+
+        Inc(LI);
+      end;
+
+      if (OldBlock.Count <> LocalOldCount) or (NewBlock.Count <> LocalNewCount) then
+      begin
+        AError := 'unified diff hunk line counts do not match header';
+        Exit;
+      end;
+
+      if LocalOldCount = 0 then
+      begin
+        // Insertion: LocalOldStart is the line after which to insert (0 = start).
+        LocalOldIndex := LocalOldStart + LocalOffset;
+        if LocalOldIndex < 0 then
+          LocalOldIndex := 0;
+        if LocalOldIndex > NewLines.Count then
+        begin
+          AError := 'hunk position is outside the file range';
+          Exit;
+        end;
+      end
+      else
+      begin
+        LocalOldIndex := LocalOldStart - 1 + LocalOffset;
+        if (LocalOldIndex < 0) or (LocalOldIndex + LocalOldCount > NewLines.Count) then
+        begin
+          AError := 'hunk position is outside the file range';
+          Exit;
+        end;
+      end;
+
+      for LJ := 0 to OldBlock.Count - 1 do
+      begin
+        if NewLines[LocalOldIndex + LJ] <> OldBlock[LJ] then
+        begin
+          AError := 'patch context does not match file at hunk ' + IntToStr(HunkCount + 1);
+          Exit;
+        end;
+      end;
+
+      for LJ := LocalOldCount - 1 downto 0 do
+        NewLines.Delete(LocalOldIndex + LJ);
+
+      for LJ := 0 to NewBlock.Count - 1 do
+        NewLines.Insert(LocalOldIndex + LJ, NewBlock[LJ]);
+
+      // Update the trailing-newline state only when this hunk reaches EOF.
+      if LocalOldIndex + LocalNewCount = NewLines.Count then
+        ResultNoNewlineAtEOF := HunkNoNewline;
+
+      LocalOffset := LocalOffset + LocalNewCount - LocalOldCount;
+      Inc(HunkCount);
+    end;
+
+    if HunkCount = 0 then
+    begin
+      AError := 'no unified diff hunks found';
+      Exit;
+    end;
+
+    Result := True;
+  end;
+
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -5242,7 +5794,7 @@ begin
   RelPath := AArgs.Get('path', '');
   Patch := AArgs.Get('patch', '');
 
-  if Patch = '' then
+  if Patch = string.Empty then
   begin
     Result := '{"error": "patch is required"}';
     Exit;
@@ -5252,6 +5804,24 @@ begin
   begin
     Result := '{"error": "patch too large"}';
     Exit;
+  end;
+
+  // Resolve the target path from the patch header when path is omitted.
+  if not ExtractCodexPatchPath(Patch, PatchPath, IsCodexPatch) then
+  begin
+    Result := '{"error": "invalid or missing Update File path"}';
+    Exit;
+  end;
+
+  if RelPath = string.Empty then
+  begin
+    if not IsCodexPatch then
+    begin
+      Result := '{"error": "path is required for unified diff"}';
+      Exit;
+    end;
+
+    RelPath := PatchPath;
   end;
 
   FullPath := SafePath(RelPath);
@@ -5279,6 +5849,9 @@ begin
     Exit;
   end;
 
+  OrigLineBreak := DetectLineBreak(FileContent);
+  NoNewlineAtEOF := not HasTrailingNewline(FileContent);
+
   Lines := TStringList.Create;
   PatchLines := TStringList.Create;
   NewLines := TStringList.Create;
@@ -5286,148 +5859,59 @@ begin
   NewBlock := TStringList.Create;
   Regex := TRegExpr.Create;
   try
-    Lines.Text := FileContent;
-    PatchLines.Text := Patch;
+    TmpText := NormalizeLineBreaks(Patch, #10);
+    PatchLines.Text := TmpText;
+
+    TmpText := NormalizeLineBreaks(FileContent, #10);
+    Lines.Text := TmpText;
+
     NewLines.Assign(Lines);
 
-    // Parse unified diff hunk headers
-    Regex.Expression := '^@@ -([0-9]+)(,([0-9]+))? \+([0-9]+)(,([0-9]+))? @@';
-
-    Offset := 0;
-    HunkCount := 0;
-    I := 0;
-
-    while I < PatchLines.Count do
+    // Detect the patch format by its opening marker.
+    IsCodexPatch := False;
+    for I := 0 to PatchLines.Count - 1 do
     begin
-      PatchLine := PatchLines[I];
-
-      // Skip optional file headers
-      if (Copy(PatchLine, 1, 4) = '--- ') or (Copy(PatchLine, 1, 4) = '+++ ') then
-      begin
-        Inc(I);
+      if Trim(PatchLines[I]) = '' then
         Continue;
-      end;
-
-      if not Regex.Exec(PatchLine) then
-      begin
-        if Trim(PatchLine) = '' then
-        begin
-          Inc(I);
-          Continue;
-        end;
-
-        Result := '{"error": "invalid unified diff header at line ' + IntToStr(I + 1) + '"}';
-        Exit;
-      end;
-
-      OldStart := StrToIntDef(Regex.Match[1], -1);
-      OldCount := StrToIntDef(Regex.Match[3], 1);
-      NewStart := StrToIntDef(Regex.Match[4], -1);
-      NewCount := StrToIntDef(Regex.Match[6], 1);
-
-      if (OldStart < 0) or (NewStart < 0) or (OldCount < 0) or (NewCount < 0) then
-      begin
-        Result := '{"error": "invalid unified diff line numbers"}';
-        Exit;
-      end;
-
-      Inc(I);
-      OldBlock.Clear;
-      NewBlock.Clear;
-
-      // Build the original and replacement blocks
-      while I < PatchLines.Count do
-      begin
-        PatchLine := PatchLines[I];
-
-        if Regex.Exec(PatchLine) then
-          Break;
-
-        if PatchLine = '\ No newline at end of file' then
-        begin
-          Inc(I);
-          Continue;
-        end;
-
-        if (Length(PatchLine) = 0) or not (PatchLine[1] in [' ', '+', '-']) then
-          Break;
-
-        case PatchLine[1] of
-          ' ':
-          begin
-            OldBlock.Add(Copy(PatchLine, 2, MaxInt));
-            NewBlock.Add(Copy(PatchLine, 2, MaxInt));
-          end;
-          '-':
-            OldBlock.Add(Copy(PatchLine, 2, MaxInt));
-          '+':
-            NewBlock.Add(Copy(PatchLine, 2, MaxInt));
-          else
-            ;
-        end;
-
-        Inc(I);
-      end;
-
-      if (OldBlock.Count <> OldCount) or (NewBlock.Count <> NewCount) then
-      begin
-        Result := '{"error": "unified diff hunk line counts do not match header"}';
-        Exit;
-      end;
-
-      // Convert original file coordinates to current result coordinates
-      if OldCount = 0 then
-        OldIndex := OldStart + Offset
-      else
-        OldIndex := OldStart - 1 + Offset;
-
-      if (OldIndex < 0) or (OldIndex > NewLines.Count) or (OldIndex + OldCount > NewLines.Count) then
-      begin
-        Result := '{"error": "hunk position is outside the file range"}';
-        Exit;
-      end;
-
-      // Verify every original line before applying the hunk
-      Valid := True;
-      for J := 0 to OldBlock.Count - 1 do
-      begin
-        if NewLines[OldIndex + J] <> OldBlock[J] then
-        begin
-          Valid := False;
-          Break;
-        end;
-      end;
-
-      if not Valid then
-      begin
-        Result := '{"error": "patch context does not match file at hunk ' + IntToStr(HunkCount + 1) + '"}';
-        Exit;
-      end;
-
-      // Replace the verified block
-      for J := OldCount - 1 downto 0 do
-        NewLines.Delete(OldIndex + J);
-
-      for J := 0 to NewBlock.Count - 1 do
-        NewLines.Insert(OldIndex + J, NewBlock[J]);
-
-      Offset := Offset + NewCount - OldCount;
-      Inc(HunkCount);
+      IsCodexPatch := Trim(PatchLines[I]) = '*** Begin Patch';
+      Break;
     end;
 
-    if HunkCount = 0 then
+    HunkCount := 0;
+    ResultNoNewlineAtEOF := NoNewlineAtEOF;
+
+    if IsCodexPatch then
     begin
-      Result := '{"error": "no unified diff hunks found"}';
-      Exit;
+      if not ApplyCodexPatch(ErrorMsg) then
+      begin
+        Result := '{"error": ' + JSONQuote(ErrorMsg) + '}';
+        Exit;
+      end;
+    end
+    else
+    begin
+      if not ApplyUnifiedDiff(ErrorMsg) then
+      begin
+        Result := '{"error": ' + JSONQuote(ErrorMsg) + '}';
+        Exit;
+      end;
     end;
 
-    if Length(NewLines.Text) > MAX_WRITE_BYTES then
+    TmpText := NewLines.Text;
+
+    if ResultNoNewlineAtEOF then
+      TmpText := StripTrailingNewline(TmpText);
+
+    // Restore the original line break style.
+    TmpText := NormalizeLineBreaks(TmpText, OrigLineBreak);
+
+    if Length(TmpText) > MAX_WRITE_BYTES then
     begin
       Result := '{"error": "resulting file is too large"}';
       Exit;
     end;
 
-    if not WriteTextFileSafe(FullPath, NewLines.Text) then
+    if not WriteTextFileSafe(FullPath, TmpText) then
     begin
       Result := '{"error": "cannot write file"}';
       Exit;
