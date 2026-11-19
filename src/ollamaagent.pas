@@ -1266,7 +1266,7 @@ begin
 end;
 
 // Builds a message JSON without internal service data
-function BuildContextMessageJson(AData: TJSONData): string;
+function BuildContextMessageJson(AData: TJSONData; AIncludeThinking: boolean = False): string;
 var
   MsgObj: TJSONObject;
   CopyObj: TJSONObject;
@@ -1284,19 +1284,20 @@ begin
 
   CopyObj := TJSONObject(MsgObj.Clone);
   try
-    // Remove legacy thinking stored inside assistant messages
-    CopyObj.Delete('thinking');
+    CopyObj.Delete('_current_run');
+    if not AIncludeThinking then
+      CopyObj.Delete('thinking');
     Result := CopyObj.AsJSON;
   finally
     CopyObj.Free;
   end;
 end;
 
-// Builds the message array sent to Ollama
 function BuildRequestMessagesJson(AMessages: TJSONArray): string;
 var
   I: integer;
   MsgJson: string;
+  IncludeThinking: boolean;
   ResultArr: TJSONArray;
 begin
   Result := '[]';
@@ -1307,7 +1308,11 @@ begin
   try
     for I := 0 to AMessages.Count - 1 do
     begin
-      MsgJson := BuildContextMessageJson(AMessages.Items[I]);
+      IncludeThinking := False;
+      if AMessages.Items[I].JSONType = jtObject then
+        IncludeThinking := TJSONObject(AMessages.Items[I]).Get('_current_run', False);
+
+      MsgJson := BuildContextMessageJson(AMessages.Items[I], IncludeThinking);
       if MsgJson <> string.Empty then
         ResultArr.Add(GetJSON(MsgJson));
     end;
@@ -1988,7 +1993,7 @@ var
   Threads: TList;
   SupportsTools: boolean;
   StoredHistory: TJSONArray;
-  ThinkingObj: TJSONObject;
+  IncludeThinking: boolean;
 begin
   Reason := afrError;
   ErrMsg := '';
@@ -2051,8 +2056,13 @@ begin
           try
             Data := GetJSON(FAgent.FHistory);
             if (Data <> nil) and (Data.JSONType = jtArray) then
+            begin
               for I := 0 to TJSONArray(Data).Count - 1 do
-                MessagesArr.Add(TJSONArray(Data).Items[I].Clone);
+              begin
+                MsgObj := TJSONObject(TJSONArray(Data).Items[I].Clone);
+                MessagesArr.Add(MsgObj);
+              end;
+            end;
           except
             ; // Ignore invalid history
           end;
@@ -2117,7 +2127,12 @@ begin
             OldMsgsStr := '';
             for I := 1 to CutPoint - 1 do
             begin
-              MsgStr := BuildContextMessageJson(MessagesArr.Items[I]);
+              IncludeThinking := False;
+              if MessagesArr.Items[I].JSONType = jtObject then
+                IncludeThinking := TJSONObject(MessagesArr.Items[I]).Get('_current_run', False);
+
+              MsgStr := BuildContextMessageJson(MessagesArr.Items[I], IncludeThinking);
+              ;
               if MsgStr = string.Empty then
                 Continue;
 
@@ -2329,19 +2344,13 @@ begin
             if MsgObj.Get('content', '') = '' then
               MsgObj.Strings['content'] := FCurrentContent;
 
-            // Keep thinking separately as an internal history entry
-            MsgObj.Delete('thinking');
-            MessagesArr.Add(MsgObj);
-
+            // Keep thinking with the assistant message for the current tool cycle
             if FCurrentThinking <> string.Empty then
-            begin
-              ThinkingObj := TJSONObject.Create;
-              ThinkingObj.Add('role', 'assistant');
-              ThinkingObj.Add('content', FCurrentThinking);
-              ThinkingObj.Add('_service', True);
-              ThinkingObj.Add('_type', 'thinking');
-              MessagesArr.Add(ThinkingObj);
-            end;
+              MsgObj.Strings['thinking'] := FCurrentThinking;
+
+            // Mark messages created during the current run
+            MsgObj.Add('_current_run', True);
+            MessagesArr.Add(MsgObj);
           end;
 
           ToolCallsArr := nil;
@@ -2595,6 +2604,11 @@ begin
       if (MessagesArr.Count > 0) and (MessagesArr.Items[0].JSONType = jtObject) and
         (TJSONObject(MessagesArr.Items[0]).Get('role', '') = 'system') then
         MessagesArr.Delete(0);
+
+      // Remove internal run markers but keep thinking in chat history
+      for I := 0 to MessagesArr.Count - 1 do
+        if MessagesArr.Items[I].JSONType = jtObject then
+          TJSONObject(MessagesArr.Items[I]).Delete('_current_run');
 
       if FAgent.KeepHistory then
         FAgent.FHistory := MessagesArr.AsJSON
