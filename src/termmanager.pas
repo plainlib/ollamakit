@@ -1580,7 +1580,16 @@ begin
     if AIsStderr then
       FCaptureError := True;
   end;
-  WriteText(AText, AIsStderr);
+
+  // Apply error color to all stderr output
+  if AIsStderr then
+    SetColor(tcErrorBadge);
+  try
+    WriteText(AText, AIsStderr);
+  finally
+    if AIsStderr then
+      SetColor(tcDefault);
+  end;
 end;
 
 procedure TCustomTermManager.DoAgentExecute(const AText: string);
