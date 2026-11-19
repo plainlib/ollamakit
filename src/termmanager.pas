@@ -1768,12 +1768,10 @@ begin
       if Assigned(FAgent.ActiveChat) then
       begin
         FAgent.ActiveChat.TerminalOutput := string.Empty;
-        FAgent.ActiveChat.TerminalHistory.Clear;
         FAgent.ActiveChat.ShellLog.Clear;
       end;
     end;
 
-    FHistory.Clear;
     FShellLog.Clear;
     ClearScreen;
   end
@@ -2477,8 +2475,7 @@ begin
   if (Mark.OutputStart < 0) or (Mark.OutputStart > Length(Chat.TerminalOutput)) then
     Exit;
 
-  if (Mark.InputKind < Ord(Low(TTermInputKind))) or
-    (Mark.InputKind > Ord(High(TTermInputKind))) then
+  if (Mark.InputKind < Ord(Low(TTermInputKind))) or (Mark.InputKind > Ord(High(TTermInputKind))) then
     Exit;
 
   // Remove the last agent exchange, including tool messages
@@ -3480,6 +3477,11 @@ begin
           finally
             FCapturing := False;
             RecordShellOperation(FCaptureCommand, FCaptureOutput, FCaptureError);
+
+            // Leave one empty line between command output and the next prompt
+            if not FLastCharWasNewLine then
+              WriteLine('', False);
+            WriteLine('', False);
           end;
         end;
         tikAgent:
