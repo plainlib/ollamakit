@@ -60,6 +60,7 @@ type
   private
     FID: integer;
     FName: string;
+    FWorkingDirectory: string;
     FHistory: string;
     FTerminalHistory: TStringList;
     FShellLog: TStringList;
@@ -72,6 +73,7 @@ type
 
     property ID: integer read FID;
     property Name: string read FName write FName;
+    property WorkingDirectory: string read FWorkingDirectory write FWorkingDirectory;
     property History: string read FHistory write FHistory;
     property TerminalHistory: TStringList read FTerminalHistory;
     property ShellLog: TStringList read FShellLog;
@@ -2652,6 +2654,7 @@ begin
   inherited Create;
   FID := AID;
   FName := AName;
+  FWorkingDirectory := string.Empty;
   FHistory := string.Empty;
   FTerminalHistory := TStringList.Create;
   FShellLog := TStringList.Create;
@@ -2761,7 +2764,12 @@ procedure TCustomOllamaAgent.SetRootPath(const AValue: string);
 begin
   if FRootPath = AValue then
     Exit;
+
   FRootPath := AValue;
+
+  // Keep the active chat working directory in sync
+  if Assigned(FActiveChat) then
+    FActiveChat.WorkingDirectory := AValue;
 end;
 
 function TCustomOllamaAgent.GetHistory: string;
@@ -2822,6 +2830,7 @@ begin
   end;
 
   Result := TAgentChat.Create(FNextChatID, ChatName);
+  Result.WorkingDirectory := FRootPath;
   FChats.Add(Result);
   FActiveChat := Result;
   FHistory := Result.History;
@@ -2853,6 +2862,13 @@ begin
   FHistory := FActiveChat.History;
   FContextUsed := FActiveChat.ContextUsed;
   FContextTotal := FActiveChat.ContextTotal;
+
+  // Restore the selected chat working directory
+  if FActiveChat.WorkingDirectory <> string.Empty then
+    RootPath := FActiveChat.WorkingDirectory
+  else
+    FActiveChat.WorkingDirectory := FRootPath;
+
   Result := True;
 end;
 
@@ -2920,6 +2936,13 @@ begin
   FHistory := FActiveChat.History;
   FContextUsed := FActiveChat.ContextUsed;
   FContextTotal := FActiveChat.ContextTotal;
+
+  // Restore the selected chat working directory
+  if FActiveChat.WorkingDirectory <> string.Empty then
+    RootPath := FActiveChat.WorkingDirectory
+  else
+    FActiveChat.WorkingDirectory := FRootPath;
+
   Result := True;
 end;
 
@@ -2972,6 +2995,7 @@ begin
       ChatObj := TJSONObject.Create;
       ChatObj.Add('id', Chat.ID);
       ChatObj.Add('name', Chat.Name);
+      ChatObj.Add('working_directory', Chat.WorkingDirectory);
       ChatObj.Add('history', Chat.History);
       ChatObj.Add('context_used', Chat.ContextUsed);
       ChatObj.Add('context_total', Chat.ContextTotal);
@@ -3049,6 +3073,7 @@ begin
           ChatID := I + 1;
 
         Chat := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
+        Chat.WorkingDirectory := ChatObj.Get('working_directory', FRootPath);
         Chat.History := ChatObj.Get('history', string.Empty);
         Chat.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
         Chat.ContextUsed := ChatObj.Get('context_used', 0);
@@ -3103,6 +3128,12 @@ begin
       FHistory := FActiveChat.History;
       FContextUsed := FActiveChat.ContextUsed;
       FContextTotal := FActiveChat.ContextTotal;
+
+      if FActiveChat.WorkingDirectory <> string.Empty then
+        RootPath := FActiveChat.WorkingDirectory
+      else
+        FActiveChat.WorkingDirectory := FRootPath;
+
       Result := True;
     except
       Result := False;
@@ -3132,6 +3163,7 @@ begin
     ChatObj := TJSONObject.Create;
     ChatObj.Add('id', AChat.ID);
     ChatObj.Add('name', AChat.Name);
+    ChatObj.Add('working_directory', AChat.WorkingDirectory);
     ChatObj.Add('history', AChat.History);
     ChatObj.Add('context_used', AChat.ContextUsed);
     ChatObj.Add('context_total', AChat.ContextTotal);
@@ -3209,6 +3241,7 @@ begin
         FNextChatID := ChatID;
 
       Result := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
+      Result.WorkingDirectory := ChatObj.Get('working_directory', FRootPath);
       Result.History := ChatObj.Get('history', string.Empty);
       Result.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
       Result.ContextUsed := ChatObj.Get('context_used', 0);
@@ -3235,6 +3268,10 @@ begin
       FHistory := Result.History;
       FContextUsed := Result.ContextUsed;
       FContextTotal := Result.ContextTotal;
+      if Result.WorkingDirectory <> string.Empty then
+        RootPath := Result.WorkingDirectory
+      else
+        Result.WorkingDirectory := FRootPath;
     except
       FreeAndNil(Result);
     end;

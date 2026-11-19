@@ -2415,6 +2415,12 @@ begin
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
     Exit;
 
+  // Restore the working directory of the active chat
+  if DirectoryExists(FAgent.ActiveChat.WorkingDirectory) then
+    Path := FAgent.ActiveChat.WorkingDirectory
+  else
+    FAgent.ActiveChat.WorkingDirectory := GetEffectivePath;
+
   FHistory.Assign(FAgent.ActiveChat.TerminalHistory);
   RestoreTerminalHistory;
   FShellLog.Assign(FAgent.ActiveChat.ShellLog);

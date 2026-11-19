@@ -449,10 +449,6 @@ begin
       Add('timeout', IntToStr(AAgent.RequestTimeout));
     Add('streaming', BoolToStrValue(AAgent.Streaming));
     Add('tools', FormatFeatures(AAgent.EnabledTools));
-    if AAgent.RootPath = '' then
-      Add('rootpath', '(process cwd)')
-    else
-      Add('rootpath', AAgent.RootPath);
     Add('keephistory', BoolToStrValue(AAgent.KeepHistory));
     Add('log', BoolToStrValue(AAgent.Log));
     Add('logtoolresult', BoolToStrValue(AAgent.LogToolResult));
