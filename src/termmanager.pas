@@ -352,7 +352,7 @@ type
   published
     // Working directory for shell commands and agent file tools, empty uses process cwd
     property Path;
-    // Prompt template, supports {path}, {model}, {context}, {context_kb}, {context_percent} and other usage placeholders
+    // Prompt template, supports {path}, {model}, {chat}, {chatindex}, context and usage placeholders
     property Prompt;
     // Multi-line banner printed once before the first prompt
     property Welcome;
@@ -1464,8 +1464,9 @@ end;
 function TCustomTermManager.GetPromptText: string;
 var
   ModelName, DefaultLabel, CtxUsed, CtxTotal, CtxPercent, Ctx, CtxKb, CtxUsedKb, CtxTotalKb: string;
-  InfoLabel, InfoCtx, ChatName: string;
+  InfoLabel, InfoCtx, ChatName, ChatIndex: string;
   HasContext: boolean;
+  I, ChatPosition, ChatCount: integer;
 begin
   Result := FPrompt;
   DefaultLabel := string(FDefaultModelLabel);
@@ -1525,9 +1526,27 @@ begin
   Result := StringReplace(Result, '{path}', GetEffectivePath, [rfReplaceAll]);
 
   ChatName := string.Empty;
+  ChatIndex := '0/0';
+
   if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+  begin
     ChatName := FAgent.ActiveChat.Name;
+    ChatCount := FAgent.ChatCount;
+    ChatPosition := 0;
+
+    for I := 0 to ChatCount - 1 do
+      if FAgent.Chats[I] = FAgent.ActiveChat then
+      begin
+        ChatPosition := I + 1;
+        Break;
+      end;
+
+    if ChatPosition > 0 then
+      ChatIndex := IntToStr(ChatPosition) + '/' + IntToStr(ChatCount);
+  end;
+
   Result := StringReplace(Result, '{chat}', ChatName, [rfReplaceAll]);
+  Result := StringReplace(Result, '{chatindex}', ChatIndex, [rfReplaceAll]);
 end;
 
 procedure TCustomTermManager.DoRoute(const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean);
@@ -2404,7 +2423,7 @@ function TCustomTermManager.RemoveLastInput: boolean;
 var
   LastInput, Payload, OutputText, PromptSuffix, LineText: string;
   Kind: TTermInputKind;
-  I, P, LineStart, LineEnd, SuffixPos, SearchFrom, LastVarPos: integer;
+  P, LineStart, LineEnd, SuffixPos, SearchFrom, LastVarPos: integer;
 
 // Finds the last submitted input using the stable prompt suffix
   function FindLastInput(out AInput: string; out ALineStart: integer): boolean;
