@@ -4609,7 +4609,7 @@ var
     Result := Length(Line);
   end;
 
-    // Reset the input buffer and redraw the prompt
+  // Reset the input buffer and redraw the prompt
   procedure ResetInput;
   begin
     Line := string.Empty;
@@ -4627,6 +4627,18 @@ var
       PromptCol := ScreenInfo.dwCursorPosition.X;
     LastRedrawRows := 1;
   end;
+
+  {$IFDEF WINDOWS}
+  procedure ForceConsoleRedraw;
+  var
+    ConsoleWindow: HWND;
+  begin
+    ConsoleWindow := GetConsoleWindow;
+    if ConsoleWindow <> 0 then
+      RedrawWindow(ConsoleWindow, nil, 0,
+        RDW_INVALIDATE or RDW_ERASE or RDW_UPDATENOW);
+  end;
+ {$ENDIF}
 
 begin
   Result := '';
@@ -4789,6 +4801,7 @@ begin
           begin
             // Move below all visual rows occupied by the input
             ConGotoXY(1, PromptRow + LastRedrawRows);
+            ForceConsoleRedraw;
             FLastCharWasNewLine := True;
             Break;
           end;
