@@ -1879,7 +1879,7 @@ begin
     Item('Ctrl+Up/Down', 'navigate command history');
     Item('Ctrl+Home/End', 'select first/last history entry');
     Item('Ctrl+Delete', 'delete the current history entry');
-    Item('Ctrl+A', 'select all input text');
+    Item('Ctrl+A', 'select input or copy chat when empty');
     Item('Ctrl+C', 'copy selection or cancel current input');
     Item('Ctrl+V', 'paste from clipboard');
     Item('Shift+Left/Right', 'select text');
@@ -4057,20 +4057,16 @@ var
     SelEnd := 0;
   end;
 
-  // Copies the selected byte range to the Windows clipboard as CF_UNICODETEXT
-  procedure CopySelectionToClipboard;
+  // Copies UTF-8 text to the Windows clipboard as CF_UNICODETEXT
+  procedure CopyTextToClipboard(AText: RawByteString);
   var
-    SelText: RawByteString;
     SelWide: UnicodeString;
     hData: THandle;
     P: Pointer;
     Size, SelLen: SizeInt;
   begin
-    if not HasSelection then
-      Exit;
-    SelText := Copy(Line, SelStart + 1, SelEnd - SelStart);
-    SetCodePage(SelText, CP_UTF8, False);
-    SelWide := UTF8Decode(SelText);
+    SetCodePage(AText, CP_UTF8, False);
+    SelWide := UTF8Decode(AText);
     SelLen := Length(SelWide);
     if not OpenClipboard(0) then
       Exit;
@@ -4095,7 +4091,40 @@ var
     finally
       CloseClipboard;
     end;
+  end;
+
+  // Copies the selected input range to the clipboard
+  procedure CopySelectionToClipboard;
+  var
+    SelText: RawByteString;
+  begin
+    if not HasSelection then
+      Exit;
+    SelText := Copy(Line, SelStart + 1, SelEnd - SelStart);
+    CopyTextToClipboard(SelText);
+  end;
+
+  // Copies the active chat output without internal color markers
+  procedure CopyChatToClipboard;
+  var
+    ChatText: RawByteString;
+    I: Integer;
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+      Exit;
+
+    ChatText := FAgent.ActiveChat.TerminalOutput;
+    I := 1;
+    while I <= Length(ChatText) do
+    begin
+      if ChatText[I] = #2 then
+        Delete(ChatText, I, 2)
+      else
+        Inc(I);
     end;
+
+    CopyTextToClipboard(ChatText);
+  end;
 
   // Reads clipboard text as a Unicode string, returns empty when clipboard has no text
   function ReadClipboardText: UnicodeString;
@@ -4891,9 +4920,14 @@ begin
       VK_A:
         if CtrlPressed then
         begin
-          SelAnchor := 0;
-          CursorPos := Length(Line);
-          UpdateSelection;
+          if Line = string.Empty then
+            CopyChatToClipboard
+          else
+          begin
+            SelAnchor := 0;
+            CursorPos := Length(Line);
+            UpdateSelection;
+          end;
         end
         else if Ord(C) >= 32 then
           InsertTypedChar(WideCharToUtf8(C));
