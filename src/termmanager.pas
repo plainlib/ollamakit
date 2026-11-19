@@ -1171,7 +1171,7 @@ begin
   else
     Cmd := LowerCase(Trim(ACommand));
 
-  Result := (Cmd = 'cls') or (Cmd = 'clear') or (Cmd = 'new');
+  Result := (Cmd = 'cls') or (Cmd = 'clear') or (Cmd = 'new') or (Cmd = 'exit') or (Cmd = 'quit');
 end;
 
 function TCustomTermManager.BuildShellContext: string;
@@ -2524,8 +2524,12 @@ begin
   end;
 
   // Remove the terminal input and synchronize the saved history
-  FHistory.Delete(FHistory.Count - 1);
-  FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+  // Keep agent input in terminal history so it can be selected again
+  if Kind <> tikAgent then
+  begin
+    FHistory.Delete(FHistory.Count - 1);
+    FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+  end;
 
   Result := True;
 end;
@@ -3431,11 +3435,10 @@ begin
   // Start with explicit default color so prompt and banner match scheme
   SetColor(tcDefault);
 
-  // Show the welcome banner only when the active chat has no history
+  // Show the welcome banner only when the active chat has no conversation history
   if FWelcome <> '' then
   begin
-    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or ((FAgent.ActiveChat.History = string.Empty) and
-      (FAgent.ActiveChat.TerminalOutput = string.Empty)) then
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or (FAgent.ActiveChat.History = string.Empty) then
     begin
       SetColor(tcWelcome);
       DoOutput(FWelcome + LineEnding, False);
