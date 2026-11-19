@@ -235,6 +235,8 @@ type
     function ReadSmallTextFile(const APath: string): string;
     // Formats a byte count as human-readable string like "23.4 GB"
     function BytesToHumanText(const ABytes: int64): string;
+    // Restores terminal input history from the chat conversation when missing
+    procedure RestoreTerminalHistory;
     // Removes the last terminal input and its conversation exchange
     function RemoveLastInput: boolean;
   protected
@@ -852,6 +854,7 @@ begin
     if Assigned(FAgent.ActiveChat) then
     begin
       FHistory.Assign(FAgent.ActiveChat.TerminalHistory);
+      RestoreTerminalHistory;
       FShellLog.Assign(FAgent.ActiveChat.ShellLog);
     end;
 
@@ -2392,12 +2395,65 @@ begin
     Result := IntToStr(ABytes) + ' B';
 end;
 
+procedure TCustomTermManager.RestoreTerminalHistory;
+var
+  Data: TJSONData;
+  Messages: TJSONArray;
+  Item: TJSONData;
+  Entry: string;
+  I: integer;
+begin
+  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or (FHistory.Count > 0) or (FAgent.ActiveChat.History = string.Empty) then
+    Exit;
+
+  Data := nil;
+  try
+    try
+      Data := GetJSON(FAgent.ActiveChat.History);
+      if not (Data is TJSONArray) then
+        Exit;
+
+      Messages := TJSONArray(Data);
+      for I := 0 to Messages.Count - 1 do
+      begin
+        if not (Messages.Items[I] is TJSONObject) then
+          Continue;
+
+        Item := Messages.Items[I];
+        if TJSONObject(Item).Get('role', string.Empty) <> 'user' then
+          Continue;
+
+        Entry := TJSONObject(Item).Get('content', string.Empty);
+        if Entry = string.Empty then
+          Continue;
+
+        // Restore the agent prefix so the input is classified correctly
+        if FUsePrefixes then
+          Entry := '?' + Entry;
+
+        if (FHistory.Count = 0) or (FHistory[FHistory.Count - 1] <> Entry) then
+          FHistory.Add(Entry);
+      end;
+
+      while FHistory.Count > FHistoryMax do
+        FHistory.Delete(0);
+
+      FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+    except
+      FHistory.Clear;
+    end;
+  finally
+    Data.Free;
+  end;
+end;
+
 procedure TCustomTermManager.RestoreActiveChat;
 begin
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
     Exit;
 
   FHistory.Assign(FAgent.ActiveChat.TerminalHistory);
+  RestoreTerminalHistory;
   FShellLog.Assign(FAgent.ActiveChat.ShellLog);
 
   ClearScreen;
@@ -2418,7 +2474,14 @@ var
   I, SearchFrom, MatchPos, StartPos: integer;
 begin
   Result := False;
-  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or (FHistory.Count = 0) then
+  if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    Exit;
+
+  // Restore missing terminal history from the conversation
+  if FHistory.Count = 0 then
+    RestoreTerminalHistory;
+
+  if FHistory.Count = 0 then
     Exit;
 
   LastInput := FHistory[FHistory.Count - 1];
@@ -2460,8 +2523,10 @@ begin
     FAgent.ActiveChat.TerminalOutput := OutputText;
   end;
 
+  // Remove the terminal input and synchronize the saved history
   FHistory.Delete(FHistory.Count - 1);
   FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+
   Result := True;
 end;
 

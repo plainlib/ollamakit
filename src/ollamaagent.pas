@@ -4418,6 +4418,7 @@ var
   Buf: TStringBuilder;
   Content: string;
   BytesRead, FileSize: int64;
+  JsonContent: TJSONString;
 begin
   Result := '{"error": "invalid arguments"}';
   if AArgs = nil then
@@ -4475,8 +4476,13 @@ begin
         if I < EndLine - 1 then
           Buf.Append(LineEnding);
       end;
-      Result := '{"content": ' + TJSONString.Create(Buf.ToString).AsJSON + ', "total_lines": ' +
-        IntToStr(TotalLines) + ', "shown_from": ' + IntToStr(StartLine) + ', "shown_to": ' + IntToStr(EndLine) + '}';
+      JsonContent := TJSONString.Create(Buf.ToString);
+      try
+        Result := '{"content": ' + JsonContent.AsJSON + ', "total_lines": ' + IntToStr(TotalLines) +
+          ', "shown_from": ' + IntToStr(StartLine) + ', "shown_to": ' + IntToStr(EndLine) + '}';
+      finally
+        JsonContent.Free;
+      end;
     finally
       Buf.Free;
     end;
