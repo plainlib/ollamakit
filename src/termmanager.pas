@@ -433,6 +433,83 @@ function CheckAndConsumeCancel: boolean; forward;
 procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString); forward;
 {$ENDIF}
 
+type
+  TShellFamily = (sfUnknown, sfCmd, sfPowerShell, sfUnix);
+
+// Detect the shell family by executable name
+function DetectShellFamily(const AShell: string): TShellFamily;
+var
+  S: string;
+begin
+  S := LowerCase(ExtractFileName(Trim(AShell)));
+
+  if (S = 'cmd.exe') or (S = 'cmd') or (S = 'command.com') then
+    Exit(sfCmd);
+
+  if (S = 'powershell.exe') or (S = 'powershell') or (S = 'pwsh.exe') or (S = 'pwsh') then
+    Exit(sfPowerShell);
+
+  if (S = 'sh') or (S = 'bash') or (S = 'zsh') or (S = 'dash') or (S = 'fish') or (S = 'ksh') then
+    Exit(sfUnix);
+
+  Result := sfUnknown;
+end;
+
+// Encode a PowerShell command as Base64 UTF-16LE
+function EncodePowerShellCommand(const ACommand: string): string;
+const
+  Base64Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+var
+  UnicodeText: unicodestring = '';
+  Data: rawbytestring = '';
+  I, J: integer;
+  B0, B1, B2: byte;
+begin
+  UnicodeText := UTF8Decode(ACommand);
+  SetLength(Data, Length(UnicodeText) * 2);
+
+  // Convert UTF-16 code units to little-endian bytes
+  for I := 1 to Length(UnicodeText) do
+  begin
+    Data[(I - 1) * 2 + 1] := ansichar(Ord(UnicodeText[I]) and $FF);
+    Data[(I - 1) * 2 + 2] := ansichar((Ord(UnicodeText[I]) shr 8) and $FF);
+  end;
+
+  Result := string.Empty;
+  I := 1;
+
+  // Encode the UTF-16LE data as Base64
+  while I <= Length(Data) do
+  begin
+    B0 := Ord(Data[I]);
+    B1 := 0;
+    B2 := 0;
+
+    if I + 1 <= Length(Data) then
+      B1 := Ord(Data[I + 1]);
+    if I + 2 <= Length(Data) then
+      B2 := Ord(Data[I + 2]);
+
+    J := Length(Result);
+    SetLength(Result, J + 4);
+
+    Result[J + 1] := Base64Chars[(B0 shr 2) + 1];
+    Result[J + 2] := Base64Chars[(((B0 and 3) shl 4) or (B1 shr 4)) + 1];
+
+    if I + 1 <= Length(Data) then
+      Result[J + 3] := Base64Chars[(((B1 and 15) shl 2) or (B2 shr 6)) + 1]
+    else
+      Result[J + 3] := '=';
+
+    if I + 2 <= Length(Data) then
+      Result[J + 4] := Base64Chars[(B2 and 63) + 1]
+    else
+      Result[J + 4] := '=';
+
+    Inc(I, 3);
+  end;
+end;
+
 // Returns True if path contains drive letter or starts with path delimiter
 function IsAbsolutePath(const APath: string): boolean;
 begin
@@ -1241,8 +1318,6 @@ begin
 end;
 
 procedure TCustomTermManager.HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
-type
-  TShellFamily = (sfCmd, sfUnix, sfPowerShell, sfUnknown);
 const
   // Unix utilities that cmd.exe does not have
   UNIX_CMDS: array[0..15] of string = (
@@ -1252,22 +1327,7 @@ const
   WIN_CMDS: array[0..3] of string = (
     'findstr', 'cls', 'where', 'powershell');
 
-// Returns the shell family inferred from the executable name
-  function DetectShellFamily(const AShell: string): TShellFamily;
-  var
-    S: string;
-  begin
-    S := LowerCase(Trim(ExtractFileName(AShell)));
-    if (S = '') or (S = 'cmd.exe') or (S = 'cmd') or (S = 'command.com') then
-      Exit(sfCmd);
-    if (S = 'powershell.exe') or (S = 'powershell') or (S = 'pwsh.exe') or (S = 'pwsh') then
-      Exit(sfPowerShell);
-    if (S = 'sh') or (S = 'bash') or (S = 'zsh') or (S = 'dash') or (S = 'fish') or (S = 'ksh') then
-      Exit(sfUnix);
-    Result := sfUnknown;
-  end;
-
-  // True when AName appears as a command token, not as an argument or path
+// True when AName appears as a command token, not as an argument or path
   function IsCommandToken(const ACommand, AName: string): boolean;
   var
     Padded: string;
@@ -1644,23 +1704,35 @@ const
     'umask|unalias|unset|wait|';
   {$ENDIF}
 var
-  EnvPath, ShellName, KnownCommands: string;
+  EnvPath, KnownCommands: string;
 begin
-  ShellName := LowerCase(ExtractFileName(FShellExec));
-
-  {$IFDEF WINDOWS}
-  if (ShellName = 'powershell.exe') or (ShellName = 'powershell') or
-    (ShellName = 'pwsh.exe') or (ShellName = 'pwsh') then
-    KnownCommands := POWERSHELL_BUILTINS
-  else
-    KnownCommands := CMD_BUILTINS;
-  {$ELSE}
-  KnownCommands := UNIX_BUILTINS;
-  {$ENDIF}
+  case DetectShellFamily(FShellExec) of
+    sfCmd:
+      KnownCommands := CMD_BUILTINS;
+    sfPowerShell:
+      KnownCommands := POWERSHELL_BUILTINS;
+    {$IFNDEF WINDOWS}
+    sfUnix:
+      KnownCommands := UNIX_BUILTINS;
+    {$ENDIF}
+    else
+      KnownCommands := string.Empty;
+  end;
 
   // Check shell-specific builtins first
   if Pos('|' + LowerCase(AName) + '|', KnownCommands) > 0 then
     Exit(True);
+
+  if DetectShellFamily(FShellExec) = sfPowerShell then
+  begin
+    // Recognize PowerShell static .NET method calls
+    if (AName <> '') and (AName[1] = '[') and (Pos(']::', AName) > 0) then
+      Exit(True);
+
+    // Recognize PowerShell variable expressions
+    if (AName <> '') and (AName[1] = '$') then
+      Exit(True);
+  end;
 
   EnvPath := SysUtils.GetEnvironmentVariable('PATH');
 
@@ -1719,6 +1791,16 @@ begin
     SetLength(FirstLine, P - 1);
   FirstLine := Trim(FirstLine);
 
+  // PowerShell variable assignments and console methods are valid commands
+  if DetectShellFamily(FShellExec) = sfPowerShell then
+  begin
+    if (FirstLine <> '') and (FirstLine[1] = '$') then
+      Exit(tikCommand);
+
+    if Pos('[Console]::', FirstLine) = 1 then
+      Exit(tikCommand);
+  end;
+
   // Extract the first command token, including quoted executable paths
   if (FirstLine <> '') and (FirstLine[1] = '"') then
   begin
@@ -1743,8 +1825,8 @@ begin
     Delete(First, 1, 1);
 
   // Detect drive switches before extracting the executable name
-  if (Length(First) >= 2) and (First[2] = ':') and (First[1] in ['a'..'z']) and ((Length(First) = 2) or
-    ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) then
+  if (DetectShellFamily(FShellExec) in [sfCmd, sfPowerShell]) and (Length(First) >= 2) and (First[2] = ':') and
+    (First[1] in ['a'..'z']) and ((Length(First) = 2) or ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) then
   begin
     if HasMultipleLines then
       Exit(tikCommand);
@@ -2205,20 +2287,23 @@ end;
 function TCustomTermManager.ReadSmallTextFile(const APath: string): string;
 var
   Stream: TFileStream;
-  Buf: TBytes = ();
+  Buf: rawbytestring = '';
   ReadCount: int64;
 begin
-  Result := '';
+  Result := string.Empty;
+
   if not FileExists(APath) then
     Exit;
+
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
     SetLength(Buf, Stream.Size);
+
     if Length(Buf) > 0 then
     begin
-      ReadCount := Stream.Read(Buf[0], Length(Buf));
+      ReadCount := Stream.Read(Buf[1], Length(Buf));
       SetLength(Buf, ReadCount);
-      Result := string(Buf);
+      Result := string(UTF8Decode(Buf));
     end;
   finally
     Stream.Free;
@@ -3122,6 +3207,7 @@ var
   P: integer;
   IsInteractive: boolean;
   HasMultipleLines: boolean;
+  ShellFamily: TShellFamily;
   {$IFDEF WINDOWS}
   InHandle: THandle;
   InMode: DWORD = 0;
@@ -3140,10 +3226,11 @@ begin
     Exit;
   FStdOutPending := '';
   FStdErrPending := '';
+  ShellFamily := DetectShellFamily(FShellExec);
 
   // Drive switch "d:", "d:\", "d:\path" must run in-process
-  if (Length(ACommand) >= 2) and (ACommand[2] = ':') and (ACommand[1] in ['a'..'z', 'A'..'Z']) and
-    ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) then
+  if (ShellFamily in [sfCmd, sfPowerShell]) and (Length(ACommand) >= 2) and (ACommand[2] = ':') and
+    (ACommand[1] in ['a'..'z', 'A'..'Z']) and ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) then
   begin
     if Length(ACommand) = 2 then
       DrivePath := UpCase(ACommand[1]) + ':\'
@@ -3201,6 +3288,7 @@ begin
   {$IFDEF WINDOWS}
   ScriptFileName := string.Empty;
   CwdFileName := string.Empty;
+  TempFileName := string.Empty;
   {$ENDIF}
   Process := TProcess.Create(nil);
   {$IFDEF WINDOWS}
@@ -3209,44 +3297,130 @@ begin
   try
     Process.Executable := FShellExec;
     {$IFDEF WINDOWS}
-    Process.Parameters.Add('/c');
+    case ShellFamily of
+      sfCmd:
+      begin
+        Process.Parameters.Add('/c');
 
-    if HasMultipleLines then
-    begin
-      // Create temporary files for the batch script and working directory
-      TempFileName := SysUtils.GetTempFileName;
-      ScriptFileName := ChangeFileExt(TempFileName, '.cmd');
-      CwdFileName := SysUtils.GetTempFileName;
+        if HasMultipleLines then
+        begin
+          // Create temporary files for the batch script and working directory
+          TempFileName := SysUtils.GetTempFileName;
+          ScriptFileName := ChangeFileExt(TempFileName, '.cmd');
+          CwdFileName := SysUtils.GetTempFileName;
 
-      // Create the temporary files before renaming or using them
-      ScriptStream := TFileStream.Create(TempFileName, fmCreate);
-      ScriptStream.Free;
+          // Create the temporary files before renaming or using them
+          ScriptStream := TFileStream.Create(TempFileName, fmCreate);
+          ScriptStream.Free;
 
-      ScriptStream := TFileStream.Create(CwdFileName, fmCreate);
-      ScriptStream.Free;
+          ScriptStream := TFileStream.Create(CwdFileName, fmCreate);
+          ScriptStream.Free;
 
-      if not RenameFile(TempFileName, ScriptFileName) then
-        raise Exception.Create('Cannot create temporary batch file');
+          if not RenameFile(TempFileName, ScriptFileName) then
+            raise Exception.Create('Cannot create temporary batch file');
 
-      // Append the final working directory to a separate file
-      ScriptData := RawByteString('@chcp 65001 > nul' + LineEnding + ACommand + LineEnding +
-        '@echo %CD%> "' + CwdFileName + '"' + LineEnding);
+          // Append the final working directory to a separate file
+          ScriptData := RawByteString(ACommand + LineEnding +
+            '@echo %CD%> "' + CwdFileName + '"' + LineEnding);
 
-      ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
-      try
-        if Length(ScriptData) > 0 then
-          ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
-      finally
-        ScriptStream.Free;
+          ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
+          try
+            if Length(ScriptData) > 0 then
+              ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
+          finally
+            ScriptStream.Free;
+          end;
+
+          Process.Parameters.Add('"' + ScriptFileName + '"');
+        end
+        else
+          Process.Parameters.Add(ACommand);
       end;
 
-      Process.Parameters.Add('"' + ScriptFileName + '"');
+      sfPowerShell:
+      begin
+        if HasMultipleLines then
+        begin
+          // Create temporary files for the PowerShell script and working directory
+          TempFileName := SysUtils.GetTempFileName;
+          ScriptFileName := ChangeFileExt(TempFileName, '.ps1');
+          CwdFileName := SysUtils.GetTempFileName;
+
+          ScriptStream := TFileStream.Create(TempFileName, fmCreate);
+          ScriptStream.Free;
+
+          ScriptStream := TFileStream.Create(CwdFileName, fmCreate);
+          ScriptStream.Free;
+
+          if not RenameFile(TempFileName, ScriptFileName) then
+            raise Exception.Create('Cannot create temporary PowerShell script');
+
+          // Configure UTF-8 output and save the final working directory
+          ScriptData := UTF8Encode(UTF8Decode(
+            '$ProgressPreference = ''SilentlyContinue''' + LineEnding +
+            '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false' +
+            LineEnding +
+            '[Console]::OutputEncoding = $utf8' + LineEnding +
+            '$OutputEncoding = $utf8' + LineEnding +
+            ACommand + LineEnding +
+            '[IO.File]::WriteAllText(''' + StringReplace(CwdFileName, '''', '''''', [rfReplaceAll]) +
+            ''', (Get-Location).Path, $utf8)' + LineEnding));
+
+          ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
+          try
+            // Write UTF-8 BOM for Windows PowerShell 5.1
+            ScriptStream.WriteByte($EF);
+            ScriptStream.WriteByte($BB);
+            ScriptStream.WriteByte($BF);
+
+            if Length(ScriptData) > 0 then
+              ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
+          finally
+            ScriptStream.Free;
+          end;
+
+          Process.Parameters.Add('-NoProfile');
+          Process.Parameters.Add('-OutputFormat');
+          Process.Parameters.Add('Text');
+          Process.Parameters.Add('-ExecutionPolicy');
+          Process.Parameters.Add('Bypass');
+          Process.Parameters.Add('-File');
+          Process.Parameters.Add(ScriptFileName);
+        end
+        else
+        begin
+          Process.Parameters.Add('-NoProfile');
+          Process.Parameters.Add('-OutputFormat');
+          Process.Parameters.Add('Text');
+          Process.Parameters.Add('-ExecutionPolicy');
+          Process.Parameters.Add('Bypass');
+          Process.Parameters.Add('-EncodedCommand');
+          Process.Parameters.Add(EncodePowerShellCommand(
+            '$ProgressPreference = ''SilentlyContinue''; ' +
+            '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false; ' +
+            '[Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; ' +
+            ACommand));
+        end;
+      end;
+
+      sfUnix:
+      begin
+        Process.Parameters.Add('-c');
+        Process.Parameters.Add(ACommand);
+      end;
+
+      else
+        // Unknown shells receive the command without shell-specific wrappers
+        Process.Parameters.Add(ACommand);
+    end;
+    {$ELSE}
+    if ShellFamily = sfUnix then
+    begin
+      Process.Parameters.Add('-c');
+      Process.Parameters.Add(ACommand);
     end
     else
-      Process.Parameters.Add('chcp 65001 > nul & ' + ACommand);
-    {$ELSE}
-    Process.Parameters.Add('-c');
-    Process.Parameters.Add(ACommand);
+      Process.Parameters.Add(ACommand);
     {$ENDIF}
 
     if IsInteractive then
@@ -3370,13 +3544,7 @@ begin
     begin
       CwdPath := Trim(ReadSmallTextFile(CwdFileName));
       if DirectoryExists(CwdPath) then
-      begin
         SetPath(CwdPath);
-
-        // Store the new directory in the active chat
-        if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
-          FAgent.ActiveChat.WorkingDirectory := GetEffectivePath;
-      end;
     end;
     {$ENDIF}
 
@@ -3388,11 +3556,13 @@ begin
     {$ENDIF}
     Process.Free;
     {$IFDEF WINDOWS}
-      // Remove temporary files after execution
-      if (ScriptFileName <> '') and FileExists(ScriptFileName) then
-        SysUtils.DeleteFile(ScriptFileName);
-      if (CwdFileName <> '') and FileExists(CwdFileName) then
-        SysUtils.DeleteFile(CwdFileName);
+    // Remove temporary files after execution
+    if (ScriptFileName <> '') and FileExists(ScriptFileName) then
+      SysUtils.DeleteFile(ScriptFileName);
+    if (TempFileName <> '') and FileExists(TempFileName) then
+      SysUtils.DeleteFile(TempFileName);
+    if (CwdFileName <> '') and FileExists(CwdFileName) then
+      SysUtils.DeleteFile(CwdFileName);
     {$ENDIF}
   end;
 end;
@@ -3405,6 +3575,7 @@ var
   StartTime: TDateTime;
   EffectiveTimeout: integer;
   HitLimit: boolean;
+  ShellFamily: TShellFamily;
 
 // Appends bytes to Captured and enforces MaxCaptureBytes limit
   procedure AppendAndCheck(const AData: rawbytestring);
@@ -3456,20 +3627,58 @@ begin
   Process := TProcess.Create(nil);
   try
     Process.Executable := FShellExec;
+    ShellFamily := DetectShellFamily(FShellExec);
+
     {$IFDEF WINDOWS}
-    Process.Parameters.Add('/c');
-    Process.Parameters.Add('chcp 65001 > nul & ' + ACommand);
+    case ShellFamily of
+      sfCmd:
+      begin
+        Process.Parameters.Add('/c');
+        Process.Parameters.Add(ACommand);
+      end;
+
+      sfPowerShell:
+      begin
+        Process.Parameters.Add('-NoProfile');
+        Process.Parameters.Add('-ExecutionPolicy');
+        Process.Parameters.Add('Bypass');
+        Process.Parameters.Add('-EncodedCommand');
+        Process.Parameters.Add(EncodePowerShellCommand(
+          '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false; ' +
+          '[Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; ' +
+          ACommand));
+      end;
+
+      sfUnix:
+      begin
+        Process.Parameters.Add('-c');
+        Process.Parameters.Add(ACommand);
+      end;
+
+      else
+        Process.Parameters.Add(ACommand);
+    end;
     {$ELSE}
-    Process.Parameters.Add('-c');
-    Process.Parameters.Add(ACommand);
+    if ShellFamily = sfUnix then
+    begin
+      Process.Parameters.Add('-c');
+      Process.Parameters.Add(ACommand);
+    end
+    else
+      Process.Parameters.Add(ACommand);
     {$ENDIF}
     Process.Options := [poUsePipes, poNoConsole];
     Process.CurrentDirectory := GetEffectivePath;
     Process.Execute;
     StartTime := Now;
 
-    while Process.Running and not HitLimit do
+    while Process.Running do
     begin
+      if HitLimit then
+      begin
+        Process.Terminate(1);
+        Break;
+      end;
       if (EffectiveTimeout > 0) and (MilliSecondsBetween(Now, StartTime) >= EffectiveTimeout) then
       begin
         Process.Terminate(1);
