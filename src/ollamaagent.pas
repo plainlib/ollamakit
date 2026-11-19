@@ -290,6 +290,8 @@ type
     function SaveChatsToFile(const AFileName: string): boolean;
     // Loads all chats from a JSON file
     function LoadChatsFromFile(const AFileName: string): boolean;
+    // Loads separate chat files and selects the chat for the startup directory
+    function LoadChatsFromFiles(AFileNames: TStrings; const AStartupDirectory: string): boolean;
     // Saves the specified chat to a separate JSON file
     function SaveChatToFile(AChat: TAgentChat; const AFileName: string): boolean;
     // Saves the active chat to a separate JSON file
@@ -3037,7 +3039,8 @@ var
   NewChats: TList;
   Chat: TAgentChat;
   FileData: TStringList;
-  I, J, ChatID, ActiveID, MaxID: integer;
+  I, J, ChatID, MaxID, ChatIndex: integer;
+  LaunchDirectory, ChatDirectory, ChatName: string;
 begin
   Result := False;
   if not FDone or (Trim(AFileName) = string.Empty) then
@@ -3059,7 +3062,6 @@ begin
         Exit;
       ChatsArray := TJSONArray(Item);
 
-      ActiveID := Root.Get('active_chat_id', 0);
       MaxID := 0;
 
       for I := 0 to ChatsArray.Count - 1 do
@@ -3073,7 +3075,7 @@ begin
           ChatID := I + 1;
 
         Chat := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
-        Chat.WorkingDirectory := ChatObj.Get('working_directory', FRootPath);
+        Chat.WorkingDirectory := ChatObj.Get('working_directory', string.Empty);
         Chat.History := ChatObj.Get('history', string.Empty);
         Chat.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
         Chat.ContextUsed := ChatObj.Get('context_used', 0);
@@ -3100,12 +3102,11 @@ begin
           MaxID := ChatID;
       end;
 
-      if NewChats.Count = 0 then
-      begin
-        Chat := TAgentChat.Create(1, 'Chat 1');
-        NewChats.Add(Chat);
-        MaxID := 1;
-      end;
+      // Preserve the launch directory before restoring any chat
+      LaunchDirectory := FRootPath;
+      if LaunchDirectory = string.Empty then
+        LaunchDirectory := GetCurrentDir;
+      LaunchDirectory := ExcludeTrailingPathDelimiter(ExpandFileName(LaunchDirectory));
 
       // Replace current chats only after the file has been parsed successfully
       for I := 0 to FChats.Count - 1 do
@@ -3116,23 +3117,68 @@ begin
         FChats.Add(NewChats[I]);
       NewChats.Clear;
 
-      FActiveChat := TAgentChat(FChats[0]);
-      for I := 0 to FChats.Count - 1 do
-        if TAgentChat(FChats[I]).ID = ActiveID then
+      // Find the last chat matching the launch directory
+      ChatIndex := -1;
+      for I := FChats.Count - 1 downto 0 do
+      begin
+        Chat := TAgentChat(FChats[I]);
+        if Chat.WorkingDirectory = string.Empty then
+          Continue;
+
+        ChatDirectory := ExcludeTrailingPathDelimiter(ExpandFileName(Chat.WorkingDirectory));
+
+        {$IFDEF WINDOWS}
+        if SameText(ChatDirectory, LaunchDirectory) then
+  {$ELSE}
+        if ChatDirectory = LaunchDirectory then
+  {$ENDIF}
         begin
-          FActiveChat := TAgentChat(FChats[I]);
+          ChatIndex := I;
           Break;
         end;
+      end;
 
+      // Reuse the last chat if it is completely empty, otherwise create a new one
+      if ChatIndex < 0 then
+      begin
+        if FChats.Count > 0 then
+        begin
+          ChatIndex := FChats.Count - 1;
+          Chat := TAgentChat(FChats[ChatIndex]);
+          if (Trim(Chat.History) = string.Empty) and (Chat.TerminalOutput = string.Empty) and
+            (Chat.TerminalHistory.Count = 0) and (Chat.ShellLog.Count = 0) then
+          begin
+            ChatName := ExtractFileName(ExcludeTrailingPathDelimiter(LaunchDirectory));
+            if ChatName = string.Empty then
+              ChatName := LaunchDirectory;
+            Chat.Name := ChatName;
+            // Reassign the directory so the chat is found on the next launch
+            Chat.WorkingDirectory := LaunchDirectory;
+          end
+          else
+            ChatIndex := -1;
+        end
+        else
+          ChatIndex := -1;
+
+        if ChatIndex < 0 then
+        begin
+          Inc(MaxID);
+          Chat := TAgentChat.Create(MaxID, 'Chat ' + IntToStr(MaxID));
+          Chat.WorkingDirectory := LaunchDirectory;
+          FChats.Add(Chat);
+          ChatIndex := FChats.Count - 1;
+        end;
+      end;
+
+      FActiveChat := TAgentChat(FChats[ChatIndex]);
       FNextChatID := MaxID;
       FHistory := FActiveChat.History;
       FContextUsed := FActiveChat.ContextUsed;
       FContextTotal := FActiveChat.ContextTotal;
 
-      if FActiveChat.WorkingDirectory <> string.Empty then
-        RootPath := FActiveChat.WorkingDirectory
-      else
-        FActiveChat.WorkingDirectory := FRootPath;
+      // Synchronize the agent workspace with the selected chat
+      RootPath := FActiveChat.WorkingDirectory;
 
       Result := True;
     except
@@ -3145,6 +3191,91 @@ begin
     FileData.Free;
     Data.Free;
   end;
+end;
+
+function TCustomOllamaAgent.LoadChatsFromFiles(AFileNames: TStrings; const AStartupDirectory: string): boolean;
+var
+  I, ChatIndex, Delta: integer;
+  ChatDirectory, LaunchDirectory, ChatName: string;
+begin
+  Result := False;
+  if not FDone or (AFileNames = nil) then
+    Exit;
+
+  // Normalize the startup directory
+  LaunchDirectory := Trim(AStartupDirectory);
+  if LaunchDirectory = string.Empty then
+    LaunchDirectory := GetCurrentDir;
+  LaunchDirectory := IncludeTrailingPathDelimiter(ExpandFileName(LaunchDirectory));
+
+  ClearChats;
+
+  // Load chats in the supplied order
+  for I := 0 to AFileNames.Count - 1 do
+    LoadChatFromFile(AFileNames[I]);
+
+  // Find the last chat matching the startup directory
+  ChatIndex := -1;
+  for I := ChatCount - 1 downto 0 do
+  begin
+    ChatDirectory := Chats[I].WorkingDirectory;
+    if ChatDirectory = string.Empty then
+      Continue;
+    ChatDirectory := IncludeTrailingPathDelimiter(ExpandFileName(ChatDirectory));
+
+    {$IFDEF WINDOWS}
+    if SameText(ChatDirectory, LaunchDirectory) then
+  {$ELSE}
+    if ChatDirectory = LaunchDirectory then
+  {$ENDIF}
+    begin
+      ChatIndex := I;
+      Break;
+    end;
+  end;
+
+  if ChatIndex >= 0 then
+  begin
+    // Activate the matching chat without changing the list order
+    Delta := ChatIndex - (ChatCount - 1);
+    if Delta <> 0 then
+      SwitchChat(Delta);
+  end
+  else
+  begin
+    // Reuse the last chat if it is completely empty
+    if ChatCount > 0 then
+    begin
+      ChatIndex := ChatCount - 1;
+      if (Trim(Chats[ChatIndex].History) = string.Empty) and (Chats[ChatIndex].TerminalOutput = string.Empty) and
+        (Chats[ChatIndex].TerminalHistory.Count = 0) and (Chats[ChatIndex].ShellLog.Count = 0) then
+      begin
+        ChatName := ExtractFileName(ExcludeTrailingPathDelimiter(LaunchDirectory));
+        if ChatName = string.Empty then
+          ChatName := LaunchDirectory;
+        Chats[ChatIndex].Name := ChatName;
+        // Reassign the directory so the chat is found on the next launch
+        Chats[ChatIndex].WorkingDirectory := LaunchDirectory;
+        RootPath := LaunchDirectory;
+      end
+      else
+        ChatIndex := -1;
+    end
+    else
+      ChatIndex := -1;
+
+    if ChatIndex < 0 then
+    begin
+      // Create a new chat named after the startup directory
+      ChatName := ExtractFileName(ExcludeTrailingPathDelimiter(LaunchDirectory));
+      if ChatName = string.Empty then
+        ChatName := LaunchDirectory;
+      NewChat(ChatName);
+      RootPath := LaunchDirectory;
+    end;
+  end;
+
+  Result := True;
 end;
 
 function TCustomOllamaAgent.SaveChatToFile(AChat: TAgentChat; const AFileName: string): boolean;
@@ -4970,6 +5101,8 @@ begin
             OldBlock.Add(Copy(PatchLine, 2, MaxInt));
           '+':
             NewBlock.Add(Copy(PatchLine, 2, MaxInt));
+          else
+            ;
         end;
 
         Inc(I);

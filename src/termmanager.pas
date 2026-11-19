@@ -862,8 +862,7 @@ begin
     // Share terminal directory and shell name with the agent at runtime only
     if not (csDesigning in ComponentState) then
     begin
-      if FAgent.RootPath = string.Empty then
-        FAgent.RootPath := GetEffectivePath;
+      FAgent.RootPath := GetEffectivePath;
       FAgent.ExecShellInfo := FShellExec;
       // Route agent log lines through the terminal so they are colored
       FPrevAgentOnLog := FAgent.OnLog;
@@ -880,6 +879,11 @@ begin
 
   if not FAgent.SwitchChat(ADelta) then
     Exit;
+
+  // Keep terminal directory in sync with the active chat working directory
+  if Assigned(FAgent.ActiveChat) and (FAgent.ActiveChat.WorkingDirectory <> '') and
+    DirectoryExists(FAgent.ActiveChat.WorkingDirectory) then
+    Path := FAgent.ActiveChat.WorkingDirectory;
 
   RestoreActiveChat;
   Result := True;
@@ -3419,6 +3423,9 @@ var
   Tagged: rawbytestring;
 begin
   if ALine = '' then
+    Exit;
+  // Skip meta and chat control commands such as exit, quit, cls
+  if IsChatControlCommand(ALine) then
     Exit;
   // Tag as UTF-8 without recoding so SetCodePage works on RawByteString
   Tagged := ALine;
