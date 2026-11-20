@@ -4254,11 +4254,13 @@ var
       -2: NewTop := 0;
        2:
        begin
-          // Place the current prompt near the middle of the viewport
+         // Place the current prompt near the middle of the viewport
          NewTop := Info.dwCursorPosition.Y - ViewHeight div 2;
        end;
+      -3: NewTop := Rect.Top - 1;
+       3: NewTop := Rect.Top + 1;
       -1: NewTop := Rect.Top - ViewHeight;
-      1: NewTop := Rect.Top + ViewHeight;
+       1: NewTop := Rect.Top + ViewHeight;
       else
         Exit;
     end;
@@ -4891,6 +4893,10 @@ begin
     CtrlPressed := (Rec.Event.KeyEvent.dwControlKeyState and
       (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
 
+    // Ignore standalone modifier keys to preserve the current viewport
+    if Rec.Event.KeyEvent.wVirtualKeyCode in [VK_SHIFT, VK_CONTROL, VK_MENU] then
+      Continue;
+
     // Delete the active chat with Ctrl+Shift+Delete
     if CtrlPressed and ShiftPressed and
       (Rec.Event.KeyEvent.wVirtualKeyCode = VK_DELETE) then
@@ -5190,7 +5196,12 @@ begin
           end;
         end;
       VK_UP:
-        if CtrlPressed then
+        if ShiftPressed then
+        begin
+          ScrollOutput(-3);
+          Continue;
+        end
+        else if CtrlPressed then
         begin
           if HistIndex = FHistory.Count then
           begin
@@ -5242,7 +5253,12 @@ begin
           end;
         end;
       VK_DOWN:
-        if CtrlPressed then
+        if ShiftPressed then
+        begin
+          ScrollOutput(3);
+          Continue;
+        end
+        else if CtrlPressed then
         begin
           if HistIndex < FHistory.Count - 1 then
           begin

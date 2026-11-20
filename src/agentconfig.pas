@@ -338,6 +338,7 @@ begin
     T.Add('  Ctrl+Left/Right Switch between chats');
     T.Add('  Ctrl+Shift+Del  Delete the active chat');
     T.Add('  Ctrl+Backspace  Remove the last input and result');
+    T.Add('  Shift+Up/Down   Scroll output by one line');
     T.Add('');
     T.Add('Type "help" for the full help.');
     Result := T.Text;
@@ -460,6 +461,7 @@ begin
     Row('Ctrl+Shift+Del', 'delete the active chat');
     Row('Ctrl+Backspace', 'remove the last input and result');
     Row('Ctrl+Up/Down', 'navigate command history');
+    Row('Shift+Up/Down', 'scroll output by one line');
     Row('Ctrl+Home/End', 'select first/last history entry');
     Row('Ctrl+Delete', 'delete the current history entry');
     Row('Ctrl+A', 'select input or copy chat when empty');
