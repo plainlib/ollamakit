@@ -1793,8 +1793,8 @@ end;
 function TCustomTermManager.ClassifyLine(const ALine: string; out APayload: string): TTermInputKind;
 var
   S, FirstLine, First: string;
-  P: integer;
-  HasMultipleLines: boolean;
+  P, I: integer;
+  HasMultipleLines, InQuotes: boolean;
 begin
   APayload := '';
   S := Trim(ALine);
@@ -1842,6 +1842,29 @@ begin
 
     if Pos('[Console]::', FirstLine) = 1 then
       Exit(tikCommand);
+  end;
+
+  // Detect cmd.exe compound commands and shell operators outside quotes
+  if DetectShellFamily(FShellExec) = sfCmd then
+  begin
+    InQuotes := False;
+    I := 1;
+
+    while I <= Length(S) do
+    begin
+      if S[I] = '^' then
+      begin
+        Inc(I, 2);
+        Continue;
+      end;
+
+      if S[I] = '"' then
+        InQuotes := not InQuotes
+      else if not InQuotes and (S[I] in ['(', ')', '&', '|', '<', '>']) then
+        Exit(tikCommand);
+
+      Inc(I);
+    end;
   end;
 
   // Extract the first command token, including quoted executable paths
@@ -4047,6 +4070,8 @@ end;
 
 // Writes UTF-8 bytes directly to handle bypassing codepage conversion
 procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString);
+const
+  ENABLE_VIRTUAL_TERMINAL_PROCESSING = $0004;
 var
   Mode: DWORD;
   Written: DWORD;
@@ -4055,15 +4080,22 @@ var
 begin
   if Length(ABytes) = 0 then
     Exit;
+
   Mode := 0;
   Written := 0;
   Ok := False;
+
   if (AHandle <> INVALID_HANDLE_VALUE) and GetConsoleMode(AHandle, Mode) then
   begin
+    // Enable ANSI escape sequence processing when supported
+    if (Mode and ENABLE_VIRTUAL_TERMINAL_PROCESSING) = 0 then
+      SetConsoleMode(AHandle, Mode or ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
     Wide := UTF8Decode(ABytes);
     if Length(Wide) > 0 then
       Ok := WriteConsoleW(AHandle, PWideChar(Wide), Length(Wide), Written, nil);
   end;
+
   // Fallback when WriteConsoleW fails or handle is not a console
   if not Ok then
     WriteFile(AHandle, ABytes[1], Length(ABytes), Written, nil);
