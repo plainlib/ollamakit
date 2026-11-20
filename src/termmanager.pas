@@ -414,7 +414,7 @@ implementation
 
 const
   INTERACTIVE_COMMANDS =
-    '|ssh|ssh.exe|ssh-keygen|ssh-keygen.exe|scp|scp.exe|sftp|sftp.exe|' +
+    '|del|erase|rd|rmdir|ssh|ssh.exe|ssh-keygen|ssh-keygen.exe|scp|scp.exe|sftp|sftp.exe|' +
     'ftp|ftp.exe|telnet|telnet.exe|rlogin|rlogin.exe|mosh|plink|putty|vim|vim.exe|vi|nano|nano.exe|emacs|emacs.exe|ne|micro|joe|' +
     'less|less.exe|more|more.exe|man|man.exe|most|bat|top|htop|btop|atop|glances|nmon|watch|' +
     'tmux|screen|mc|ranger|nnn|lf|yazi|python|python.exe|python3|python3.exe|ipython|ipython.exe|' +
