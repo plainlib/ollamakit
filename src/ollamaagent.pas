@@ -4247,10 +4247,12 @@ begin
         '[abc] classes unsupported. Capped at 2000 results.',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
       AddTool(Arr, 'grep',
-        'Search file contents, capped at 500 matches. Literal by default, but patterns ' +
-        'starting with ^ or ending with $ or containing \\w, \\d or | (alternation) are ' +
-        'automatically treated as regex. Skips .git/node_modules/bin/obj. ' + 'Returns file, line, text per match.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Force literal match, bypassing auto-regex detection"}},"required":["pattern"]}');
+        'Find text inside files. This tool is named grep, not search. ' +
+        'The required parameter is pattern, never query. Capped at 500 matches. ' +
+        'Literal by default, but patterns starting with ^ or ending with $ or containing ' +
+        '\w, \d or | (alternation) are automatically treated as regex. ' +
+        'Skips .git/node_modules/bin/obj. Returns file, line and text per match.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string","description":"Required text or regex pattern to find"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Force literal match, bypassing auto-regex detection"}},"required":["pattern"]}');
       AddTool(Arr, 'read_agents_md',
         'Read the nearest ' + FAgentsFileName + ' for the given path, walking up to the workspace root. ' +
         'Returns {found, path, content}. Use before editing files to learn local conventions.',

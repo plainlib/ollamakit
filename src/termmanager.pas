@@ -112,6 +112,7 @@ type
   private
     FPath: string;
     FPrompt: string;
+
     FWelcome: TCaption;
     // Label printed before agent thinking block, followed by a newline
     FThinkingLabel: TCaption;
@@ -192,8 +193,13 @@ type
     FSuppressChatOutput: boolean;
     FPendingOutputStart: SizeInt;
     FCurrentOutputMark: boolean;
+    // Updates the native terminal window title with the current directory
+    procedure UpdateConsoleTitle;
+    // Sets the working directory and synchronizes the agent root path
     procedure SetPath(const AValue: string);
+    // Assigns the agent and synchronizes its terminal state
     procedure SetAgent(const AValue: TCustomOllamaAgent);
+    // Assigns the command history
     procedure SetHistory(const AValue: TStringList);
     // Switches the active agent chat and restores its terminal state
     function SwitchActiveChat(ADelta: integer): boolean;
@@ -201,7 +207,9 @@ type
     function MoveActiveChat(ADelta: integer): boolean;
     // Appends terminal text to the active chat transcript
     procedure AppendChatOutput(const AText: string);
+    // Sets the terminal color scheme
     procedure SetColors(const AValue: TTermColorScheme);
+    // Assigns the shell command history
     procedure SetShellHistory(const AValue: TAgentShellHistory);
     // Handles help, help agent, and ? alias
     procedure HandleHelpCommand(const AArg: string);
@@ -217,22 +225,35 @@ type
     procedure HandleTermGet(const AName: string);
     // Dispatches ollama <subcommand> to the API-backed implementation
     procedure HandleOllamaCommand(const AArg: string);
-    // Handlers for the various ollama subcommands
+    // Handles the ollama list command
     procedure HandleOllamaList;
+    // Handles the ollama ps command
     procedure HandleOllamaPs;
+    // Handles the ollama show command for a model
     procedure HandleOllamaShow(const AModel: string);
+    // Handles pulling a model from the Ollama registry
     procedure HandleOllamaPull(const AModel: string);
+    // Handles removing a local model
     procedure HandleOllamaRm(const AModel: string);
+    // Handles stopping a running model
     procedure HandleOllamaStop(const AModel: string);
+    // Handles loading a model into memory
     procedure HandleOllamaLoad(const AModel: string);
+    // Handles unloading a model from memory
     procedure HandleOllamaUnload(const AModel: string);
+    // Handles copying a model to another name
     procedure HandleOllamaCopy(const ASource, ADest: string);
+    // Handles creating a model from a Modelfile
     procedure HandleOllamaCreate(const AName, AFile: string);
+    // Handles displaying the Ollama version
     procedure HandleOllamaVersion;
+    // Displays help for ollama commands
     procedure HandleOllamaHelp;
     // Temporary event handlers used while a command is in flight
     procedure HandleOllamaModelsRefreshed(Sender: TObject; const Models: TStringList);
+    // Handles an Ollama operation error
     procedure HandleOllamaError(Sender: TObject; Kind: TOllamaErrorKind; const ModelName, Msg: string);
+    // Handles model download progress updates
     procedure HandleOllamaPullProgress(Sender: TObject; const ModelName: string; Percent: integer);
     // Pumps sync events until the pending ollama operation finishes or times out
     function WaitOllamaOp(ATimeoutMs: integer): boolean;
@@ -855,6 +876,24 @@ begin
   inherited Destroy;
 end;
 
+// Updates the native terminal window title with the current directory
+procedure TCustomTermManager.UpdateConsoleTitle;
+var
+  Title: string;
+begin
+  if csDesigning in ComponentState then
+    Exit;
+
+  Title := 'PlainConsole - ' + GetEffectivePath;
+
+  {$IFDEF WINDOWS}
+  SetConsoleTitleW(PWideChar(UTF8Decode(Title)));
+  {$ELSE}
+  Write(#27']0;' + UTF8Encode(Title) + #7);
+  Flush(Output);
+  {$ENDIF}
+end;
+
 procedure TCustomTermManager.SetPath(const AValue: string);
 var
   NewPath: string;
@@ -862,6 +901,8 @@ begin
   if AValue = '' then
   begin
     FPath := '';
+    UpdateConsoleTitle;
+
     // Keep agent workspace in sync with terminal directory
     if Assigned(FAgent) and not (csDesigning in ComponentState) then
       FAgent.RootPath := GetEffectivePath;
@@ -876,6 +917,8 @@ begin
       NewPath := NewPath + PathDelim;
     {$ENDIF}
     FPath := NewPath;
+    UpdateConsoleTitle;
+
     // Keep agent workspace in sync with terminal directory
     if Assigned(FAgent) and not (csDesigning in ComponentState) then
       FAgent.RootPath := GetEffectivePath;
