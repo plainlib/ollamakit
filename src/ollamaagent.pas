@@ -4259,12 +4259,12 @@ begin
         '[abc] classes unsupported. Capped at 2000 results.',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
       AddTool(Arr, 'grep',
-        'Find text inside files. This tool is named grep, not search. ' +
-        'The required parameter is pattern, never query. Capped at 500 matches. ' +
+        'Search text inside files. Accepts pattern or query (alias for pattern). ' +
+        'Optional max_results limits the number of matches, default 500, maximum 500. ' +
         'Literal by default, but patterns starting with ^ or ending with $ or containing ' +
         '\w, \d or | (alternation) are automatically treated as regex. ' +
         'Skips .git/node_modules/bin/obj. Returns file, line and text per match.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string","description":"Required text or regex pattern to find"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Force literal match, bypassing auto-regex detection"}},"required":["pattern"]}');
+        '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"},"pattern":{"type":"string","description":"Text or regex pattern to find"},"query":{"type":"string","description":"Alias for pattern"},"max_results":{"type":"integer","description":"Maximum number of matches, default 500, maximum 500"},"recursive":{"type":"boolean","description":"Recurse, default true"},"literal":{"type":"boolean","description":"Force literal match, bypassing auto-regex detection"}}}');
       AddTool(Arr, 'read_agents_md',
         'Read the nearest ' + FAgentsFileName + ' for the given path, walking up to the workspace root. ' +
         'Returns {found, path, content}. Use before editing files to learn local conventions.',
@@ -6363,6 +6363,7 @@ var
   StartTick: QWord;
   TimedOut: boolean;
   TotalBytes: integer;
+  MaxResults: integer;
 
 // Returns True for VCS, build output and package caches to skip
   function IsJunkPath(const ARelPath: string): boolean;
@@ -6386,7 +6387,7 @@ var
     FR: TSearchRec;
     HasMatch: boolean;
   begin
-    if Matches.Count >= MAX_MATCHES then
+    if Matches.Count >= MaxResults then
       Exit;
     if FindFirst(AFullPath, faAnyFile, FR) = 0 then
     try
@@ -6444,12 +6445,23 @@ begin
   if AArgs = nil then
     Exit;
   Pattern := AArgs.Get('pattern', '');
+  if Pattern = string.Empty then
+    Pattern := AArgs.Get('query', '');
+
   IncludePattern := Trim(AArgs.Get('include', ''));
-  if Pattern = '' then
+
+  if Pattern = string.Empty then
   begin
-    Result := '{"error": "pattern required"}';
+    Result := '{"error": "pattern or query required"}';
     Exit;
   end;
+
+  // Clamp the requested result limit
+  MaxResults := AArgs.Get('max_results', MAX_MATCHES);
+  if MaxResults < 1 then
+    MaxResults := 1
+  else if MaxResults > MAX_MATCHES then
+    MaxResults := MAX_MATCHES;
   RelPath := AArgs.Get('path', '');
   Recursive := GetBoolArg(AArgs, 'recursive', True);
   // Auto-enable regex mode when pattern clearly uses regex syntax
@@ -6515,7 +6527,7 @@ begin
       FindAllFiles(Files, FullPath, '*.*', Recursive);
       for I := 0 to Files.Count - 1 do
       begin
-        if Matches.Count >= MAX_MATCHES then
+        if Matches.Count >= MaxResults then
           Break;
         if TotalBytes >= MAX_TOTAL_BYTES then
         begin
@@ -6545,9 +6557,9 @@ begin
       if (not TimedOut) and (FilesScanned >= MAX_FILES_SCANNED) then
         ScanLimited := True;
     end;
-    Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >= MAX_MATCHES, 'true', 'false') +
-      ', "scanned_files": ' + IntToStr(FilesScanned) + ', "scan_limited": ' + BoolToStr(ScanLimited, 'true', 'false') +
-      ', "timed_out": ' + BoolToStr(TimedOut, 'true', 'false');
+    Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >=
+      MaxResults, 'true', 'false') + ', "scanned_files": ' + IntToStr(FilesScanned) + ', "scan_limited": ' +
+      BoolToStr(ScanLimited, 'true', 'false') + ', "timed_out": ' + BoolToStr(TimedOut, 'true', 'false');
     if AutoRegex then
       Result := Result + ', "auto_regex": true';
     Result := Result + ', "matches": ' + Matches.AsJSON + '}';
@@ -6949,6 +6961,26 @@ begin
         Exit;
       end;
     end;
+
+    // Normalize built-in tool names and resolve common aliases
+    CleanName := LowerCase(CleanName);
+
+    if (CleanName = 'search') or (CleanName = 'search_text') then
+      CleanName := 'grep'
+    else if (CleanName = 'search_files') or (CleanName = 'find_files') then
+      CleanName := 'glob'
+    else if CleanName = 'ls' then
+      CleanName := 'list_files'
+    else if CleanName = 'read' then
+      CleanName := 'read_file'
+    else if CleanName = 'open' then
+      CleanName := 'open_file'
+    else if CleanName = 'write' then
+      CleanName := 'write_file'
+    else if CleanName = 'edit' then
+      CleanName := 'edit_file'
+    else if CleanName = 'delete' then
+      CleanName := 'delete_file';
 
     if afFileTools in FFeatures then
     begin
