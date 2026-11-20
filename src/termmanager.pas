@@ -211,8 +211,8 @@ type
     procedure SetColors(const AValue: TTermColorScheme);
     // Assigns the shell command history
     procedure SetShellHistory(const AValue: TAgentShellHistory);
-    // Handles help, help agent, and ? alias
-    procedure HandleHelpCommand(const AArg: string);
+    // Handles short and full help commands
+    procedure HandleHelpCommand(AShort: boolean);
     // Handles set <name> <value>
     procedure HandleSetCommand(const AArg: string);
     // Handles get <name>
@@ -1299,7 +1299,7 @@ begin
 
   Result := (Cmd = 'cls') or (Cmd = 'clear') or (Cmd = 'new') or (Cmd = 'exit') or (Cmd = 'quit') or
     (Cmd = 'help') or (Cmd = 'h') or (Cmd = '?') or (Cmd = 'config') or (Cmd = 'settings') or (Cmd = 'get') or
-    (Cmd = 'history') or ((Cmd = 'set') and (SubCmd = 'chat'));
+    (Cmd = 'history') or ((Cmd = 'set') and ((SubCmd = 'chat') or (SubCmd = 'chatprompt')));
 end;
 
 function TCustomTermManager.IsChatControlCommand(const ACommand: string): boolean;
@@ -1996,7 +1996,7 @@ begin
       DoOutput(Format('%4d  %s%s', [I + 1, FHistory[I], LineEnding]), False);
   end
   else if (Cmd = 'help') or (Cmd = 'h') or (Cmd = '?') then
-    HandleHelpCommand(Arg)
+    HandleHelpCommand(Cmd <> 'help')
   else if Cmd = 'set' then
     HandleSetCommand(Arg)
   else if Cmd = 'get' then
@@ -2014,104 +2014,12 @@ begin
     DoOutput('Unknown builtin: ' + Cmd + LineEnding, True);
 end;
 
-procedure TCustomTermManager.HandleHelpCommand(const AArg: string);
-var
-  Topic: string;
-
-// Writes a hint row with a label and a short description
-  procedure Item(const ALabel, ADesc: string);
-  var
-    Pad: string;
-  begin
-    Pad := '  ' + ALabel;
-    while Length(Pad) < 34 do
-      Pad := Pad + ' ';
-    DoOutput(Pad + ADesc + LineEnding, False);
-  end;
-
+procedure TCustomTermManager.HandleHelpCommand(AShort: boolean);
 begin
-  Topic := LowerCase(Trim(AArg));
-
-  if Topic = 'agent' then
-  begin
-    DoOutput('Commands' + LineEnding, False);
-    Item('cd [path]', 'change working directory');
-    Item('pwd', 'show working directory');
-    Item('cls / clear', 'clear the current chat');
-    Item('new', 'start a new chat');
-    Item('history', 'show command history');
-    Item('exit / quit', 'exit the console');
-    Item('set <name> <value>', 'change a property');
-    Item('get <name>', 'inspect a property');
-    Item('set chat <name>', 'rename the active chat');
-    Item('config', 'show current settings');
-    Item('models', 'list available models');
-    Item('ollama help', 'model management commands');
-    Item('help / ?', 'show short help');
-    DoOutput(LineEnding, False);
-
-    DoOutput(FormatAgentHelp + LineEnding, False);
-
-    DoOutput('Terminal settings' + LineEnding, False);
-    Item('term.path', 'working directory');
-    Item('term.shell', 'executable, e.g. cmd.exe or pwsh.exe');
-    Item('term.showthinking', 'on|off, show agent reasoning text');
-    Item('term.commandtimeout', 'ms, user command timeout, 0 = none');
-    Item('term.maxcapturebytes', 'cap on captured output per command');
-    Item('term.agentcommandtimeout', 'timeout for agent commands (ms, 0 = unlimited)');
-    DoOutput(LineEnding, False);
-
-    DoOutput('Examples' + LineEnding, False);
-    DoOutput('  set baseurl http://192.168.1.10:11434' + LineEnding, False);
-    DoOutput('  set model qwen2.5:7b' + LineEnding, False);
-    DoOutput('  set tools filetools, exec' + LineEnding, False);
-    DoOutput('  set systemprompt from prompt.txt' + LineEnding, False);
-    DoOutput('  get tools' + LineEnding, False);
-    DoOutput(LineEnding, False);
-
-    DoOutput('Keyboard shortcuts' + LineEnding, False);
-    Item('Enter', 'submit input');
-    Item('Shift+Enter', 'insert a new line');
-    Item('Ctrl+Enter', 'insert a new line');
-    Item('Ctrl+N', 'start a new chat');
-    Item('Ctrl+Left/Right', 'switch between chats');
-    Item('Ctrl+Shift+Del', 'delete the active chat');
-    Item('Ctrl+Backspace', 'remove the last input and result');
-    Item('Ctrl+Up/Down', 'navigate command history');
-    Item('Ctrl+Home/End', 'select first/last history entry');
-    Item('Ctrl+Delete', 'delete the current history entry');
-    Item('Ctrl+A', 'select input or copy chat when empty');
-    Item('Ctrl+C', 'copy selection or cancel current input');
-    Item('Ctrl+V', 'paste from clipboard');
-    Item('Shift+Left/Right', 'select text');
-    Item('Left/Right', 'move cursor');
-    Item('Up/Down', 'move vertically or navigate history');
-    Item('Home/End', 'move to line start/end');
-    Item('Escape', 'clear current input');
-  end
+  if AShort then
+    DoOutput(FormatShortHelp + LineEnding, False)
   else
-  begin
-    DoOutput('Commands' + LineEnding, False);
-    Item('cd  pwd', 'change/show working directory');
-    Item('cls  clear', 'clear the current chat');
-    Item('new', 'start a new chat');
-    Item('history', 'show command history');
-    Item('set  get  config', 'manage and view settings');
-    Item('models  ollama', 'model management');
-    Item('help  help agent  ?', 'show help');
-
-    DoOutput(LineEnding + 'Shortcuts' + LineEnding, False);
-    Item('Ctrl+N', 'start a new chat');
-    Item('Ctrl+Left/Right', 'switch between chats');
-    Item('Ctrl+Shift+Del', 'delete the active chat');
-    Item('Ctrl+Backspace', 'remove the last input and result');
-
-    DoOutput(LineEnding, False);
-    DoOutput('Type "config" to view current settings.' + LineEnding, False);
-    DoOutput('Type "help agent" for details and all available commands and shortcuts.' + LineEnding, False);
-  end;
-
-  DoOutput(LineEnding, False);
+    DoOutput(FormatFullHelp + LineEnding, False);
 end;
 
 procedure TCustomTermManager.HandleSetCommand(const AArg: string);
@@ -2122,7 +2030,7 @@ begin
   if Trim(AArg) = '' then
   begin
     DoOutput('usage: set <name> <value>' + LineEnding, True);
-    DoOutput('use "help agent" for property lists' + LineEnding, True);
+    DoOutput('use "help" for property lists' + LineEnding, True);
     Exit;
   end;
 
@@ -2163,6 +2071,21 @@ begin
     FAgent.ActiveChat.Name := PropValue;
     DoOutput('chat = ' + PropValue + LineEnding, False);
   end
+  else if LowerCase(PropName) = 'chatprompt' then
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    begin
+      DoOutput('error: agent is not attached' + LineEnding, True);
+      Exit;
+    end;
+
+    // Strip surrounding quotes to allow clearing the prompt
+    if (Length(PropValue) >= 2) and (PropValue[1] = '"') and (PropValue[Length(PropValue)] = '"') then
+      PropValue := Copy(PropValue, 2, Length(PropValue) - 2);
+
+    FAgent.ActiveChat.ChatPrompt := PropValue;
+    DoOutput('chatprompt = ' + PropValue + LineEnding, False);
+  end
   // term.* properties are handled locally, everything else goes to the agent
   else if LowerCase(Copy(PropName, 1, 5)) = 'term.' then
     HandleTermSet(Copy(PropName, 6, MaxInt), PropValue)
@@ -2179,9 +2102,21 @@ begin
   if Trim(AArg) = '' then
   begin
     DoOutput('usage: get <name>' + LineEnding, True);
-    DoOutput('use "help agent" or "help term" for property lists' + LineEnding, True);
+    DoOutput('use "help" for property lists' + LineEnding, True);
     Exit;
   end;
+  if LowerCase(Trim(AArg)) = 'chatprompt' then
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    begin
+      DoOutput('error: agent is not attached' + LineEnding, True);
+      Exit;
+    end;
+
+    DoOutput('chatprompt = ' + FAgent.ActiveChat.ChatPrompt + LineEnding, False);
+    Exit;
+  end;
+
   // term.* properties are handled locally, everything else goes to the agent
   if LowerCase(Copy(Trim(AArg), 1, 5)) = 'term.' then
   begin

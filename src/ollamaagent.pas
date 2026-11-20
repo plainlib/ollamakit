@@ -71,6 +71,7 @@ type
     FName: string;
     FWorkingDirectory: string;
     FHistory: string;
+    FChatPrompt: string;
     FTerminalHistory: TStringList;
     FShellLog: TStringList;
     FTerminalOutput: string;
@@ -85,6 +86,8 @@ type
     property Name: string read FName write FName;
     property WorkingDirectory: string read FWorkingDirectory write FWorkingDirectory;
     property History: string read FHistory write FHistory;
+    // Additional system instructions for this chat
+    property ChatPrompt: string read FChatPrompt write FChatPrompt;
     property TerminalHistory: TStringList read FTerminalHistory;
     property ShellLog: TStringList read FShellLog;
     property TerminalOutput: string read FTerminalOutput write FTerminalOutput;
@@ -2715,6 +2718,7 @@ begin
   FName := AName;
   FWorkingDirectory := string.Empty;
   FHistory := string.Empty;
+  FChatPrompt := string.Empty;
   FTerminalHistory := TStringList.Create;
   FShellLog := TStringList.Create;
   FTerminalOutput := string.Empty;
@@ -3106,6 +3110,7 @@ begin
       ChatObj.Add('name', Chat.Name);
       ChatObj.Add('working_directory', Chat.WorkingDirectory);
       ChatObj.Add('history', Chat.History);
+      ChatObj.Add('chat_prompt', Chat.ChatPrompt);
       ChatObj.Add('context_used', Chat.ContextUsed);
       ChatObj.Add('context_total', Chat.ContextTotal);
       ChatObj.Add('terminal_output', Chat.TerminalOutput);
@@ -3199,6 +3204,7 @@ begin
         Chat := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
         Chat.WorkingDirectory := ChatObj.Get('working_directory', string.Empty);
         Chat.History := ChatObj.Get('history', string.Empty);
+        Chat.ChatPrompt := ChatObj.Get('chat_prompt', string.Empty);
         Chat.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
         Chat.ContextUsed := ChatObj.Get('context_used', 0);
         Chat.ContextTotal := ChatObj.Get('context_total', 0);
@@ -3458,6 +3464,7 @@ begin
     ChatObj.Add('name', AChat.Name);
     ChatObj.Add('working_directory', AChat.WorkingDirectory);
     ChatObj.Add('history', AChat.History);
+    ChatObj.Add('chat_prompt', AChat.ChatPrompt);
     ChatObj.Add('context_used', AChat.ContextUsed);
     ChatObj.Add('context_total', AChat.ContextTotal);
     ChatObj.Add('terminal_output', AChat.TerminalOutput);
@@ -3552,6 +3559,7 @@ begin
       Result := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
       Result.WorkingDirectory := ChatObj.Get('working_directory', FRootPath);
       Result.History := ChatObj.Get('history', string.Empty);
+      Result.ChatPrompt := ChatObj.Get('chat_prompt', string.Empty);
       Result.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
       Result.ContextUsed := ChatObj.Get('context_used', 0);
       Result.ContextTotal := ChatObj.Get('context_total', 0);
@@ -3743,6 +3751,10 @@ begin
   Result := StringReplace(Result, '{tools}', ToolList, [rfReplaceAll]);
   // Drop trailing whitespace so the environment block starts on a clean line
   Result := TrimRight(Result);
+
+  // Append chat-specific system instructions
+  if Assigned(FActiveChat) and (Trim(FActiveChat.ChatPrompt) <> string.Empty) then
+    Result := Result + #10#10 + FActiveChat.ChatPrompt;
 
   // Platform identity is compiled in, not guessed at runtime
   {$IFDEF WINDOWS}

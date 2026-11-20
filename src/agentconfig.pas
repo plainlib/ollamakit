@@ -13,8 +13,11 @@ interface
 uses
   Classes, SysUtils, OllamaAgent, OllamaManager;
 
-// Returns multi-line help text describing set/get/config commands and properties
-function FormatAgentHelp: string;
+// Returns short help text with essential commands and shortcuts
+function FormatShortHelp: string;
+
+// Returns full help text with all commands, settings, examples and shortcuts
+function FormatFullHelp: string;
 
 // Returns multi-line list of current agent settings
 function FormatAgentConfig(AAgent: TCustomOllamaAgent): string;
@@ -312,7 +315,38 @@ begin
   end;
 end;
 
-function FormatAgentHelp: string;
+function FormatShortHelp: string;
+var
+  T: TStringList;
+begin
+  T := TStringList.Create;
+  try
+    T.Add('Commands');
+    T.Add('  cd [path]       Change working directory');
+    T.Add('  pwd             Show working directory');
+    T.Add('  cls / clear     Clear current chat');
+    T.Add('  new             Start a new chat');
+    T.Add('  history         Show command history');
+    T.Add('  set / get       Manage settings');
+    T.Add('  config          Show current settings');
+    T.Add('  models          List available models');
+    T.Add('  ollama          Model management');
+    T.Add('  exit / quit     Exit the console');
+    T.Add('');
+    T.Add('Shortcuts');
+    T.Add('  Ctrl+N          Start a new chat');
+    T.Add('  Ctrl+Left/Right Switch between chats');
+    T.Add('  Ctrl+Shift+Del  Delete the active chat');
+    T.Add('  Ctrl+Backspace  Remove the last input and result');
+    T.Add('');
+    T.Add('Type "help" for the full help.');
+    Result := T.Text;
+  finally
+    T.Free;
+  end;
+end;
+
+function FormatFullHelp: string;
 var
   T: TStringList;
 
@@ -329,7 +363,7 @@ var
     Pad: string;
   begin
     Pad := '  ' + AName;
-    while Length(Pad) < 24 do
+    while Length(Pad) < 34 do
       Pad := Pad + ' ';
     T.Add(Pad + ADesc);
   end;
@@ -337,7 +371,24 @@ var
 begin
   T := TStringList.Create;
   try
-    T.Add('Agent settings  set <name> <value>  get <name>  config  models');
+    T.Add('Commands');
+
+    Row('cd [path]', 'change working directory');
+    Row('pwd', 'show working directory');
+    Row('cls / clear', 'clear the current chat');
+    Row('new', 'start a new chat');
+    Row('history', 'show command history');
+    Row('exit / quit', 'exit the console');
+    Row('set <name> <value>', 'change a property');
+    Row('get <name>', 'inspect a property');
+    Row('set chat <name>', 'rename the active chat');
+    Row('set chatprompt <text>', 'set additional chat instructions');
+    Row('get chatprompt', 'show additional chat instructions');
+    Row('config', 'show current settings');
+    Row('models', 'list available models');
+    Row('ollama help', 'model management commands');
+    Row('help', 'show full help');
+    Row('h / ?', 'show short help');
 
     Header('OllamaManager');
     Row('baseurl', 'server URL, e.g. http://localhost:11434');
@@ -376,11 +427,49 @@ begin
     Row('web.blockprivateips', 'block private IPv4');
     Row('web.allowedhosts', 'whitelist, "none" = any');
 
+    Header('Terminal settings');
+    Row('term.path', 'working directory');
+    Row('term.shell', 'executable, e.g. cmd.exe or pwsh.exe');
+    Row('term.showthinking', 'on|off, show agent reasoning text');
+    Row('term.commandtimeout', 'ms, user command timeout, 0 = none');
+    Row('term.maxcapturebytes', 'captured output limit per command');
+    Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
+
     Header('Values');
     T.Add('  boolean   on off true false yes no 1 0');
     T.Add('  list      comma separated, "none" clears');
     T.Add('  text      single line, or "from <file>"');
     T.Add('  runtime   numctx and active are not saved');
+
+    Header('Examples');
+    T.Add('  set baseurl http://192.168.1.10:11434');
+    T.Add('  set model qwen2.5:7b');
+    T.Add('  set tools filetools, exec');
+    T.Add('  set systemprompt from prompt.txt');
+    T.Add('  set chat My project');
+    T.Add('  set chatprompt You are an expert Pascal developer');
+    T.Add('  get chatprompt');
+    T.Add('  get tools');
+
+    Header('Keyboard shortcuts');
+    Row('Enter', 'submit input');
+    Row('Shift+Enter', 'insert a new line');
+    Row('Ctrl+Enter', 'insert a new line');
+    Row('Ctrl+N', 'start a new chat');
+    Row('Ctrl+Left/Right', 'switch between chats');
+    Row('Ctrl+Shift+Del', 'delete the active chat');
+    Row('Ctrl+Backspace', 'remove the last input and result');
+    Row('Ctrl+Up/Down', 'navigate command history');
+    Row('Ctrl+Home/End', 'select first/last history entry');
+    Row('Ctrl+Delete', 'delete the current history entry');
+    Row('Ctrl+A', 'select input or copy chat when empty');
+    Row('Ctrl+C', 'copy selection or cancel current input');
+    Row('Ctrl+V', 'paste from clipboard');
+    Row('Shift+Left/Right', 'select text');
+    Row('Left/Right', 'move cursor');
+    Row('Up/Down', 'move vertically or navigate history');
+    Row('Home/End', 'move to line start/end');
+    Row('Escape', 'clear current input');
 
     Result := T.Text;
   finally
@@ -494,7 +583,7 @@ begin
   end;
   if not FindProperty(AName, Canonical) then
   begin
-    AError := 'unknown property: ' + AName + ', use "help agent" for list';
+    AError := 'unknown property: ' + AName + ', use "help" for list';
     Exit;
   end;
   // Manager-owned properties
@@ -601,7 +690,7 @@ begin
   end;
   if not FindProperty(AName, Canonical) then
   begin
-    AError := 'unknown property: ' + AName + ', use "help agent" for list';
+    AError := 'unknown property: ' + AName + ', use "help" for list';
     Exit;
   end;
   Value := Trim(AValue);
