@@ -5012,9 +5012,16 @@ begin
           end;
           if IsModifier or HasMore then
           begin
-            Line := Line + LineEnding;
-            CursorPos := Length(Line);
-            ClearSelection;
+            // Replace selection and insert the line ending at the cursor
+            if HasSelection then
+            begin
+              Delete(Line, SelStart + 1, SelEnd - SelStart);
+              CursorPos := SelStart;
+              ClearSelection;
+            end;
+
+            Insert(LineEnding, Line, CursorPos + 1);
+            Inc(CursorPos, Length(LineEnding));
           end
           else
           begin
