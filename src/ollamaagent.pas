@@ -278,7 +278,7 @@ type
     // Creates a directory at the specified path
     function DoCreateDirectory(AArgs: TJSONObject): string; virtual;
     // Finds files and directories matching the specified criteria
-    function DoFindFiles(AArgs: TJSONObject): string; virtual;
+    function DoGlob(AArgs: TJSONObject): string; virtual;
     // Searches file contents using grep
     function DoGrep(AArgs: TJSONObject): string; virtual;
     // Reads the nearest AGENTS.md walking up from the given path
@@ -496,7 +496,7 @@ end;
 function IsParallelSafeTool(const AName: string): boolean;
 begin
   Result := (AName = 'read_file') or (AName = 'read_file_preview') or (AName = 'read_file_lines') or
-    (AName = 'list_files') or (AName = 'find_files') or (AName = 'grep') or (AName = 'file_info') or
+    (AName = 'list_files') or (AName = 'glob') or (AName = 'grep') or (AName = 'file_info') or
     (AName = 'read_agents_md') or (AName = 'web_fetch') or (AName = 'web_search');
 end;
 
@@ -4242,7 +4242,7 @@ begin
         'List files in a directory, non-recursive. Returns {files: [...], agents_md?: "name"} ' +
         'when a local ' + FAgentsFileName + ' exists in that directory.',
         '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative directory"}}}');
-      AddTool(Arr, 'find_files',
+      AddTool(Arr, 'glob',
         'Find files by glob (* and ?). Recursive by default, do NOT add ** prefix. ' +
         '[abc] classes unsupported. Capped at 2000 results.',
         '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
@@ -4355,7 +4355,7 @@ begin
     if afFileTools in FFeatures then
     begin
       Names.Add('list_files');
-      Names.Add('find_files');
+      Names.Add('glob');
       Names.Add('grep');
       Names.Add('read_agents_md');
       Names.Add('open_file');
@@ -6022,100 +6022,307 @@ begin
   end;
 end;
 
-function TCustomOllamaAgent.DoFindFiles(AArgs: TJSONObject): string;
+function TCustomOllamaAgent.DoGlob(AArgs: TJSONObject): string;
 const
   MAX_RESULTS = 2000;
   MAX_TOTAL_BYTES = 50000;
 var
-  RelPath, FullPath, Pattern, NormPattern: string;
+  RelPath, FullPath, Pattern, BaseRoot, RelativePath: string;
   Recursive: boolean;
-  Files: TStringList;
-  Patterns: TStringList;
+  Files, Patterns, Matches: TStringList;
   Arr: TJSONArray;
   I, P, TotalBytes: integer;
-  BaseRoot: string;
   Truncated: boolean;
+  Regex: TRegExpr;
+
+  function EscapeRegexChar(const AChar: char): string;
+  begin
+    if AChar in ['\', '.', '+', '(', ')', '^', '$', '|'] then
+      Result := '\' + AChar
+    else
+      Result := AChar;
+  end;
+
+  // Converts a glob pattern into an anchored regular expression
+  function GlobToRegex(const APattern: string): string;
+  var
+    J, ClassEnd: integer;
+    C: char;
+    ClassContent: string;
+  begin
+    Result := '^';
+    J := 1;
+
+    while J <= Length(APattern) do
+    begin
+      C := APattern[J];
+
+      case C of
+        '*':
+        begin
+          if (J < Length(APattern)) and (APattern[J + 1] = '*') then
+          begin
+            Inc(J, 2);
+
+            // **/ also matches files in the current directory
+            if (J <= Length(APattern)) and (APattern[J] = '/') then
+            begin
+              Result := Result + '(.*\/)?';
+              Inc(J);
+            end
+            else
+              Result := Result + '.*';
+          end
+          else
+          begin
+            Result := Result + '[^/]*';
+            Inc(J);
+          end;
+        end;
+
+        '?':
+        begin
+          Result := Result + '[^/]';
+          Inc(J);
+        end;
+
+        '[':
+        begin
+          ClassEnd := J + 1;
+          while (ClassEnd <= Length(APattern)) and (APattern[ClassEnd] <> ']') do
+            Inc(ClassEnd);
+
+          if ClassEnd > Length(APattern) then
+          begin
+            Result := Result + '\[';
+            Inc(J);
+          end
+          else
+          begin
+            ClassContent := Copy(APattern, J + 1, ClassEnd - J - 1);
+
+            if ClassContent = string.Empty then
+              Result := Result + '\['
+            else
+            begin
+              if ClassContent[1] = '!' then
+                ClassContent[1] := '^';
+
+              Result := Result + '[' + ClassContent + ']';
+              J := ClassEnd;
+            end;
+
+            Inc(J);
+          end;
+        end;
+
+        else
+        begin
+          Result := Result + EscapeRegexChar(C);
+          Inc(J);
+        end;
+      end;
+    end;
+
+    Result := Result + '$';
+  end;
+
+  // Expands brace alternatives, including nested expressions
+  procedure ExpandPattern(const APattern: string);
+  var
+    OpenPos, ClosePos, J, Depth, StartPos: integer;
+    Prefix, Suffix, Body, Item: string;
+  begin
+    OpenPos := Pos('{', APattern);
+    if OpenPos = 0 then
+    begin
+      Patterns.Add(APattern);
+      Exit;
+    end;
+
+    Depth := 0;
+    ClosePos := 0;
+
+    for J := OpenPos to Length(APattern) do
+    begin
+      if APattern[J] = '{' then
+        Inc(Depth)
+      else if APattern[J] = '}' then
+      begin
+        Dec(Depth);
+        if Depth = 0 then
+        begin
+          ClosePos := J;
+          Break;
+        end;
+      end;
+    end;
+
+    if ClosePos = 0 then
+    begin
+      Patterns.Add(APattern);
+      Exit;
+    end;
+
+    Prefix := Copy(APattern, 1, OpenPos - 1);
+    Suffix := Copy(APattern, ClosePos + 1, MaxInt);
+    Body := Copy(APattern, OpenPos + 1, ClosePos - OpenPos - 1);
+
+    Depth := 0;
+    StartPos := 1;
+
+    for J := 1 to Length(Body) + 1 do
+    begin
+      if J <= Length(Body) then
+      begin
+        if Body[J] = '{' then
+          Inc(Depth)
+        else if Body[J] = '}' then
+          Dec(Depth);
+      end;
+
+      if (J > Length(Body)) or ((Body[J] = ',') and (Depth = 0)) then
+      begin
+        Item := Copy(Body, StartPos, J - StartPos);
+        StartPos := J + 1;
+        ExpandPattern(Prefix + Item + Suffix);
+      end;
+    end;
+  end;
+
 begin
   Result := '{"error": "invalid arguments"}';
+
   if AArgs = nil then
     Exit;
+
   RelPath := AArgs.Get('path', '');
   Pattern := AArgs.Get('pattern', '*');
   Recursive := GetBoolArg(AArgs, 'recursive', True);
+
   if Pattern = '' then
     Pattern := '*';
-  if Pattern = '' then
-    Pattern := '*';
-  // Handle recursive glob prefix before splitting the path and mask
-  if (Copy(Pattern, 1, 3) = '**/') or (Copy(Pattern, 1, 3) = '**\') then
-  begin
-    Delete(Pattern, 1, 3);
+
+  // Normalize separators before processing the pattern
+  Pattern := StringReplace(Pattern, '\', '/', [rfReplaceAll]);
+
+  // A ** pattern always requires recursive traversal
+  if Pos('**', Pattern) > 0 then
     Recursive := True;
-  end;
-  // Accept path-style patterns like "src/*.pas" by merging them into the search root
-  P := LastDelimiter('/' + PathDelim, Pattern);
+
+  // Support path-style patterns such as src/*.pas
+  P := LastDelimiter('/', Pattern);
   if P > 0 then
   begin
     if RelPath <> '' then
       RelPath := IncludeTrailingPathDelimiter(RelPath) + Copy(Pattern, 1, P - 1)
     else
       RelPath := Copy(Pattern, 1, P - 1);
+
     Pattern := Copy(Pattern, P + 1, MaxInt);
+
     if Pattern = '' then
       Pattern := '*';
   end;
+
   FullPath := SafePath(RelPath);
   if FullPath = '' then
   begin
     Result := SafePathError;
     Exit;
   end;
+
   if not DirectoryExists(FullPath) then
   begin
     Result := '{"error": "directory not found"}';
     Exit;
   end;
+
   BaseRoot := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
+
   Files := TStringList.Create;
-  Files.Sorted := True;
-  Files.Duplicates := dupIgnore;
+  Patterns := TStringList.Create;
+  Matches := TStringList.Create;
   Arr := TJSONArray.Create;
-  Patterns := ExpandBracePatterns(Pattern);
+  Regex := nil;
+
   try
-    // Run FindAllFiles once per expanded pattern, Files dedupes results
+    Files.Sorted := True;
+    Files.Duplicates := dupIgnore;
+
+    Patterns.Sorted := True;
+    Patterns.Duplicates := dupIgnore;
+
+    Matches.Sorted := True;
+    Matches.Duplicates := dupIgnore;
+
+    ExpandPattern(Pattern);
+
+    // Collect files once; matching is performed against their relative paths
+    FindAllFiles(Files, FullPath, '*', Recursive);
+
+    Regex := TRegExpr.Create;
+
     for P := 0 to Patterns.Count - 1 do
     begin
-      NormPattern := NormalizeGlobPattern(Patterns[P]);
-      if NormPattern <> '' then
-        FindAllFiles(Files, FullPath, NormPattern, Recursive);
+      Regex.Expression := GlobToRegex(Patterns[P]);
+
+      {$IFDEF MSWINDOWS}
+      Regex.ModifierI := True;
+      {$ENDIF}
+
+      for I := 0 to Files.Count - 1 do
+      begin
+        RelativePath := ExtractRelativePath(IncludeTrailingPathDelimiter(FullPath), Files[I]);
+
+        RelativePath := StringReplace(RelativePath, '\', '/', [rfReplaceAll]);
+
+        if Regex.Exec(RelativePath) then
+          Matches.Add(Files[I]);
+
+        // Stop once enough unique matches have been collected
+        if Matches.Count > MAX_RESULTS then
+          Break;
+      end;
+
+      if Matches.Count > MAX_RESULTS then
+        Break;
     end;
-    Files.Sort;
+
     TotalBytes := 0;
     Truncated := False;
-    for I := 0 to Files.Count - 1 do
+
+    for I := 0 to Matches.Count - 1 do
     begin
       if Arr.Count >= MAX_RESULTS then
       begin
         Truncated := True;
         Break;
       end;
+
       if TotalBytes >= MAX_TOTAL_BYTES then
       begin
         Truncated := True;
         Break;
       end;
-      // Explicit find_files must see all files, gitignore filtering is for grep only
-      RelPath := RelativeToRoot(BaseRoot, Files[I]);
+
+      RelPath := RelativeToRoot(BaseRoot, Matches[I]);
+
       if IsJunkFileForFind(RelPath) then
         Continue;
+
       Arr.Add(RelPath);
       Inc(TotalBytes, Length(RelPath) + 4);
     end;
+
     Result := '{"count": ' + IntToStr(Arr.Count) + ', "truncated": ' + BoolToStr(Truncated, 'true', 'false') +
       ', "files": ' + Arr.AsJSON + '}';
+
   finally
-    Patterns.Free;
+    Regex.Free;
     Arr.Free;
+    Matches.Free;
+    Patterns.Free;
     Files.Free;
   end;
 end;
@@ -6733,8 +6940,8 @@ begin
     begin
       if CleanName = 'list_files' then
         Exit(DoListFiles(Args))
-      else if CleanName = 'find_files' then
-        Exit(DoFindFiles(Args))
+      else if CleanName = 'glob' then
+        Exit(DoGlob(Args))
       else if CleanName = 'grep' then
         Exit(DoGrep(Args))
       else if CleanName = 'read_agents_md' then
@@ -6836,8 +7043,8 @@ var
 // Returns a replacement hint for known aliases from other agent frameworks
   function SuggestFor(const AName: string): string;
   begin
-    if (AName = 'glob') or (AName = 'search_files') or (AName = 'find') then
-      Exit('use find_files with a glob pattern like "*.pas" or "src/*.md"');
+    if (AName = 'glob') or (AName = 'search_files') or (AName = 'find') or (AName = 'find_files') then
+      Exit('use glob with a pattern like "*.pas" or "src/*.md"');
     if (AName = 'bash') or (AName = 'shell') or (AName = 'run') or (AName = 'execute') then
       Exit('use exec_command');
     if (AName = 'read') or (AName = 'view') or (AName = 'open') then
