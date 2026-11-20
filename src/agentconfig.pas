@@ -399,7 +399,7 @@ var
     Col: string;
   begin
     Col := '  ' + AName;
-    while Length(Col) < 24 do
+    while Length(Col) < 34 do
       Col := Col + ' ';
     T.Add(Col + ': ' + AValue);
   end;

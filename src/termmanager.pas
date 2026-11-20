@@ -2260,12 +2260,12 @@ var
 // Adds an aligned setting row
   procedure Row(const AName, AValue: string);
   var
-    Pad: string;
+    Col: string;
   begin
-    Pad := '  ' + AName;
-    while Length(Pad) < 24 do
-      Pad := Pad + ' ';
-    T.Add(Pad + AValue);
+    Col := '  ' + AName;
+    while Length(Col) < 34 do
+      Col := Col + ' ';
+    T.Add(Col + ': ' + AValue);
   end;
 
 begin
