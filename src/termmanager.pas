@@ -4377,7 +4377,7 @@ var
   C: WideChar;
   Wide: UnicodeString;
   LastRedrawRows: Integer;
-  HasMore, IsModifier, ShiftPressed, CtrlPressed: Boolean;
+  HasMore, IsModifier, ShiftPressed, CtrlPressed, AltPressed: Boolean;
   SelAnchor, SelStart, SelEnd: Integer;
   HasSelection: Boolean;
   MessageNavIndex: integer;
@@ -4418,6 +4418,13 @@ var
     if MaxTop < 0 then
       MaxTop := 0;
 
+    // Keep the input prompt inside the viewport
+    NewTop := PromptRow + LastRedrawRows - ViewHeight - 1;
+    if NewTop < 0 then
+      NewTop := 0;
+    if MaxTop > NewTop then
+      MaxTop := NewTop;
+
     case ADirection of
       -2: NewTop := 0;
        2:
@@ -4450,39 +4457,53 @@ var
     Info: TConsoleScreenBufferInfo;
     Rect: SMALL_RECT;
     Mark: TTerminalOutputMark;
-    ViewHeight, MaxTop, NewTop: integer;
+    ViewHeight, MaxTop, NewTop, MarksCount: integer;
+    TargetIndex: integer;
   begin
     if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
       Exit;
 
+    MarksCount := Length(FAgent.ActiveChat.OutputMarks);
+
+    // The position after the last message represents the input prompt
     if ADirection < 0 then
     begin
-      while MessageNavIndex > 0 do
+      TargetIndex := MessageNavIndex;
+
+      if TargetIndex > MarksCount then
+        TargetIndex := MarksCount;
+
+      Dec(TargetIndex);
+
+      while TargetIndex >= 0 do
       begin
-        Dec(MessageNavIndex);
-        Mark := FAgent.ActiveChat.OutputMarks[MessageNavIndex];
+        Mark := FAgent.ActiveChat.OutputMarks[TargetIndex];
         if Mark.ScreenRow >= 0 then
           Break;
+        Dec(TargetIndex);
       end;
+
+      if TargetIndex < 0 then
+        Exit;
     end
     else
     begin
-      while MessageNavIndex < Length(FAgent.ActiveChat.OutputMarks) - 1 do
+      TargetIndex := MessageNavIndex + 1;
+
+      while TargetIndex < MarksCount do
       begin
-        Inc(MessageNavIndex);
-        Mark := FAgent.ActiveChat.OutputMarks[MessageNavIndex];
+        Mark := FAgent.ActiveChat.OutputMarks[TargetIndex];
         if Mark.ScreenRow >= 0 then
           Break;
+        Inc(TargetIndex);
       end;
+
+      // Move to the input prompt after the last available message
+      if TargetIndex >= MarksCount then
+        TargetIndex := MarksCount;
     end;
 
-    if (MessageNavIndex < 0) or
-      (MessageNavIndex >= Length(FAgent.ActiveChat.OutputMarks)) then
-      Exit;
-
-    Mark := FAgent.ActiveChat.OutputMarks[MessageNavIndex];
-    if Mark.ScreenRow < 0 then
-      Exit;
+    MessageNavIndex := TargetIndex;
 
     Info := Default(TConsoleScreenBufferInfo);
     if not GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
@@ -4497,16 +4518,29 @@ var
     if MaxTop < 0 then
       MaxTop := 0;
 
-    NewTop := Mark.ScreenRow - ViewHeight div 2;
-
+    // Keep the input prompt inside the viewport
+    NewTop := PromptRow + LastRedrawRows - ViewHeight - 1;
     if NewTop < 0 then
-      NewTop := 0
-    else if NewTop > MaxTop then
-      NewTop := MaxTop;
+      NewTop := 0;
+    if MaxTop > NewTop then
+      MaxTop := NewTop;
+
+    if MessageNavIndex >= MarksCount then
+      // Return to the input prompt after the last message
+      NewTop := MaxTop
+    else
+    begin
+      Mark := FAgent.ActiveChat.OutputMarks[MessageNavIndex];
+      NewTop := Mark.ScreenRow - ViewHeight div 2;
+
+      if NewTop < 0 then
+        NewTop := 0
+      else if NewTop > MaxTop then
+        NewTop := MaxTop;
+    end;
 
     Rect.Top := NewTop;
     Rect.Bottom := NewTop + ViewHeight - 1;
-
     SetConsoleWindowInfo(GetStdHandle(STD_OUTPUT_HANDLE), True, Rect);
   end;
 
@@ -5135,6 +5169,8 @@ begin
     ShiftPressed := (Rec.Event.KeyEvent.dwControlKeyState and SHIFT_PRESSED) <> 0;
     CtrlPressed := (Rec.Event.KeyEvent.dwControlKeyState and
       (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+    AltPressed := (Rec.Event.KeyEvent.dwControlKeyState and
+      (LEFT_ALT_PRESSED or RIGHT_ALT_PRESSED)) <> 0;
 
     // Ignore standalone modifier keys to preserve the current viewport
     if Rec.Event.KeyEvent.wVirtualKeyCode in [VK_SHIFT, VK_CONTROL, VK_MENU] then
@@ -5374,16 +5410,20 @@ begin
         end;
       VK_PRIOR:
         begin
-          if ShiftPressed and not CtrlPressed then
+          if AltPressed and not CtrlPressed then
             NavigateMessage(-1)
+          else if ShiftPressed and not CtrlPressed then
+            ScrollOutput(-3)
           else
             ScrollOutput(-1);
           Continue;
         end;
       VK_NEXT:
         begin
-          if ShiftPressed and not CtrlPressed then
+          if AltPressed and not CtrlPressed then
             NavigateMessage(1)
+          else if ShiftPressed and not CtrlPressed then
+            ScrollOutput(3)
           else
             ScrollOutput(1);
           Continue;
@@ -5449,12 +5489,7 @@ begin
           end;
         end;
       VK_UP:
-        if ShiftPressed then
-        begin
-          ScrollOutput(-3);
-          Continue;
-        end
-        else if CtrlPressed then
+        if CtrlPressed then
         begin
           if HistIndex = FHistory.Count then
           begin
@@ -5506,12 +5541,7 @@ begin
           end;
         end;
       VK_DOWN:
-        if ShiftPressed then
-        begin
-          ScrollOutput(3);
-          Continue;
-        end
-        else if CtrlPressed then
+        if CtrlPressed then
         begin
           if HistIndex < FHistory.Count - 1 then
           begin
