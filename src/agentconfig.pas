@@ -318,29 +318,50 @@ end;
 function FormatShortHelp: string;
 var
   T: TStringList;
+
+// Adds a section header with a leading blank line
+  procedure Header(const AText: string);
+  begin
+    T.Add('');
+    T.Add(AText);
+  end;
+
+  // Adds an aligned command or shortcut row
+  procedure Row(const AName, ADesc: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + AName;
+    while Length(Pad) < 34 do
+      Pad := Pad + ' ';
+    T.Add(Pad + ADesc);
+  end;
+
 begin
   T := TStringList.Create;
   try
-    T.Add('Commands');
-    T.Add('  cd [path]       Change working directory');
-    T.Add('  pwd             Show working directory');
-    T.Add('  cls / clear     Clear current chat');
-    T.Add('  new             Start a new chat');
-    T.Add('  history         Show command history');
-    T.Add('  set / get       Manage settings');
-    T.Add('  config          Show current settings');
-    T.Add('  models          List available models');
-    T.Add('  ollama          Model management');
-    T.Add('  exit / quit     Exit the console');
-    T.Add('');
-    T.Add('Shortcuts');
-    T.Add('  Ctrl+N          Start a new chat');
-    T.Add('  Ctrl+Left/Right Switch between chats');
-    T.Add('  Ctrl+Shift+Del  Delete the active chat');
-    T.Add('  Ctrl+Backspace  Remove the last input and result');
-    T.Add('  Shift+Up/Down   Scroll output by one line');
-    T.Add('');
-    T.Add('Type "help" for the full help.');
+    Header('Commands');
+    Row('cd [path]', 'Change working directory');
+    Row('pwd', 'Show working directory');
+    Row('cls / clear', 'Clear current chat');
+    Row('new', 'Start a new chat');
+    Row('history', 'Show command history');
+    Row('set / get', 'Manage settings');
+    Row('config', 'Show current settings');
+    Row('models', 'List available models');
+    Row('ollama', 'Model management');
+    Row('exit / quit', 'Exit the console');
+
+    Header('Shortcuts');
+    Row('Ctrl+N', 'Start a new chat');
+    Row('Ctrl+Left/Right', 'Switch between chats');
+    Row('Ctrl+Shift+Del', 'Delete the active chat');
+    Row('Ctrl+Backspace', 'Remove the last input and result');
+    Row('Alt+PageUp/Down', 'Navigate between user messages');
+    Row('Shift+PageUp/Down', 'Scroll output by one line');
+    Row('PageUp/Down', 'Scroll output by page');
+
+    Header('Type "help" for the full help.');
     Result := T.Text;
   finally
     T.Free;
@@ -461,7 +482,9 @@ begin
     Row('Ctrl+Shift+Del', 'delete the active chat');
     Row('Ctrl+Backspace', 'remove the last input and result');
     Row('Ctrl+Up/Down', 'navigate command history');
-    Row('Shift+Up/Down', 'scroll output by one line');
+    Row('Alt+PageUp/Down', 'navigate between user messages');
+    Row('Shift+PageUp/Down', 'scroll output by one line');
+    Row('PageUp/PageDown', 'scroll output by page');
     Row('Ctrl+Home/End', 'select first/last history entry');
     Row('Ctrl+Delete', 'delete the current history entry');
     Row('Ctrl+A', 'select input or copy chat when empty');
