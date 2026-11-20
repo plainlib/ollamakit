@@ -251,11 +251,15 @@ type
     function DoReadFile(AArgs: TJSONObject): string; virtual;
     // Shows first and last lines of a file with a gap marker
     function DoReadFilePreview(AArgs: TJSONObject): string; virtual;
+    // Writes content to a file, creating it if necessary
     function DoWriteFile(AArgs: TJSONObject): string; virtual;
+    // Lists files and directories in the specified path
     function DoListFiles(AArgs: TJSONObject): string; virtual;
-    function DoSearchText(AArgs: TJSONObject): string; virtual;
+    // Reads a specified range of lines from a file
     function DoReadFileLines(AArgs: TJSONObject): string; virtual;
+    // Opens a file using the host application
     function DoOpenFile(AArgs: TJSONObject): string; virtual;
+    // Edits an existing file by replacing specified content
     function DoEditFile(AArgs: TJSONObject): string; virtual;
     // Inserts text before the specified line
     function DoInsertCode(AArgs: TJSONObject): string; virtual;
@@ -263,26 +267,39 @@ type
     function DoReplaceRange(AArgs: TJSONObject): string; virtual;
     // Applies a unified diff to a single file
     function DoApplyPatch(AArgs: TJSONObject): string; virtual;
+    // Deletes the specified file
     function DoDeleteFile(AArgs: TJSONObject): string; virtual;
+    // Moves a file to another location
     function DoMoveFile(AArgs: TJSONObject): string; virtual;
+    // Copies a file to another location
     function DoCopyFile(AArgs: TJSONObject): string; virtual;
+    // Returns file information such as size and modification time
     function DoFileInfo(AArgs: TJSONObject): string; virtual;
+    // Creates a directory at the specified path
     function DoCreateDirectory(AArgs: TJSONObject): string; virtual;
+    // Finds files and directories matching the specified criteria
     function DoFindFiles(AArgs: TJSONObject): string; virtual;
+    // Searches file contents using grep
     function DoGrep(AArgs: TJSONObject): string; virtual;
     // Reads the nearest AGENTS.md walking up from the given path
     function DoReadAgentsMd(AArgs: TJSONObject): string; virtual;
     // Git tools delegate to OnExecCommand, host runs git in its own shell
     function DoGitCommand(const AFullCommand: string): string; virtual;
+    // Returns the current Git working tree status
     function DoGitStatus(AArgs: TJSONObject): string; virtual;
+    // Shows changes in the Git working tree
     function DoGitDiff(AArgs: TJSONObject): string; virtual;
+    // Shows Git commit history
     function DoGitLog(AArgs: TJSONObject): string; virtual;
+    // Creates a Git commit
     function DoGitCommit(AArgs: TJSONObject): string; virtual;
     // Ask user delegates to OnAskUser, host shows the question
     function DoAskUser(AArgs: TJSONObject): string; virtual;
     // Web tools, GET only, subject to WebOptions restrictions
     function DoWebFetchInternal(const AUrl: string; out AContent, AErrorMsg: string): boolean; virtual;
+    // Fetches content from a URL
     function DoWebFetch(AArgs: TJSONObject): string; virtual;
+    // Searches the web for information
     function DoWebSearch(AArgs: TJSONObject): string; virtual;
   public
     constructor Create(AOwner: TComponent); override;
@@ -479,8 +496,8 @@ end;
 function IsParallelSafeTool(const AName: string): boolean;
 begin
   Result := (AName = 'read_file') or (AName = 'read_file_preview') or (AName = 'read_file_lines') or
-    (AName = 'list_files') or (AName = 'find_files') or (AName = 'grep') or (AName = 'search_text') or
-    (AName = 'file_info') or (AName = 'read_agents_md') or (AName = 'web_fetch') or (AName = 'web_search');
+    (AName = 'list_files') or (AName = 'find_files') or (AName = 'grep') or (AName = 'file_info') or
+    (AName = 'read_agents_md') or (AName = 'web_fetch') or (AName = 'web_search');
 end;
 
 // Returns path relative to ARoot for display, or full path when outside root
@@ -4221,54 +4238,10 @@ begin
 
     if afFileTools in FFeatures then
     begin
-      AddTool(Arr, 'read_file_preview',
-        'Preview a text file: first and last N lines plus total size. ' +
-        'Call FIRST on unknown or large (>50KB) files before read_file.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"head":{"type":"integer","description":"First lines, default 30, max 500"},"tail":{"type":"integer","description":"Last lines, default 30, max 500"}},"required":["path"]}');
-      AddTool(Arr, 'read_file_lines',
-        'Read a line range. Use for files >50KB or after read_file truncation. ' +
-        'Up to 5000 lines per call, use increasing start_line for large files.',
-        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"}},"required":["path"]}');
-      AddTool(Arr, 'open_file',
-        'Open a text file and read a specific range of lines. line is 1-based, line_count is the number of lines to read, maximum 5000.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"line":{"type":"integer","description":"First line, 1-based"},"line_count":{"type":"integer","description":"Number of lines to read, maximum 5000"}},"required":["path","line","line_count"]}');
-      AddTool(Arr, 'read_file',
-        'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
-        'prefer read_file_preview or read_file_lines for large ones. Set allow_binary=true only when binary data must be read as text.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"},"allow_binary":{"type":"boolean","description":"Allow reading binary files as text, default false"}},"required":["path"]}');
-      AddTool(Arr, 'write_file', 'Write contents to a file, creates parent directories',
-        '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
       AddTool(Arr, 'list_files',
         'List files in a directory, non-recursive. Returns {files: [...], agents_md?: "name"} ' +
         'when a local ' + FAgentsFileName + ' exists in that directory.',
         '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative directory"}}}');
-      AddTool(Arr, 'search_text', 'Search for a literal text pattern, returns file and line',
-        '{"type":"object","properties":{"path":{"type":"string"},"pattern":{"type":"string"},"recursive":{"type":"boolean"}},"required":["pattern"]}');
-      AddTool(Arr, 'edit_file',
-        'Replace exact string in a file. old_string must occur exactly once unless replace_all=true',
-        '{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}');
-      AddTool(Arr, 'insert_code',
-        'Insert text before a 1-based line number. Use line_count + 1 to append at the end.',
-        '{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer","description":"1-based insertion position, line_count + 1 appends"},"content":{"type":"string"}},"required":["path","line","content"]}');
-      AddTool(Arr, 'replace_range',
-        'Replace an inclusive 1-based line range with the supplied text. Use the same start_line and end_line to replace one line.',
-        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"},"content":{"type":"string","description":"Replacement text, may be empty to delete the range"}},"required":["path","start_line","end_line","content"]}');
-      AddTool(Arr, 'apply_patch',
-        'Apply a patch to one existing text file. Supports unified diff and Codex patch formats. ' +
-        'Codex format uses *** Begin Patch, *** Update File: path and *** End Patch markers. ' +
-        'For Codex patches, the target path is extracted from the *** Update File header, so path is optional. ' +
-        'For unified diffs, path is required. Supports multiple hunks and requires exact context lines.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative file path. Required for unified diff. For Codex patches, extracted from the *** Update File header if omitted."},"patch":{"type":"string","description":"Unified diff or Codex patch. Codex format must include *** Begin Patch, *** Update File: path and *** End Patch."}},"required":["patch"]}');
-      AddTool(Arr, 'delete_file', 'Delete a file',
-        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
-      AddTool(Arr, 'move_file', 'Move or rename a file',
-        '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
-      AddTool(Arr, 'copy_file', 'Copy a file',
-        '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
-      AddTool(Arr, 'file_info', 'Size, modification time and type of a file or directory',
-        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
-      AddTool(Arr, 'create_directory', 'Create a directory and all parent directories',
-        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
       AddTool(Arr, 'find_files',
         'Find files by glob (* and ?). Recursive by default, do NOT add ** prefix. ' +
         '[abc] classes unsupported. Capped at 2000 results.',
@@ -4282,6 +4255,48 @@ begin
         'Read the nearest ' + FAgentsFileName + ' for the given path, walking up to the workspace root. ' +
         'Returns {found, path, content}. Use before editing files to learn local conventions.',
         '{"type":"object","properties":{"path":{"type":"string","description":"File or directory, default workspace root"}}}');
+      AddTool(Arr, 'open_file',
+        'Open a text file and read a specific range of lines. line is 1-based, line_count is the number of lines to read, maximum 5000.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"line":{"type":"integer","description":"First line, 1-based"},"line_count":{"type":"integer","description":"Number of lines to read, maximum 5000"}},"required":["path","line","line_count"]}');
+      AddTool(Arr, 'read_file_preview',
+        'Preview a text file: first and last N lines plus total size. ' +
+        'Call FIRST on unknown or large (>50KB) files before read_file.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"head":{"type":"integer","description":"First lines, default 30, max 500"},"tail":{"type":"integer","description":"Last lines, default 30, max 500"}},"required":["path"]}');
+      AddTool(Arr, 'read_file_lines',
+        'Read a line range. Use for files >50KB or after read_file truncation. ' +
+        'Up to 5000 lines per call, use increasing start_line for large files.',
+        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"}},"required":["path"]}');
+      AddTool(Arr, 'read_file',
+        'Read file contents. Default max_bytes=50000. Use max_bytes=0 only for small files, ' +
+        'prefer read_file_preview or read_file_lines for large ones. Set allow_binary=true only when binary data must be read as text.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Relative file path"},"max_bytes":{"type":"integer","description":"Max bytes, default 50000, 0=whole file"},"allow_binary":{"type":"boolean","description":"Allow reading binary files as text, default false"}},"required":["path"]}');
+      AddTool(Arr, 'file_info', 'Size, modification time and type of a file or directory',
+        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
+      AddTool(Arr, 'apply_patch',
+        'Apply a patch to one existing text file. Supports unified diff and Codex patch formats. ' +
+        'Codex format uses *** Begin Patch, *** Update File: path and *** End Patch markers. ' +
+        'For Codex patches, the target path is extracted from the *** Update File header, so path is optional. ' +
+        'For unified diffs, path is required. Supports multiple hunks and requires exact context lines.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative file path. Required for unified diff. For Codex patches, extracted from the *** Update File header if omitted."},"patch":{"type":"string","description":"Unified diff or Codex patch. Codex format must include *** Begin Patch, *** Update File: path and *** End Patch."}},"required":["patch"]}');
+      AddTool(Arr, 'write_file', 'Write contents to a file, creates parent directories',
+        '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
+      AddTool(Arr, 'edit_file',
+        'Replace exact string in a file. old_string must occur exactly once unless replace_all=true',
+        '{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}');
+      AddTool(Arr, 'insert_code',
+        'Insert text before a 1-based line number. Use line_count + 1 to append at the end.',
+        '{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer","description":"1-based insertion position, line_count + 1 appends"},"content":{"type":"string"}},"required":["path","line","content"]}');
+      AddTool(Arr, 'replace_range',
+        'Replace an inclusive 1-based line range with the supplied text. Use the same start_line and end_line to replace one line.',
+        '{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","description":"First line, 1-based"},"end_line":{"type":"integer","description":"Last line, inclusive"},"content":{"type":"string","description":"Replacement text, may be empty to delete the range"}},"required":["path","start_line","end_line","content"]}');
+      AddTool(Arr, 'delete_file', 'Delete a file',
+        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
+      AddTool(Arr, 'move_file', 'Move or rename a file',
+        '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
+      AddTool(Arr, 'copy_file', 'Copy a file',
+        '{"type":"object","properties":{"source":{"type":"string"},"destination":{"type":"string"}},"required":["source","destination"]}');
+      AddTool(Arr, 'create_directory', 'Create a directory and all parent directories',
+        '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
     end;
 
     if afExecCommand in FFeatures then
@@ -4339,25 +4354,24 @@ begin
       Names.Add(FTools[I].Name);
     if afFileTools in FFeatures then
     begin
-      Names.Add('read_file_preview');
-      Names.Add('read_file_lines');
-      Names.Add('open_file');
-      Names.Add('read_file');
-      Names.Add('write_file');
       Names.Add('list_files');
-      Names.Add('search_text');
-      Names.Add('edit_file');
-      Names.Add('insert_code');
-      Names.Add('replace_range');
-      Names.Add('apply_patch');
-      Names.Add('delete_file');
-      Names.Add('move_file');
-      Names.Add('copy_file');
-      Names.Add('file_info');
-      Names.Add('create_directory');
       Names.Add('find_files');
       Names.Add('grep');
       Names.Add('read_agents_md');
+      Names.Add('open_file');
+      Names.Add('read_file_preview');
+      Names.Add('read_file_lines');
+      Names.Add('read_file');
+      Names.Add('file_info');
+      Names.Add('apply_patch');
+      Names.Add('write_file');
+      Names.Add('edit_file');
+      Names.Add('insert_code');
+      Names.Add('replace_range');
+      Names.Add('delete_file');
+      Names.Add('move_file');
+      Names.Add('copy_file');
+      Names.Add('create_directory');
     end;
     if afExecCommand in FFeatures then
       Names.Add('exec_command');
@@ -4752,115 +4766,6 @@ begin
     end;
   finally
     Items.Free;
-  end;
-end;
-
-function TCustomOllamaAgent.DoSearchText(AArgs: TJSONObject): string;
-const
-  MAX_MATCHES = 500;
-  MAX_TOTAL_BYTES = 50000;
-  MAX_MATCH_LINE_CHARS = 500;
-var
-  RelPath, FullPath, Pattern, LowPattern: string;
-  Recursive: boolean;
-  Files: TStringList;
-  Matches: TJSONArray;
-  FileLines: TStringList;
-  I, J, TotalBytes: integer;
-  Line: string;
-  MatchObj: TJSONObject;
-  BaseRoot: string;
-  Truncated: boolean;
-begin
-  Result := '{"error": "invalid arguments"}';
-  if AArgs = nil then
-    Exit;
-  RelPath := AArgs.Get('path', '');
-  Pattern := AArgs.Get('pattern', '');
-  Recursive := GetBoolArg(AArgs, 'recursive', True);
-  if Pattern = '' then
-  begin
-    Result := '{"error": "pattern required"}';
-    Exit;
-  end;
-  FullPath := SafePath(RelPath);
-  if FullPath = '' then
-  begin
-    Result := SafePathError;
-    Exit;
-  end;
-  if not DirectoryExists(FullPath) then
-  begin
-    Result := '{"error": "directory not found"}';
-    Exit;
-  end;
-  BaseRoot := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
-  LowPattern := LowerCase(Pattern);
-  Files := TStringList.Create;
-  Matches := TJSONArray.Create;
-  Truncated := False;
-  TotalBytes := 0;
-  try
-    FindAllFiles(Files, FullPath, '*.*', Recursive);
-    for I := 0 to Files.Count - 1 do
-    begin
-      if Matches.Count >= MAX_MATCHES then
-      begin
-        Truncated := True;
-        Break;
-      end;
-      if TotalBytes >= MAX_TOTAL_BYTES then
-      begin
-        Truncated := True;
-        Break;
-      end;
-      if IsBinaryFile(Files[I]) then
-        Continue;
-      FileLines := TStringList.Create;
-      try
-        try
-          FileLines.LoadFromFile(Files[I], TEncoding.UTF8);
-        except
-          try
-            FileLines.LoadFromFile(Files[I]);
-          except
-            Continue;
-          end;
-        end;
-        for J := 0 to FileLines.Count - 1 do
-        begin
-          if Matches.Count >= MAX_MATCHES then
-          begin
-            Truncated := True;
-            Break;
-          end;
-          if TotalBytes >= MAX_TOTAL_BYTES then
-          begin
-            Truncated := True;
-            Break;
-          end;
-          Line := FileLines[J];
-          if Pos(LowPattern, LowerCase(Line)) > 0 then
-          begin
-            if Length(Line) > MAX_MATCH_LINE_CHARS then
-              Line := Copy(Line, 1, MAX_MATCH_LINE_CHARS) + '...';
-            MatchObj := TJSONObject.Create;
-            MatchObj.Add('file', Copy(Files[I], Length(BaseRoot) + 1, MaxInt));
-            MatchObj.Add('line', J + 1);
-            MatchObj.Add('text', Line);
-            Matches.Add(MatchObj);
-            Inc(TotalBytes, Length(Line) + 50);
-          end;
-        end;
-      finally
-        FileLines.Free;
-      end;
-    end;
-    Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Truncated, 'true', 'false') +
-      ', "matches": ' + Matches.AsJSON + '}';
-  finally
-    Matches.Free;
-    Files.Free;
   end;
 end;
 
@@ -6826,44 +6731,42 @@ begin
 
     if afFileTools in FFeatures then
     begin
-      if CleanName = 'read_file' then
-        Exit(DoReadFile(Args))
-      else if CleanName = 'read_file_preview' then
-        Exit(DoReadFilePreview(Args))
-      else if CleanName = 'write_file' then
-        Exit(DoWriteFile(Args))
-      else if CleanName = 'list_files' then
+      if CleanName = 'list_files' then
         Exit(DoListFiles(Args))
-      else if CleanName = 'search_text' then
-        Exit(DoSearchText(Args))
-      else if CleanName = 'read_file_lines' then
-        Exit(DoReadFileLines(Args))
+      else if CleanName = 'find_files' then
+        Exit(DoFindFiles(Args))
+      else if CleanName = 'grep' then
+        Exit(DoGrep(Args))
+      else if CleanName = 'read_agents_md' then
+        Exit(DoReadAgentsMd(Args))
       else if CleanName = 'open_file' then
         Exit(DoOpenFile(Args))
+      else if CleanName = 'read_file_preview' then
+        Exit(DoReadFilePreview(Args))
+      else if CleanName = 'read_file_lines' then
+        Exit(DoReadFileLines(Args))
+      else if CleanName = 'read_file' then
+        Exit(DoReadFile(Args))
+      else if CleanName = 'file_info' then
+        Exit(DoFileInfo(Args))
+      else if CleanName = 'apply_patch' then
+        Exit(DoApplyPatch(Args))
+      else if CleanName = 'write_file' then
+        Exit(DoWriteFile(Args))
       else if CleanName = 'edit_file' then
         Exit(DoEditFile(Args))
       else if CleanName = 'insert_code' then
         Exit(DoInsertCode(Args))
       else if CleanName = 'replace_range' then
         Exit(DoReplaceRange(Args))
-      else if CleanName = 'apply_patch' then
-        Exit(DoApplyPatch(Args))
       else if CleanName = 'delete_file' then
         Exit(DoDeleteFile(Args))
       else if CleanName = 'move_file' then
         Exit(DoMoveFile(Args))
       else if CleanName = 'copy_file' then
         Exit(DoCopyFile(Args))
-      else if CleanName = 'file_info' then
-        Exit(DoFileInfo(Args))
       else if CleanName = 'create_directory' then
-        Exit(DoCreateDirectory(Args))
-      else if CleanName = 'find_files' then
-        Exit(DoFindFiles(Args))
-      else if CleanName = 'grep' then
-        Exit(DoGrep(Args))
-      else if CleanName = 'read_agents_md' then
-        Exit(DoReadAgentsMd(Args));
+        Exit(DoCreateDirectory(Args));
     end;
 
     if (CleanName = 'exec_command') and (afExecCommand in FFeatures) then
