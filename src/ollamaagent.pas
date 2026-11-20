@@ -678,16 +678,14 @@ end;
 function WriteTextFileSafe(const APath, AContent: string): boolean;
 var
   Stream: TFileStream;
-  Bytes: TBytes;
 begin
   Result := False;
   ForceDirectories(ExtractFileDir(APath));
   try
     Stream := TFileStream.Create(APath, fmCreate);
     try
-      Bytes := TBytes(AContent);
-      if Length(Bytes) > 0 then
-        Stream.Write(Bytes[0], Length(Bytes));
+      if Length(AContent) > 0 then
+        Stream.WriteBuffer(AContent[1], Length(AContent));
       Result := True;
     finally
       Stream.Free;
@@ -2330,6 +2328,10 @@ begin
           end;
           if (Data = nil) or (Data.JSONType <> jtObject) then
           begin
+            FAgent.LogLine(Format('Invalid JSON from LLM, response_len=%d', [Length(FinalJson)]));
+            if FinalJson <> string.Empty then
+              FAgent.LogLine('Raw response: ' + FinalJson);
+
             Reason := afrError;
             ErrMsg := 'Invalid JSON from LLM';
             Exit;
