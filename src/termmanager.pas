@@ -1847,12 +1847,13 @@ begin
     Exit(tikBuiltin);
   end;
 
-  // Multi-line shell input must take precedence over application commands
-  if HasMultipleLines and FSearchPath and IsExternalCommand(First) then
-    Exit(tikCommand);
-
+  // Application builtins must take precedence over shell commands
   if FBuiltinCommands.IndexOf(First) >= 0 then
     Exit(tikBuiltin);
+
+  // Multi-line shell input must take precedence over external executables
+  if HasMultipleLines and FSearchPath and IsExternalCommand(First) then
+    Exit(tikCommand);
 
   if FSearchPath and IsExternalCommand(First) then
     Exit(tikCommand);
@@ -2081,8 +2082,13 @@ begin
     DoOutput('use "help agent" for property lists' + LineEnding, True);
     Exit;
   end;
-  P := Pos(' ', AArg);
-  if P > 0 then
+
+  // Split property name and value at the first whitespace character
+  P := 1;
+  while (P <= Length(AArg)) and not (AArg[P] in [#9, #10, #13, ' ']) do
+    Inc(P);
+
+  if P <= Length(AArg) then
   begin
     PropName := Copy(AArg, 1, P - 1);
     PropValue := Trim(Copy(AArg, P + 1, MaxInt));
@@ -2090,8 +2096,9 @@ begin
   else
   begin
     PropName := Trim(AArg);
-    PropValue := '';
+    PropValue := string.Empty;
   end;
+
   if LowerCase(PropName) = 'chat' then
   begin
     if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
