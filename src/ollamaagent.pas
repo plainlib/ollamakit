@@ -40,6 +40,8 @@ type
     OutputStart: SizeInt;
     InputKind: integer;
     ShellLogCount: integer;
+    ScreenRow: integer;
+    ScreenCol: integer;
   end;
 
   TTerminalOutputMarks = array of TTerminalOutputMark;
@@ -95,6 +97,7 @@ type
     procedure IncrementLastOutputMarkShellLogCount;
     function GetLastOutputMark(out AMark: TTerminalOutputMark): boolean;
     procedure DeleteLastOutputMark;
+    procedure SetOutputMarkScreenPosition(AIndex, ARow, ACol: integer);
 
     property OutputMarks: TTerminalOutputMarks read FOutputMarks;
     property ContextUsed: integer read FContextUsed write FContextUsed;
@@ -2012,7 +2015,9 @@ var
   SupportsTools: boolean;
   StoredHistory: TJSONArray;
   IncludeThinking: boolean;
+  UserMessageAdded: boolean;
 begin
+  UserMessageAdded := False;
   Reason := afrError;
   ErrMsg := '';
   FinalContent := '';
@@ -2097,6 +2102,7 @@ begin
       else
         MsgObj.Add('content', FUserText);
       MessagesArr.Add(MsgObj);
+      UserMessageAdded := True;
 
       if SendTools then
         ToolsJson := FAgent.BuildToolsSchemaJson
@@ -2622,6 +2628,36 @@ begin
         MessagesArr.Add(MsgObj);
       end;
 
+      // Preserve the user request if execution failed before it was added
+      if not UserMessageAdded then
+      begin
+        // Restore previous history when it is normally sent to the model
+        if FAgent.KeepHistory and (FAgent.FHistory <> string.Empty) then
+        begin
+          Data := nil;
+          try
+            try
+              Data := GetJSON(FAgent.FHistory);
+              if (Data <> nil) and (Data.JSONType = jtArray) then
+                for I := 0 to TJSONArray(Data).Count - 1 do
+                  MessagesArr.Add(TJSONArray(Data).Items[I].Clone);
+            except
+              ; // Ignore invalid stored history
+            end;
+          finally
+            Data.Free;
+          end;
+        end;
+
+        MsgObj := TJSONObject.Create;
+        MsgObj.Add('role', 'user');
+        if FAgent.FContextPrelude <> string.Empty then
+          MsgObj.Add('content', FAgent.FContextPrelude + #10#10 + FUserText)
+        else
+          MsgObj.Add('content', FUserText);
+        MessagesArr.Add(MsgObj);
+      end;
+
       // Strip leading system message, it is rebuilt on each run
       if (MessagesArr.Count > 0) and (MessagesArr.Items[0].JSONType = jtObject) and
         (TJSONObject(MessagesArr.Items[0]).Get('role', '') = 'system') then
@@ -2770,6 +2806,15 @@ begin
   Count := Length(FOutputMarks);
   if Count > 0 then
     SetLength(FOutputMarks, Count - 1);
+end;
+
+procedure TAgentChat.SetOutputMarkScreenPosition(AIndex, ARow, ACol: integer);
+begin
+  if (AIndex < 0) or (AIndex >= Length(FOutputMarks)) then
+    Exit;
+
+  FOutputMarks[AIndex].ScreenRow := ARow;
+  FOutputMarks[AIndex].ScreenCol := ACol;
 end;
 
 { TCustomOllamaAgent }
@@ -3239,6 +3284,8 @@ begin
             Mark.OutputStart := -1;
             Mark.InputKind := -1;
             Mark.ShellLogCount := 0;
+            Mark.ScreenRow := -1;
+            Mark.ScreenCol := -1;
 
             Item := MarkObj.Find('output_start');
             if Item = nil then
@@ -3594,6 +3641,8 @@ begin
           Mark.OutputStart := -1;
           Mark.InputKind := -1;
           Mark.ShellLogCount := 0;
+          Mark.ScreenRow := -1;
+          Mark.ScreenCol := -1;
 
           Item := MarkObj.Find('output_start');
           if Item = nil then
@@ -6557,9 +6606,9 @@ begin
       if (not TimedOut) and (FilesScanned >= MAX_FILES_SCANNED) then
         ScanLimited := True;
     end;
-    Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >=
-      MaxResults, 'true', 'false') + ', "scanned_files": ' + IntToStr(FilesScanned) + ', "scan_limited": ' +
-      BoolToStr(ScanLimited, 'true', 'false') + ', "timed_out": ' + BoolToStr(TimedOut, 'true', 'false');
+    Result := '{"count": ' + IntToStr(Matches.Count) + ', "truncated": ' + BoolToStr(Matches.Count >= MaxResults, 'true', 'false') +
+      ', "scanned_files": ' + IntToStr(FilesScanned) + ', "scan_limited": ' + BoolToStr(ScanLimited, 'true', 'false') +
+      ', "timed_out": ' + BoolToStr(TimedOut, 'true', 'false');
     if AutoRegex then
       Result := Result + ', "auto_regex": true';
     Result := Result + ', "matches": ' + Matches.AsJSON + '}';

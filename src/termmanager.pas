@@ -192,6 +192,9 @@ type
     FStdErrPending: rawbytestring;
     FSuppressChatOutput: boolean;
     FPendingOutputStart: SizeInt;
+    FPendingScreenRow: integer;
+    FPendingScreenCol: integer;
+    FLastInputScreenCleared: boolean;
     FCurrentOutputMark: boolean;
     // Updates the native terminal window title with the current directory
     procedure UpdateConsoleTitle;
@@ -808,7 +811,9 @@ begin
   FColors := TTermColorScheme.Create;
   FDefaultModelLabel := 'plainconsole';
   FAgent := nil;
-  FPendingOutputStart := -1;
+  FPendingScreenRow := -1;
+  FPendingScreenCol := -1;
+  FLastInputScreenCleared := False;
   FCurrentOutputMark := False;
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
@@ -2629,8 +2634,14 @@ var
   Chat: TAgentChat;
   Mark: TTerminalOutputMark;
   I: integer;
+  {$IFDEF WINDOWS}
+  Info: TConsoleScreenBufferInfo;
+  Coord: TCoord;
+  Count, Written: DWORD;
+  {$ENDIF}
 begin
   Result := False;
+  FLastInputScreenCleared := False;
 
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
     Exit;
@@ -2648,8 +2659,8 @@ begin
     Exit;
 
   // Remove the last agent exchange, including tool messages
-  if (Mark.InputKind = Ord(tikAgent)) and not FAgent.RemoveLastExchange then
-    Exit;
+  if Mark.InputKind = Ord(tikAgent) then
+    FAgent.RemoveLastExchange;
 
   // Remove shell log entries created by this operation
   for I := 1 to Mark.ShellLogCount do
@@ -2666,6 +2677,35 @@ begin
 
   // Remove the completed operation mark
   Chat.DeleteLastOutputMark;
+
+  {$IFDEF WINDOWS}
+  // Clear the screen buffer from the saved input position
+  Info := Default(TConsoleScreenBufferInfo);
+  if (Mark.ScreenRow >= 0) and (Mark.ScreenCol >= 0) and
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) and
+    (Mark.ScreenRow >= Info.srWindow.Top) and
+    (Mark.ScreenRow <= Info.srWindow.Bottom) and
+    (Mark.ScreenRow < Info.dwSize.Y) and
+    (Mark.ScreenCol < Info.dwSize.X) then
+  begin
+    Coord.X := Mark.ScreenCol;
+    Coord.Y := Mark.ScreenRow;
+    Count := DWORD(Info.dwSize.X) * DWORD(Info.dwSize.Y - Mark.ScreenRow) -
+      DWORD(Mark.ScreenCol);
+    Written := 0;
+
+    if (Count > 0) and
+      FillConsoleOutputCharacter(GetStdHandle(STD_OUTPUT_HANDLE), ' ', Count, Coord, Written) and
+      (Written = Count) then
+    begin
+      Written := 0;
+      if FillConsoleOutputAttribute(GetStdHandle(STD_OUTPUT_HANDLE), Info.wAttributes,
+        Count, Coord, Written) and (Written = Count) then
+        FLastInputScreenCleared :=
+          SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), Coord);
+    end;
+  end;
+  {$ENDIF}
 
   Result := True;
 end;
@@ -3816,11 +3856,15 @@ begin
         Mark.OutputStart := FPendingOutputStart;
         Mark.InputKind := Ord(Kind);
         Mark.ShellLogCount := 0;
+        Mark.ScreenRow := FPendingScreenRow;
+        Mark.ScreenCol := FPendingScreenCol;
         FAgent.ActiveChat.AddOutputMark(Mark);
         FCurrentOutputMark := True;
       end;
 
       FPendingOutputStart := -1;
+      FPendingScreenRow := -1;
+      FPendingScreenCol := -1;
 
       case Kind of
         tikBuiltin:
@@ -4036,34 +4080,109 @@ end;
 
 procedure TCustomTermManager.ReplayChatOutput(const AText: string);
 var
-  I, StartPos: integer;
-  ColorValue: integer;
+  I, J, ColorValue: integer;
+  {$IFDEF WINDOWS}
+  MarkIndex: integer;
+  Mark: TTerminalOutputMark;
+  Info: TConsoleScreenBufferInfo;
+  {$ENDIF}
+
+  {$IFDEF WINDOWS}
+  // Updates saved screen positions when replay reaches an operation boundary
+  procedure CaptureOutputMarks(APos: SizeInt);
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+      Exit;
+
+    while MarkIndex < Length(FAgent.ActiveChat.OutputMarks) do
+    begin
+      Mark := FAgent.ActiveChat.OutputMarks[MarkIndex];
+
+      if Mark.OutputStart > APos then
+        Break;
+
+      if Mark.OutputStart = APos then
+      begin
+        Info := Default(TConsoleScreenBufferInfo);
+        if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+          FAgent.ActiveChat.SetOutputMarkScreenPosition(
+            MarkIndex, Info.dwCursorPosition.Y, Info.dwCursorPosition.X)
+        else
+          FAgent.ActiveChat.SetOutputMarkScreenPosition(MarkIndex, -1, -1);
+      end;
+
+      Inc(MarkIndex);
+    end;
+  end;
+  {$ENDIF}
+
 begin
-  StartPos := 1;
+  {$IFDEF WINDOWS}
   I := 1;
+  MarkIndex := 0;
 
   while I <= Length(AText) do
   begin
+    CaptureOutputMarks(I - 1);
+
     if (AText[I] = #2) and (I < Length(AText)) then
     begin
-      // Write text accumulated before the color marker
-      if I > StartPos then
-        WriteText(Copy(AText, StartPos, I - StartPos), False);
-
       ColorValue := Ord(AText[I + 1]);
       if ColorValue <= Ord(High(TTermColor)) then
         SetColor(TTermColor(ColorValue));
 
       Inc(I, 2);
-      StartPos := I;
     end
     else
-      Inc(I);
+    begin
+      J := I;
+
+      // Stop before the next color marker or operation boundary
+      while J <= Length(AText) do
+      begin
+        if AText[J] = #2 then
+          Break;
+
+        if Assigned(FAgent) and Assigned(FAgent.ActiveChat) and
+          (MarkIndex < Length(FAgent.ActiveChat.OutputMarks)) and
+          (FAgent.ActiveChat.OutputMarks[MarkIndex].OutputStart = J - 1) then
+          Break;
+
+        Inc(J);
+      end;
+
+      if J > I then
+      begin
+        WriteText(Copy(AText, I, J - I), False);
+        I := J;
+      end;
+    end;
   end;
 
-  // Write the remaining text
-  if StartPos <= Length(AText) then
-    WriteText(Copy(AText, StartPos, MaxInt), False);
+  CaptureOutputMarks(Length(AText));
+  {$ELSE}
+  I := 1;
+  while I <= Length(AText) do
+  begin
+    if (AText[I] = #2) and (I < Length(AText)) then
+    begin
+      ColorValue := Ord(AText[I + 1]);
+      if ColorValue <= Ord(High(TTermColor)) then
+        SetColor(TTermColor(ColorValue));
+
+      Inc(I, 2);
+    end
+    else
+    begin
+      J := I;
+      while (J <= Length(AText)) and (AText[J] <> #2) do
+        Inc(J);
+
+      WriteText(Copy(AText, I, J - I), False);
+      I := J;
+    end;
+  end;
+  {$ENDIF}
 
   SetColor(tcDefault);
 end;
@@ -4261,6 +4380,23 @@ var
   HasMore, IsModifier, ShiftPressed, CtrlPressed: Boolean;
   SelAnchor, SelStart, SelEnd: Integer;
   HasSelection: Boolean;
+  MessageNavIndex: integer;
+
+  // Saves the cursor position where the current prompt begins
+  procedure CapturePromptPosition;
+  var
+    Info: TConsoleScreenBufferInfo;
+  begin
+    FPendingScreenRow := -1;
+    FPendingScreenCol := -1;
+
+    Info := Default(TConsoleScreenBufferInfo);
+    if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+    begin
+      FPendingScreenRow := Info.dwCursorPosition.Y;
+      FPendingScreenCol := Info.dwCursorPosition.X;
+    end;
+  end;
 
   // Scrolls the console viewport without moving the input cursor
   procedure ScrollOutput(ADirection: Integer);
@@ -4296,6 +4432,72 @@ var
       else
         Exit;
     end;
+
+    if NewTop < 0 then
+      NewTop := 0
+    else if NewTop > MaxTop then
+      NewTop := MaxTop;
+
+    Rect.Top := NewTop;
+    Rect.Bottom := NewTop + ViewHeight - 1;
+
+    SetConsoleWindowInfo(GetStdHandle(STD_OUTPUT_HANDLE), True, Rect);
+  end;
+
+  // Moves the viewport to the previous or next user message
+  procedure NavigateMessage(ADirection: integer);
+  var
+    Info: TConsoleScreenBufferInfo;
+    Rect: SMALL_RECT;
+    Mark: TTerminalOutputMark;
+    ViewHeight, MaxTop, NewTop: integer;
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+      Exit;
+
+    if ADirection < 0 then
+    begin
+      while MessageNavIndex > 0 do
+      begin
+        Dec(MessageNavIndex);
+        Mark := FAgent.ActiveChat.OutputMarks[MessageNavIndex];
+        if Mark.ScreenRow >= 0 then
+          Break;
+      end;
+    end
+    else
+    begin
+      while MessageNavIndex < Length(FAgent.ActiveChat.OutputMarks) - 1 do
+      begin
+        Inc(MessageNavIndex);
+        Mark := FAgent.ActiveChat.OutputMarks[MessageNavIndex];
+        if Mark.ScreenRow >= 0 then
+          Break;
+      end;
+    end;
+
+    if (MessageNavIndex < 0) or
+      (MessageNavIndex >= Length(FAgent.ActiveChat.OutputMarks)) then
+      Exit;
+
+    Mark := FAgent.ActiveChat.OutputMarks[MessageNavIndex];
+    if Mark.ScreenRow < 0 then
+      Exit;
+
+    Info := Default(TConsoleScreenBufferInfo);
+    if not GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+      Exit;
+
+    Rect := Info.srWindow;
+    ViewHeight := Rect.Bottom - Rect.Top + 1;
+    if ViewHeight <= 0 then
+      Exit;
+
+    MaxTop := Info.dwSize.Y - ViewHeight;
+    if MaxTop < 0 then
+      MaxTop := 0;
+
+    NewTop := Mark.ScreenRow - ViewHeight div 2;
 
     if NewTop < 0 then
       NewTop := 0
@@ -4692,6 +4894,7 @@ var
     Lines := SplitLines(Line);
     try
       ConGotoXY(1, PromptRow);
+      CapturePromptPosition;
       CursorSaved := False;
       CurRow := PromptRow;
       CurCol := 1;
@@ -4848,6 +5051,7 @@ var
     ClearSelection;
 
     PromptText := GetPromptText;
+    CapturePromptPosition;
     ConWriteUtf8(PromptText);
     FLastCharWasNewLine := False;
     PromptRow := ConWhereY;
@@ -4886,6 +5090,13 @@ begin
   // Ensure prompt starts on a fresh line after streaming output
   if not FLastCharWasNewLine then
     ConWriteUtf8(LineEnding);
+
+  CapturePromptPosition;
+
+  MessageNavIndex := 0;
+  if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+    MessageNavIndex := Length(FAgent.ActiveChat.OutputMarks);
+
   Handle := GetStdHandle(STD_INPUT_HANDLE);
   // Drop input events accumulated while the agent was streaming, a paste
   // sent to a busy console would otherwise flood Line on the next read
@@ -5060,7 +5271,11 @@ begin
           // Remove the previous input and its result with Ctrl+Backspace
           if CtrlPressed and RemoveLastInput then
           begin
-            RestoreActiveChat;
+            if not FLastInputScreenCleared then
+              RestoreActiveChat
+            else
+              ScrollOutput(2);
+
             ResetInput;
             Continue;
           end;
@@ -5159,12 +5374,18 @@ begin
         end;
       VK_PRIOR:
         begin
-          ScrollOutput(-1);
+          if ShiftPressed and not CtrlPressed then
+            NavigateMessage(-1)
+          else
+            ScrollOutput(-1);
           Continue;
         end;
       VK_NEXT:
         begin
-          ScrollOutput(1);
+          if ShiftPressed and not CtrlPressed then
+            NavigateMessage(1)
+          else
+            ScrollOutput(1);
           Continue;
         end;
       VK_HOME:
