@@ -62,6 +62,7 @@ type
   TAgentToolExecuteEvent = procedure(Sender: TObject; const AArgsJson: string; var AResult: string) of object;
   TAgentAskUserEvent = procedure(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean) of object;
   TAgentLogEvent = procedure(Sender: TObject; const AText: string) of object;
+  TAgentContextUsageEvent = procedure(Sender: TObject; AUsed, ATotal: integer) of object;
 
 type
   TCustomOllamaAgent = class;
@@ -202,6 +203,7 @@ type
     FContextUsed: integer;
     // Configured context window size in tokens, 0 when unknown
     FContextTotal: integer;
+    FOnContextUsage: TAgentContextUsageEvent;
     FOnRoute: TAgentRouteEvent;
     FOnChunk: TAgentChunkEvent;
     FOnThinking: TAgentThinkingEvent;
@@ -399,6 +401,7 @@ type
     property Log: boolean read FLog write FLog default False;
     property LogToolResult: boolean read FLogToolResult write FLogToolResult default True;
     property OnLog: TAgentLogEvent read FOnLog write FOnLog;
+    property OnContextUsage: TAgentContextUsageEvent read FOnContextUsage write FOnContextUsage;
     property OnRoute: TAgentRouteEvent read FOnRoute write FOnRoute;
     property OnChunk: TAgentChunkEvent read FOnChunk write FOnChunk;
     property OnThinking: TAgentThinkingEvent read FOnThinking write FOnThinking;
@@ -1681,6 +1684,12 @@ type
     procedure Invoke; override;
   end;
 
+  TContextUsageCall = class(TAgentCallBase)
+  public
+    Used, Total: integer;
+    procedure Invoke; override;
+  end;
+
   TThinkingCall = class(TAgentCallBase)
   public
     Text: string;
@@ -1781,6 +1790,20 @@ begin
       Agent.FOnChunk(Agent, Text);
     except
       ; // Swallow host handler errors, must not kill the main loop
+    end;
+  finally
+    Free;
+  end;
+end;
+
+procedure TContextUsageCall.Invoke;
+begin
+  try
+    if Assigned(Agent.FOnContextUsage) then
+    try
+      Agent.FOnContextUsage(Agent, Used, Total);
+    except
+      ; // Swallow host handler errors
     end;
   finally
     Free;
@@ -1910,6 +1933,7 @@ type
     procedure QueueToolCall(const AName, AArgs: string);
     procedure QueueToolResult(const AName, AResult: string);
     procedure QueueFinish(AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
+    procedure QueueContextUsage;
   protected
     procedure Execute; override;
   public
@@ -2055,6 +2079,20 @@ begin
   TThread.Synchronize(nil, @Call.Invoke);
 end;
 
+procedure TOllamaAgentThread.QueueContextUsage;
+var
+  Call: TContextUsageCall;
+begin
+  if not Assigned(FAgent.FOnContextUsage) then
+    Exit;
+
+  Call := TContextUsageCall.Create;
+  Call.Agent := FAgent;
+  Call.Used := FAgent.FContextUsed;
+  Call.Total := FAgent.FContextTotal;
+  TThread.Queue(nil, @Call.Invoke);
+end;
+
 procedure TOllamaAgentThread.Execute;
 const
   // Tool results older than the most recent N are truncated to save context
@@ -2102,9 +2140,15 @@ var
   SupportsTools: boolean;
   StoredHistory: TJSONArray;
   UserMessageAdded: boolean;
+  ContextToolBytes, ContextThinkingBytes: integer;
+  ContextMessages, ContextPercent: integer;
+  ContextMeasured: boolean;
+  ContextReport: string;
+  MonitorObj: TJSONObject;
 begin
   UserMessageAdded := False;
   Reason := afrError;
+  ContextMeasured := False;
   ErrMsg := '';
   FinalContent := '';
   EmptyResponseRetries := 0;
@@ -2285,14 +2329,14 @@ begin
             FAgent.LogLine('Compaction skipped, no safe cut point');
         end;
 
-        // Truncate only old tool results, keep the current run intact
+        // Truncate old tool results from both history and current run
         TruncTotalTool := 0;
         for TruncIdx := 0 to MessagesArr.Count - 1 do
         begin
           if MessagesArr.Items[TruncIdx].JSONType <> jtObject then
             Continue;
           MsgObj := TJSONObject(MessagesArr.Items[TruncIdx]);
-          if (MsgObj.Get('role', '') = 'tool') and not MsgObj.Get('_current_run', False) then
+          if MsgObj.Get('role', '') = 'tool' then
             Inc(TruncTotalTool);
         end;
 
@@ -2302,7 +2346,7 @@ begin
           if MessagesArr.Items[TruncIdx].JSONType <> jtObject then
             Continue;
           MsgObj := TJSONObject(MessagesArr.Items[TruncIdx]);
-          if (MsgObj.Get('role', '') <> 'tool') or MsgObj.Get('_current_run', False) then
+          if MsgObj.Get('role', '') <> 'tool' then
             Continue;
           Inc(TruncSeen);
           if TruncSeen > TruncTotalTool - KEEP_RECENT_TOOL_RESULTS then
@@ -2316,7 +2360,59 @@ begin
           end;
         end;
 
-        MessagesJson := BuildRequestMessagesJson(MessagesArr);
+        // Collect context statistics after tool result truncation
+        ContextToolBytes := 0;
+        ContextThinkingBytes := 0;
+        ContextMessages := MessagesArr.Count;
+
+        for I := 0 to MessagesArr.Count - 1 do
+        begin
+          if MessagesArr.Items[I].JSONType <> jtObject then
+            Continue;
+
+          MsgObj := TJSONObject(MessagesArr.Items[I]);
+
+          if MsgObj.Get('role', '') = 'tool' then
+            Inc(ContextToolBytes, Length(MsgObj.Get('content', '')));
+
+          if (MsgObj.Get('role', '') = 'assistant') and MsgObj.Get('_current_run', False) then
+            Inc(ContextThinkingBytes, Length(MsgObj.Get('thinking', '')));
+        end;
+
+        ContextPercent := 0;
+        if FAgent.FContextTotal > 0 then
+          ContextPercent := FAgent.FContextUsed * 100 div FAgent.FContextTotal;
+
+        // Build context report using the last completed request usage
+        if ContextMeasured then
+          ContextReport := Format('Last request token usage: %d/%d (%d%%). ', [FAgent.FContextUsed,
+            FAgent.FContextTotal, ContextPercent])
+        else
+          ContextReport := 'Token usage is not available yet. ';
+
+        ContextReport := ContextReport + Format('Messages: %d. Tool results: %d bytes. Thinking: %d bytes. ',
+          [ContextMessages, ContextToolBytes, ContextThinkingBytes]) + 'Monitor context consumption during this task. ' +
+          'The token usage above is from the previous completed request, not a live estimate. ' +
+          'Tool results may be truncated, but the two latest results are preserved. ' +
+          'Continue from the existing work and avoid repeating completed operations.';
+
+        // Add temporary context information to the next request
+        MonitorObj := TJSONObject.Create;
+        MonitorObj.Add('role', 'system');
+        MonitorObj.Add('content', ContextReport);
+        MessagesArr.Insert(1, MonitorObj);
+
+        try
+          MessagesJson := BuildRequestMessagesJson(MessagesArr);
+        finally
+          // Do not retain the temporary monitor message in chat history
+          MessagesArr.Delete(1);
+        end;
+
+        FAgent.LogLine(Format('Context step=%d usage=%d/%d (%d%%) messages=%d thinking=%d bytes tool_results=%d bytes',
+          [Step, FAgent.FContextUsed, FAgent.FContextTotal, ContextPercent, ContextMessages, ContextThinkingBytes,
+          ContextToolBytes]));
+
         FAgent.LogLine(Format('Step %d messages=%d timeout=%d request_json_bytes=%d',
           [Step, MessagesArr.Count, FAgent.OllamaManager.RequestTimeout, Length(MessagesJson)]));
 
@@ -2432,6 +2528,16 @@ begin
             FAgent.FContextTotal := 8192;
           FAgent.LogLine(Format('Resolved context_length=%d for "%s"', [FAgent.FContextTotal, FAgent.ModelName]));
         end;
+
+        // Keep the active chat counters synchronized
+        if Assigned(FAgent.FActiveChat) then
+        begin
+          FAgent.FActiveChat.ContextUsed := FAgent.FContextUsed;
+          FAgent.FActiveChat.ContextTotal := FAgent.FContextTotal;
+        end;
+
+        // Notify the host to refresh context indicators
+        QueueContextUsage;
 
         FAgent.LogLine(Format('Chat done raw_len=%d usage=%d/%d', [Length(FinalJson), FAgent.FContextUsed,
           FAgent.FContextTotal]));
