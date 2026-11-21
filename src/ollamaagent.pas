@@ -363,7 +363,7 @@ type
     // Resolves placeholders in SystemPrompt using current values
     function BuildSystemPrompt: string; virtual;
     // Resolves model context window size and updates ContextTotal
-    procedure RefreshContextInfo(AQueryOllama: Boolean = True);
+    procedure RefreshContextInfo(AQueryOllama: boolean = True);
     // Resets usage counters in the manager and this agent
     procedure ResetUsage;
 
@@ -558,6 +558,106 @@ type
   // Encoding selector for ReadTextFileSafe
   TFileEncoding = (feAuto, feUTF8, feANSI, feUTF16LE, feUTF16BE);
 
+// Returns the first line break sequence found in the text
+function DetectTextLineBreak(const AText: string): string;
+var
+  I: integer;
+begin
+  Result := LineEnding;
+
+  I := 1;
+  while I <= Length(AText) do
+  begin
+    if AText[I] = #13 then
+    begin
+      if (I < Length(AText)) and (AText[I + 1] = #10) then
+        Result := #13#10
+      else
+        Result := #13;
+      Exit;
+    end;
+
+    if AText[I] = #10 then
+    begin
+      Result := #10;
+      Exit;
+    end;
+
+    Inc(I);
+  end;
+end;
+
+// Converts line breaks to the specified format
+function NormalizeTextLineBreaks(const AText, ALineBreak: string): string;
+begin
+  Result := StringReplace(AText, #13#10, #10, [rfReplaceAll]);
+  Result := StringReplace(Result, #13, #10, [rfReplaceAll]);
+
+  if ALineBreak <> #10 then
+    Result := StringReplace(Result, #10, ALineBreak, [rfReplaceAll]);
+end;
+
+// Extracts a line range while preserving the original line separators
+function ExtractTextLineRange(const AText: unicodestring; AStartLine, AEndLine: integer; out ATotalLines: integer): unicodestring;
+var
+  Lines, Breaks: TStringList;
+  I: integer;
+  BreakText: unicodestring;
+begin
+  Result := '';
+  Lines := TStringList.Create;
+  Breaks := TStringList.Create;
+  try
+    Lines.Text := UTF8Encode(AText);
+    ATotalLines := Lines.Count;
+
+    // Collect original line separators, including mixed line endings
+    I := 1;
+    while I <= Length(AText) do
+    begin
+      if AText[I] = #13 then
+      begin
+        if (I < Length(AText)) and (AText[I + 1] = #10) then
+        begin
+          BreakText := #13#10;
+          Inc(I, 2);
+        end
+        else
+        begin
+          BreakText := #13;
+          Inc(I);
+        end;
+        Breaks.Add(UTF8Encode(BreakText));
+      end
+      else if AText[I] = #10 then
+      begin
+        Breaks.Add(#10);
+        Inc(I);
+      end
+      else
+        Inc(I);
+    end;
+
+    if AStartLine < 1 then
+      AStartLine := 1;
+
+    if (AEndLine < 0) or (AEndLine > ATotalLines) then
+      AEndLine := ATotalLines;
+
+    // Reconstruct the requested range using the original separators
+    for I := AStartLine to AEndLine do
+    begin
+      if I > AStartLine then
+        Result := Result + UTF8Decode(Breaks[I - 2]);
+
+      Result := Result + UTF8Decode(Lines[I - 1]);
+    end;
+  finally
+    Breaks.Free;
+    Lines.Free;
+  end;
+end;
+
 function ReadTextFileSafe(const APath: string; out AContent: string; AEncoding: TFileEncoding; AStartLine: integer;
   AEndLine: integer; AMaxBytes: int64; out ATotalLines: integer; out ABytesRead: int64; out AFileSize: int64): boolean;
 var
@@ -568,7 +668,6 @@ var
   UResult: unicodestring;
   Probe: unicodestring;
   Lines: TStringList;
-  I: integer;
 begin
   Result := False;
   AContent := '';
@@ -651,29 +750,19 @@ begin
   if (Length(UText) > 0) and (UText[1] = #$FEFF) then
     Delete(UText, 1, 1);
 
-  Lines := TStringList.Create;
-  try
-    Lines.Text := UTF8Encode(UText);
-    ATotalLines := Lines.Count;
+  if (AStartLine >= 1) or (AEndLine >= 1) then
+    UResult := ExtractTextLineRange(UText, AStartLine, AEndLine, ATotalLines)
+  else
+  begin
+    Lines := TStringList.Create;
+    try
+      Lines.Text := UTF8Encode(UText);
+      ATotalLines := Lines.Count;
+    finally
+      Lines.Free;
+    end;
 
-    if (AStartLine >= 1) or (AEndLine >= 1) then
-    begin
-      if AStartLine < 1 then
-        AStartLine := 1;
-      if (AEndLine < 0) or (AEndLine > ATotalLines) then
-        AEndLine := ATotalLines;
-      UResult := '';
-      for I := AStartLine - 1 to AEndLine - 1 do
-      begin
-        if I > AStartLine - 1 then
-          UResult := UResult + #13#10;
-        UResult := UResult + UTF8Decode(Lines[I]);
-      end;
-    end
-    else
-      UResult := UText;
-  finally
-    Lines.Free;
+    UResult := UText;
   end;
 
   // Encode as UTF-8 bytes into the AnsiString result
@@ -3898,7 +3987,7 @@ begin
       'Do not give up on large files, read them in sections until you have the ' + 'content you need.';
 end;
 
-procedure TCustomOllamaAgent.RefreshContextInfo(AQueryOllama: Boolean = True);
+procedure TCustomOllamaAgent.RefreshContextInfo(AQueryOllama: boolean = True);
 var
   ResolvedCtx: int64;
 begin
@@ -4947,7 +5036,7 @@ end;
 
 function TCustomOllamaAgent.DoEditFile(AArgs: TJSONObject): string;
 var
-  RelPath, FullPath, Content, OldStr, NewStr: string;
+  RelPath, FullPath, Content, OldStr, NewStr, FileLineBreak: string;
   ReplaceAll: boolean;
   P, SecondPos: integer;
   Count: integer;
@@ -4988,6 +5077,12 @@ begin
     Result := '{"error": "cannot read file"}';
     Exit;
   end;
+
+  // Normalize only replacement strings, preserving untouched file content
+  FileLineBreak := DetectTextLineBreak(Content);
+  OldStr := NormalizeTextLineBreaks(OldStr, FileLineBreak);
+  NewStr := NormalizeTextLineBreaks(NewStr, FileLineBreak);
+
   Count := 0;
   if ReplaceAll then
   begin
