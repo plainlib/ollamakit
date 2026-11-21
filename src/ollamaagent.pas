@@ -4449,11 +4449,10 @@ begin
       AddTool(Arr, 'file_info', 'Size, modification time and type of a file or directory',
         '{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}');
       AddTool(Arr, 'apply_patch',
-        'Apply a patch to one existing text file. Supports unified diff and Codex patch formats. ' +
-        'Codex format uses *** Begin Patch, *** Update File: path and *** End Patch markers. ' +
-        'For Codex patches, the target path is extracted from the *** Update File header, so path is optional. ' +
-        'For unified diffs, path is required. Supports multiple hunks and requires exact context lines.',
-        '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative file path. Required for unified diff. For Codex patches, extracted from the *** Update File header if omitted."},"patch":{"type":"string","description":"Unified diff or Codex patch. Codex format must include *** Begin Patch, *** Update File: path and *** End Patch."}},"required":["patch"]}');
+        'Apply a patch to one existing text file. Supports unified diff and Codex patch formats, including Codex patches with --- a/path and +++ b/path headers. '
+        + 'Codex patches must start with *** Begin Patch and end with *** End Patch. Use either *** Update File: path or matching --- a/path and +++ b/path headers. '
+        + 'The target path is extracted from Codex headers; path is optional. Unified diff requires path. Preserve exact context, indentation and line endings.',
+        '{"type":"object","properties":{"path":{"type":"string","description":"Optional relative file path. Required for unified diff. For Codex patches, extracted from the patch headers if omitted."},"patch":{"type":"string","description":"Unified diff or Codex patch with *** Begin Patch and *** End Patch markers."}},"required":["patch"]}');
       AddTool(Arr, 'write_file', 'Write contents to a file, creates parent directories',
         '{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}');
       AddTool(Arr, 'edit_file',
@@ -5305,8 +5304,7 @@ begin
       begin
         if LinesInfo[J].EolLength > 0 then
         begin
-          CandidateEOL := Copy(Content, LinesInfo[J].TextStart + LinesInfo[J].TextLength,
-            LinesInfo[J].EolLength);
+          CandidateEOL := Copy(Content, LinesInfo[J].TextStart + LinesInfo[J].TextLength, LinesInfo[J].EolLength);
           Break;
         end;
       end;
@@ -5589,6 +5587,7 @@ var
   IsCodexPatch: boolean = False;
   NoNewlineAtEOF: boolean = False;
   ResultNoNewlineAtEOF: boolean = False;
+  IsHybridPatch: boolean = False;
 
   function DetectLineBreak(const S: string): string;
   begin
@@ -5639,17 +5638,21 @@ var
     end;
   end;
 
-  // Extracts the target path from a Codex patch.
-  function ExtractCodexPatchPath(const APatch: string; out APath: string; out AIsCodexPatch: boolean): boolean;
+  // Extracts the target path and detects the patch format.
+  function ExtractCodexPatchPath(const APatch: string; out APath: string; out AIsCodexPatch: boolean;
+    out AIsHybridPatch: boolean): boolean;
   var
     TempLines: TStringList = nil;
     LI: integer = 0;
     LineText: string = '';
+    OldPath: string = '';
+    NewPath: string = '';
     HasUpdate: boolean = False;
   begin
     Result := False;
     APath := string.Empty;
     AIsCodexPatch := False;
+    AIsHybridPatch := False;
 
     TempLines := TStringList.Create;
     try
@@ -5658,7 +5661,7 @@ var
       for LI := 0 to TempLines.Count - 1 do
       begin
         LineText := Trim(TempLines[LI]);
-        if LineText = '' then
+        if LineText = string.Empty then
           Continue;
 
         AIsCodexPatch := LineText = '*** Begin Patch';
@@ -5670,7 +5673,7 @@ var
 
       for LI := 0 to TempLines.Count - 1 do
       begin
-        LineText := TempLines[LI];
+        LineText := Trim(TempLines[LI]);
 
         if Copy(LineText, 1, Length('*** Update File: ')) = '*** Update File: ' then
         begin
@@ -5679,10 +5682,32 @@ var
 
           APath := Trim(Copy(LineText, Length('*** Update File: ') + 1, MaxInt));
           HasUpdate := True;
-        end;
+        end
+        else if Copy(LineText, 1, 4) = '--- ' then
+          OldPath := Trim(Copy(LineText, 5, MaxInt))
+        else if Copy(LineText, 1, 4) = '+++ ' then
+          NewPath := Trim(Copy(LineText, 5, MaxInt));
       end;
 
-      Result := HasUpdate and (APath <> string.Empty);
+      if HasUpdate then
+        Exit(APath <> string.Empty);
+
+      // Accept unified diff file headers inside a Codex patch.
+      if (OldPath <> string.Empty) and (NewPath <> string.Empty) then
+      begin
+        if Copy(OldPath, 1, 2) = 'a/' then
+          Delete(OldPath, 1, 2);
+
+        if Copy(NewPath, 1, 2) = 'b/' then
+          Delete(NewPath, 1, 2);
+
+        if not SameText(OldPath, NewPath) then
+          Exit;
+
+        APath := NewPath;
+        AIsHybridPatch := True;
+        Result := APath <> string.Empty;
+      end;
     finally
       TempLines.Free;
     end;
@@ -5982,12 +6007,12 @@ var
       PatchLine := PatchLines[LI];
 
       // Skip file headers and git extended headers.
-      if (Copy(PatchLine, 1, 4) = '--- ') or (Copy(PatchLine, 1, 4) = '+++ ') or (Copy(PatchLine, 1, 11) = 'diff --git ') or
-        (Copy(PatchLine, 1, 6) = 'index ') or (Copy(PatchLine, 1, 15) = 'new file mode ') or
-        (Copy(PatchLine, 1, 19) = 'deleted file mode ') or (Copy(PatchLine, 1, 16) = 'similarity index ') or
-        (Copy(PatchLine, 1, 9) = 'old mode ') or (Copy(PatchLine, 1, 9) = 'new mode ') or
-        (Copy(PatchLine, 1, 10) = 'rename from ') or (Copy(PatchLine, 1, 8) = 'rename to ') or
-        (Copy(PatchLine, 1, 8) = 'copy from ') or (Copy(PatchLine, 1, 6) = 'copy to ') then
+      if (Trim(PatchLine) = '*** Begin Patch') or (Trim(PatchLine) = '*** End Patch') or (Copy(PatchLine, 1, 4) = '--- ') or
+        (Copy(PatchLine, 1, 4) = '+++ ') or (Copy(PatchLine, 1, 11) = 'diff --git ') or (Copy(PatchLine, 1, 6) = 'index ') or
+        (Copy(PatchLine, 1, 15) = 'new file mode ') or (Copy(PatchLine, 1, 19) = 'deleted file mode ') or
+        (Copy(PatchLine, 1, 16) = 'similarity index ') or (Copy(PatchLine, 1, 9) = 'old mode ') or
+        (Copy(PatchLine, 1, 9) = 'new mode ') or (Copy(PatchLine, 1, 10) = 'rename from ') or
+        (Copy(PatchLine, 1, 8) = 'rename to ') or (Copy(PatchLine, 1, 8) = 'copy from ') or (Copy(PatchLine, 1, 6) = 'copy to ') then
       begin
         Inc(LI);
         Continue;
@@ -6146,7 +6171,7 @@ begin
   end;
 
   // Resolve the target path from the patch header when path is omitted.
-  if not ExtractCodexPatchPath(Patch, PatchPath, IsCodexPatch) then
+  if not ExtractCodexPatchPath(Patch, PatchPath, IsCodexPatch, IsHybridPatch) then
   begin
     Result := '{"error": "invalid or missing Update File path"}';
     Exit;
@@ -6219,7 +6244,7 @@ begin
     HunkCount := 0;
     ResultNoNewlineAtEOF := NoNewlineAtEOF;
 
-    if IsCodexPatch then
+    if IsCodexPatch and not IsHybridPatch then
     begin
       if not ApplyCodexPatch(ErrorMsg) then
       begin
