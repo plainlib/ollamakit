@@ -151,6 +151,7 @@ type
     // Previous agent handlers, restored when agent is detached
     FPrevAgentOnChunk: TAgentChunkEvent;
     FPrevAgentOnLog: TAgentLogEvent;
+    FPrevAgentOnContextUsage: TAgentContextUsageEvent;
     FPrevAgentOnThinking: TAgentThinkingEvent;
     FPrevAgentOnToolCall: TAgentToolCallEvent;
     FPrevAgentOnToolResult: TAgentToolResultEvent;
@@ -307,6 +308,8 @@ type
     procedure CloseThinking;
     // Prints agent log lines in thinking color
     procedure HandleAgentLog(Sender: TObject; const AText: string);
+    // Refreshes context indicators after agent usage changes
+    procedure HandleAgentContextUsage(Sender: TObject; AUsed, ATotal: integer);
     // Redirects agent thinking chunks to console output with a label
     procedure HandleAgentThinking(Sender: TObject; const AText: string);
     // Prints tool call label with surrounding blank lines
@@ -824,6 +827,7 @@ begin
   FPrevAgentOnFinish := nil;
   FPrevAgentOnExecCommand := nil;
   FPrevAgentOnAskUser := nil;
+  FPrevAgentOnContextUsage := nil;
   FInThinking := False;
   FFirstChunkSeen := False;
   FFinishToolCalled := False;
@@ -947,6 +951,7 @@ begin
     FPrevAgentOnFinish := nil;
     FPrevAgentOnExecCommand := nil;
     FPrevAgentOnAskUser := nil;
+    FPrevAgentOnContextUsage := nil;
     FPrevAgentOnLog := nil;
     FInThinking := False;
   end;
@@ -1202,6 +1207,15 @@ begin
   WriteText(AText, True);
   SetColor(tcDefault);
   WriteLine('', True);
+end;
+
+procedure TCustomTermManager.HandleAgentContextUsage(Sender: TObject; AUsed, ATotal: integer);
+begin
+  // Refresh the native title using the current agent counters
+  UpdateConsoleTitle;
+
+  if Assigned(FPrevAgentOnContextUsage) then
+    FPrevAgentOnContextUsage(Sender, AUsed, ATotal);
 end;
 
 procedure TCustomTermManager.HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
@@ -3976,6 +3990,7 @@ begin
             FPrevAgentOnExecCommand := FAgent.OnExecCommand;
             FPrevAgentOnAskUser := FAgent.OnAskUser;
             FPrevAgentOnLog := FAgent.OnLog;
+            FPrevAgentOnContextUsage := FAgent.OnContextUsage;
             FAgent.OnChunk := @HandleAgentChunk;
             FAgent.OnThinking := @HandleAgentThinking;
             FAgent.OnToolCall := @HandleAgentToolCall;
@@ -3983,6 +3998,7 @@ begin
             FAgent.OnFinish := @HandleAgentFinish;
             FAgent.OnExecCommand := @HandleAgentExecCommand;
             FAgent.OnAskUser := @HandleAgentAskUser;
+            FAgent.OnContextUsage := @HandleAgentContextUsage;
             try
               FFirstChunkSeen := False;
               FAgent.RunAsync(Payload);
@@ -4025,6 +4041,7 @@ begin
               FAgent.OnExecCommand := FPrevAgentOnExecCommand;
               FAgent.OnAskUser := FPrevAgentOnAskUser;
               FAgent.OnLog := FPrevAgentOnLog;
+              FAgent.OnContextUsage := FPrevAgentOnContextUsage;
               FPrevAgentOnChunk := nil;
               FPrevAgentOnThinking := nil;
               FPrevAgentOnToolCall := nil;
@@ -4032,6 +4049,7 @@ begin
               FPrevAgentOnFinish := nil;
               FPrevAgentOnExecCommand := nil;
               FPrevAgentOnAskUser := nil;
+              FPrevAgentOnContextUsage := nil;
               FPrevAgentOnLog := nil;
               FInThinking := False;
               SetColor(tcDefault);
