@@ -1334,7 +1334,7 @@ begin
 end;
 
 // Finds a safe cut point for history compaction, -1 when no valid cut exists
-function FindCompactionCutPoint(AMessages: TJSONArray; AKeepLast: integer): integer;
+function FindCompactionCutPoint(AMessages: TJSONArray; AKeepLast: integer; AExcludeCurrentRun: boolean = False): integer;
 var
   I: integer;
   MsgObj: TJSONObject;
@@ -1355,8 +1355,8 @@ begin
 
     MsgObj := TJSONObject(AMessages.Items[I]);
 
-    // Ignore service messages when looking for a safe cut point
-    if MsgObj.Get('_service', False) then
+    // Ignore service and protected current-run messages
+    if MsgObj.Get('_service', False) or (AExcludeCurrentRun and MsgObj.Get('_current_run', False)) then
     begin
       Dec(I);
       Continue;
@@ -2067,8 +2067,6 @@ const
   MAX_EMPTY_RESPONSE_RETRIES = 2;
   // Compaction triggers when context usage reaches this percent
   COMPACT_THRESHOLD_PCT = 75;
-  // Minimum number of messages before compaction is attempted
-  COMPACT_MIN_MESSAGES = 10;
   // Always keep at least this many messages from the end after compaction
   KEEP_RECENT_MESSAGES = 5;
   // Cap on the total bytes sent to the summarizer, prevents overflow
@@ -2092,6 +2090,7 @@ var
   ResolvedCtx: int64;
   SystemPromptText: string;
   CutPoint: integer;
+  CompactCurrentRun: boolean;
   OldMsgsStr, MsgStr, Summary: string;
   NewArr: TJSONArray;
   SummObj: TJSONObject;
@@ -2190,8 +2189,8 @@ begin
         MsgObj.Add('content', FAgent.FContextPrelude + #10#10 + FUserText)
       else
         MsgObj.Add('content', FUserText);
+      MsgObj.Add('_current_run', True);
       MessagesArr.Add(MsgObj);
-      UserMessageAdded := True;
 
       if SendTools then
         ToolsJson := FAgent.BuildToolsSchemaJson
@@ -2229,13 +2228,28 @@ begin
         FCurrentContent := '';
         // Compact history when context is near full and there is room to cut
         if (FAgent.FContextTotal > 0) and (FAgent.FContextUsed > 0) and (FAgent.FContextUsed * 100 div
-          FAgent.FContextTotal >= COMPACT_THRESHOLD_PCT) and (MessagesArr.Count > COMPACT_MIN_MESSAGES) then
+          FAgent.FContextTotal >= COMPACT_THRESHOLD_PCT) and (MessagesArr.Count > KEEP_RECENT_MESSAGES + 2) then
         begin
-          CutPoint := FindCompactionCutPoint(MessagesArr, KEEP_RECENT_MESSAGES);
+          // Prefer compacting only previous conversation history
+          CompactCurrentRun := False;
+          CutPoint := FindCompactionCutPoint(MessagesArr, KEEP_RECENT_MESSAGES, True);
+
+          // Compact the current run only when older history cannot be reduced further
+          if CutPoint <= 1 then
+          begin
+            CompactCurrentRun := True;
+            CutPoint := FindCompactionCutPoint(MessagesArr, KEEP_RECENT_MESSAGES, False);
+          end;
+
           if CutPoint > 1 then
           begin
-            FAgent.LogLine(Format('Compacting: context %d/%d, %d old messages', [FAgent.FContextUsed,
-              FAgent.FContextTotal, CutPoint - 1]));
+            if CompactCurrentRun then
+              FAgent.LogLine(Format('Compacting current run: context %d/%d, %d messages',
+                [FAgent.FContextUsed, FAgent.FContextTotal, CutPoint - 1]))
+            else
+              FAgent.LogLine(Format('Compacting old history: context %d/%d, %d messages',
+                [FAgent.FContextUsed, FAgent.FContextTotal, CutPoint - 1]));
+
             // Build a bounded input for the summarizer
             OldMsgsStr := '';
             for I := 1 to CutPoint - 1 do
@@ -2245,7 +2259,6 @@ begin
                 IncludeThinking := TJSONObject(MessagesArr.Items[I]).Get('_current_run', False);
 
               MsgStr := BuildContextMessageJson(MessagesArr.Items[I], IncludeThinking);
-              ;
               if MsgStr = string.Empty then
                 Continue;
 
@@ -2258,6 +2271,7 @@ begin
                 Break;
               end;
             end;
+
             Summary := FAgent.SummarizeMessages(OldMsgsStr);
             if Summary <> '' then
             begin
@@ -2288,19 +2302,24 @@ begin
             FAgent.LogLine('Compaction skipped, no safe cut point');
         end;
 
-        // Keep only the most recent tool results intact, older ones are truncated
+        // Truncate only old tool results, keep the current run intact
         TruncTotalTool := 0;
         for TruncIdx := 0 to MessagesArr.Count - 1 do
-          if (MessagesArr.Items[TruncIdx].JSONType = jtObject) and
-            (TJSONObject(MessagesArr.Items[TruncIdx]).Get('role', '') = 'tool') then
+        begin
+          if MessagesArr.Items[TruncIdx].JSONType <> jtObject then
+            Continue;
+          MsgObj := TJSONObject(MessagesArr.Items[TruncIdx]);
+          if (MsgObj.Get('role', '') = 'tool') and not MsgObj.Get('_current_run', False) then
             Inc(TruncTotalTool);
+        end;
+
         TruncSeen := 0;
         for TruncIdx := 0 to MessagesArr.Count - 1 do
         begin
           if MessagesArr.Items[TruncIdx].JSONType <> jtObject then
             Continue;
           MsgObj := TJSONObject(MessagesArr.Items[TruncIdx]);
-          if MsgObj.Get('role', '') <> 'tool' then
+          if (MsgObj.Get('role', '') <> 'tool') or MsgObj.Get('_current_run', False) then
             Continue;
           Inc(TruncSeen);
           if TruncSeen > TruncTotalTool - KEEP_RECENT_TOOL_RESULTS then
@@ -2658,6 +2677,7 @@ begin
             MsgObj := TJSONObject.Create;
             MsgObj.Add('role', 'tool');
             MsgObj.Add('content', ToolResultArr[ToolIdx]);
+            MsgObj.Add('_current_run', True);
             MessagesArr.Add(MsgObj);
           end;
         finally
