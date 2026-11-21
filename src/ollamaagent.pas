@@ -363,7 +363,7 @@ type
     // Resolves placeholders in SystemPrompt using current values
     function BuildSystemPrompt: string; virtual;
     // Resolves model context window size and updates ContextTotal
-    procedure RefreshContextInfo;
+    procedure RefreshContextInfo(AQueryOllama: Boolean = True);
     // Resets usage counters in the manager and this agent
     procedure ResetUsage;
 
@@ -3898,20 +3898,32 @@ begin
       'Do not give up on large files, read them in sections until you have the ' + 'content you need.';
 end;
 
-procedure TCustomOllamaAgent.RefreshContextInfo;
+procedure TCustomOllamaAgent.RefreshContextInfo(AQueryOllama: Boolean = True);
 var
   ResolvedCtx: int64;
 begin
-  FContextTotal := 0;
   if not Assigned(FOllamaManager) then
+  begin
+    if AQueryOllama then
+      FContextTotal := 0;
     Exit;
-  if Trim(FModelName) = '' then
-    Exit;
+  end;
+
   if FOllamaManager.NumCtx > 0 then
   begin
     FContextTotal := FOllamaManager.NumCtx;
     Exit;
   end;
+
+  // Keep the current value when querying Ollama is disabled
+  if not AQueryOllama then
+    Exit;
+
+  FContextTotal := 0;
+
+  if Trim(FModelName) = '' then
+    Exit;
+
   ResolvedCtx := FOllamaManager.GetModelContextLength(FModelName);
   if ResolvedCtx > 0 then
     FContextTotal := ResolvedCtx;

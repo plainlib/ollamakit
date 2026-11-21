@@ -112,6 +112,7 @@ type
   private
     FPath: string;
     FPrompt: string;
+    FStartupPrompt: string;
 
     FWelcome: TCaption;
     // Label printed before agent thinking block, followed by a newline
@@ -344,6 +345,7 @@ type
 
     property Path: string read FPath write SetPath;
     property Prompt: string read FPrompt write FPrompt;
+    property StartupPrompt: string read FStartupPrompt write FStartupPrompt;
     property Welcome: TCaption read FWelcome write FWelcome;
     property ThinkingLabel: TCaption read FThinkingLabel write FThinkingLabel;
     property ShowThinking: boolean read FShowThinking write FShowThinking default True;
@@ -2491,6 +2493,8 @@ begin
       else
       begin
         FAgent.OllamaManager.NumCtx := Value;
+        FAgent.ContextTotal := Value;
+
         if Value = 0 then
           DoOutput('context reset to Ollama default' + LineEnding, False)
         else
@@ -3752,6 +3756,7 @@ procedure TCustomTermManager.Run;
 var
   Line, Payload: string;
   Kind: TTermInputKind;
+  UseStartupPrompt: boolean;
   Allow: boolean;
   CancelledShown: boolean;
   WaitShown: boolean;
@@ -3763,6 +3768,8 @@ var
   InModeSaved: boolean;
   {$ENDIF}
 begin
+  RestoreActiveChat;
+
   {$IFDEF WINDOWS}
   // Force UTF-8 everywhere so OEM->UTF-8 conversion is consistent
   DefaultSystemCodePage := CP_UTF8;
@@ -3792,13 +3799,34 @@ begin
 
   // Start with explicit default color so prompt and banner match scheme
   SetColor(tcDefault);
+  UseStartupPrompt := FStartupPrompt <> string.Empty;
 
   FRunning := True;
   FLastExitCode := 0;
   try
     while FRunning do
     begin
-      Line := ReadLine;
+      if UseStartupPrompt then
+      begin
+        // Refresh context information before displaying the startup prompt
+        if Assigned(FAgent) then
+          FAgent.RefreshContextInfo(False);
+
+        Line := '?' + FStartupPrompt;
+        FStartupPrompt := string.Empty;
+        UseStartupPrompt := False;
+
+        // Display and record the initial agent request
+        WriteLine(GetPromptText + Line, False);
+        AddToHistory(Line);
+
+        if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+          FPendingOutputStart := Length(FAgent.ActiveChat.TerminalOutput);
+
+        AppendChatOutput(GetPromptText + Line + LineEnding);
+      end
+      else
+        Line := ReadLine;
       if not FRunning then
         Break;
       Kind := ClassifyLine(Line, Payload);
