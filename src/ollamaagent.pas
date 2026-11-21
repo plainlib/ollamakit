@@ -2090,7 +2090,6 @@ var
   ResolvedCtx: int64;
   SystemPromptText: string;
   CutPoint: integer;
-  CompactCurrentRun: boolean;
   OldMsgsStr, MsgStr, Summary: string;
   NewArr: TJSONArray;
   SummObj: TJSONObject;
@@ -2102,7 +2101,6 @@ var
   Threads: TList;
   SupportsTools: boolean;
   StoredHistory: TJSONArray;
-  IncludeThinking: boolean;
   UserMessageAdded: boolean;
 begin
   UserMessageAdded := False;
@@ -2191,6 +2189,7 @@ begin
         MsgObj.Add('content', FUserText);
       MsgObj.Add('_current_run', True);
       MessagesArr.Add(MsgObj);
+      UserMessageAdded := True;
 
       if SendTools then
         ToolsJson := FAgent.BuildToolsSchemaJson
@@ -2230,35 +2229,19 @@ begin
         if (FAgent.FContextTotal > 0) and (FAgent.FContextUsed > 0) and (FAgent.FContextUsed * 100 div
           FAgent.FContextTotal >= COMPACT_THRESHOLD_PCT) and (MessagesArr.Count > KEEP_RECENT_MESSAGES + 2) then
         begin
-          // Prefer compacting only previous conversation history
-          CompactCurrentRun := False;
+          // Compact only previous conversation history, never the current run
           CutPoint := FindCompactionCutPoint(MessagesArr, KEEP_RECENT_MESSAGES, True);
-
-          // Compact the current run only when older history cannot be reduced further
-          if CutPoint <= 1 then
-          begin
-            CompactCurrentRun := True;
-            CutPoint := FindCompactionCutPoint(MessagesArr, KEEP_RECENT_MESSAGES, False);
-          end;
 
           if CutPoint > 1 then
           begin
-            if CompactCurrentRun then
-              FAgent.LogLine(Format('Compacting current run: context %d/%d, %d messages',
-                [FAgent.FContextUsed, FAgent.FContextTotal, CutPoint - 1]))
-            else
-              FAgent.LogLine(Format('Compacting old history: context %d/%d, %d messages',
-                [FAgent.FContextUsed, FAgent.FContextTotal, CutPoint - 1]));
+            FAgent.LogLine(Format('Compacting old history: context %d/%d, %d messages',
+              [FAgent.FContextUsed, FAgent.FContextTotal, CutPoint - 1]));
 
             // Build a bounded input for the summarizer
             OldMsgsStr := '';
             for I := 1 to CutPoint - 1 do
             begin
-              IncludeThinking := False;
-              if MessagesArr.Items[I].JSONType = jtObject then
-                IncludeThinking := TJSONObject(MessagesArr.Items[I]).Get('_current_run', False);
-
-              MsgStr := BuildContextMessageJson(MessagesArr.Items[I], IncludeThinking);
+              MsgStr := BuildContextMessageJson(MessagesArr.Items[I]);
               if MsgStr = string.Empty then
                 Continue;
 
@@ -3839,7 +3822,16 @@ var
   I, UserIndex: integer;
 begin
   Result := False;
-  if not FDone or (FHistory = string.Empty) then
+
+  // Do not modify history while the agent is processing a request
+  if not FDone then
+    Exit;
+
+  // Use the active chat as the source of truth
+  if Assigned(FActiveChat) then
+    FHistory := FActiveChat.History;
+
+  if FHistory = string.Empty then
     Exit;
 
   Data := nil;
@@ -5055,43 +5047,192 @@ begin
 end;
 
 function TCustomOllamaAgent.DoEditFile(AArgs: TJSONObject): string;
+type
+  TStringArray = array of string;
+
+  TLineInfo = record
+    TextStart: integer;
+    TextLength: integer;
+    EolLength: integer;
+  end;
+
+  TLineInfoArray = array of TLineInfo;
 var
   RelPath, FullPath, Content, OldStr, NewStr, FileLineBreak: string;
   ReplaceAll: boolean;
-  P, SecondPos: integer;
-  Count: integer;
+  P, SecondPos, Count: integer;
+  Lines, OldLines: TStringArray;
+  LinesInfo, OldLinesInfo: TLineInfoArray;
+  I, J, OldIndent, MatchCount: integer;
+  MatchStart, MatchEnd: integer;
+  CandidateIndent: integer;
+  CandidateEOL, IndentPrefix: string;
+  NewContent: string;
+
+  procedure ParseLines(const AText: string; out ATexts: TStringArray; out AInfo: TLineInfoArray);
+  var
+    PosIndex, LineStart, LineIndex, EolLen: integer;
+  begin
+    ATexts := nil;
+    AInfo := nil;
+    SetLength(ATexts, 0);
+    SetLength(AInfo, 0);
+
+    PosIndex := 1;
+
+    while PosIndex <= Length(AText) do
+    begin
+      LineStart := PosIndex;
+
+      while (PosIndex <= Length(AText)) and not (AText[PosIndex] in [#10, #13]) do
+        Inc(PosIndex);
+
+      LineIndex := Length(ATexts);
+      SetLength(ATexts, LineIndex + 1);
+      SetLength(AInfo, LineIndex + 1);
+
+      ATexts[LineIndex] := Copy(AText, LineStart, PosIndex - LineStart);
+
+      AInfo[LineIndex].TextStart := LineStart;
+      AInfo[LineIndex].TextLength := PosIndex - LineStart;
+      AInfo[LineIndex].EolLength := 0;
+
+      if PosIndex <= Length(AText) then
+      begin
+        EolLen := 1;
+
+        if (AText[PosIndex] = #13) and (PosIndex < Length(AText)) and (AText[PosIndex + 1] = #10) then
+          EolLen := 2;
+
+        AInfo[LineIndex].EolLength := EolLen;
+        Inc(PosIndex, EolLen);
+      end;
+    end;
+  end;
+
+  function GetCommonIndent(const ALines: TStringArray; AStartIndex, ALineCount: integer): integer;
+  var
+    LineIndex, CharIndex, LineIndent: integer;
+  begin
+    Result := MaxInt;
+
+    for LineIndex := AStartIndex to AStartIndex + ALineCount - 1 do
+    begin
+      if Trim(ALines[LineIndex]) = '' then
+        Continue;
+
+      LineIndent := 0;
+
+      for CharIndex := 1 to Length(ALines[LineIndex]) do
+      begin
+        if not (ALines[LineIndex][CharIndex] in [' ', #9]) then
+          Break;
+
+        Inc(LineIndent);
+      end;
+
+      if LineIndent < Result then
+        Result := LineIndent;
+    end;
+
+    if Result = MaxInt then
+      Result := 0;
+  end;
+
+  function NormalizeLine(const ALine: string; AIndent: integer): string;
+  begin
+    if Trim(ALine) = '' then
+      Exit('');
+
+    Result := Copy(ALine, AIndent + 1, MaxInt);
+  end;
+
+  function GetIndentPrefix(const ALines: TStringArray; AStartIndex, ALineCount, AIndent: integer): string;
+  var
+    LineIndex: integer;
+  begin
+    Result := '';
+
+    for LineIndex := AStartIndex to AStartIndex + ALineCount - 1 do
+    begin
+      if Trim(ALines[LineIndex]) = '' then
+        Continue;
+
+      Result := Copy(ALines[LineIndex], 1, AIndent);
+      Exit;
+    end;
+  end;
+
+  function HasTrailingLineBreak(const AText: string): boolean;
+  begin
+    Result := (AText <> '') and (AText[Length(AText)] in [#10, #13]);
+  end;
+
+  function BuildIndentedReplacement(const AText, AIndentPrefix, ALineBreak: string): string;
+  var
+    ReplacementLines: TStringArray;
+    ReplacementInfo: TLineInfoArray;
+    LineIndex, ReplacementIndent: integer;
+  begin
+    Result := '';
+
+    ParseLines(AText, ReplacementLines, ReplacementInfo);
+    ReplacementIndent := GetCommonIndent(ReplacementLines, 0, Length(ReplacementLines));
+
+    for LineIndex := 0 to Length(ReplacementLines) - 1 do
+    begin
+      if Trim(ReplacementLines[LineIndex]) <> '' then
+        Result := Result + AIndentPrefix + Copy(ReplacementLines[LineIndex], ReplacementIndent + 1, MaxInt)
+      else
+        Result := Result + ReplacementLines[LineIndex];
+
+      if ReplacementInfo[LineIndex].EolLength > 0 then
+        Result := Result + ALineBreak;
+    end;
+  end;
+
 begin
   Result := '{"error": "invalid arguments"}';
+
   if AArgs = nil then
     Exit;
+
   RelPath := AArgs.Get('path', '');
+
   // Model may emit {"": "path"} or {"filename": "path"} when confused
   if (RelPath = '') and (AArgs.Count = 1) and (AArgs.Names[0] = '') then
     RelPath := AArgs.Items[0].AsString;
+
   OldStr := AArgs.Get('old_string', '');
   NewStr := AArgs.Get('new_string', '');
   ReplaceAll := GetBoolArg(AArgs, 'replace_all', False);
+
   if OldStr = '' then
   begin
     Result := '{"error": "old_string is required"}';
     Exit;
   end;
+
   FullPath := SafePath(RelPath);
+
   if FullPath = '' then
   begin
     Result := SafePathError;
     Exit;
   end;
+
   if not FileExists(FullPath) then
   begin
     Result := BuildFileNotFoundError(FullPath, RelPath);
     Exit;
   end;
+
   if IsBinaryFile(FullPath) then
   begin
     Result := '{"error": "binary file detected, cannot edit binary files"}';
     Exit;
   end;
+
   if not ReadTextFileSafe(FullPath, Content) then
   begin
     Result := '{"error": "cannot read file"}';
@@ -5103,45 +5244,132 @@ begin
   OldStr := NormalizeTextLineBreaks(OldStr, FileLineBreak);
   NewStr := NormalizeTextLineBreaks(NewStr, FileLineBreak);
 
-  Count := 0;
-  if ReplaceAll then
+  P := Pos(OldStr, Content);
+
+  if P = 0 then
   begin
-    P := Pos(OldStr, Content);
-    if P = 0 then
+    // Try matching the block while ignoring its common indentation
+    ParseLines(Content, Lines, LinesInfo);
+    ParseLines(OldStr, OldLines, OldLinesInfo);
+
+    if (Length(OldLines) = 0) or (GetCommonIndent(OldLines, 0, Length(OldLines)) = 0) and (Trim(OldLines[0]) = '') then
     begin
       Result := '{"error": "old_string not found"}';
       Exit;
     end;
-    while P > 0 do
+
+    OldIndent := GetCommonIndent(OldLines, 0, Length(OldLines));
+
+    MatchCount := 0;
+    MatchStart := 0;
+    MatchEnd := 0;
+    IndentPrefix := '';
+    CandidateEOL := FileLineBreak;
+
+    for I := 0 to Length(Lines) - Length(OldLines) do
     begin
-      Inc(Count);
-      P := Pos(OldStr, Content, P + Length(OldStr));
+      CandidateIndent := GetCommonIndent(Lines, I, Length(OldLines));
+
+      // Compare each line after removing the block's common indentation
+      for J := 0 to Length(OldLines) - 1 do
+      begin
+        if NormalizeLine(OldLines[J], OldIndent) <> NormalizeLine(Lines[I + J], CandidateIndent) then
+          Break;
+      end;
+
+      if J < Length(OldLines) then
+        Continue;
+
+      // A trailing line break in old_string must also exist in the file
+      if HasTrailingLineBreak(OldStr) and (LinesInfo[I + Length(OldLines) - 1].EolLength = 0) then
+        Continue;
+
+      Inc(MatchCount);
+
+      if MatchCount > 1 then
+        Break;
+
+      MatchStart := LinesInfo[I].TextStart;
+
+      MatchEnd :=
+        LinesInfo[I + Length(OldLines) - 1].TextStart + LinesInfo[I + Length(OldLines) - 1].TextLength;
+
+      if HasTrailingLineBreak(OldStr) then
+        Inc(MatchEnd,
+          LinesInfo[I + Length(OldLines) - 1].EolLength);
+
+      IndentPrefix := GetIndentPrefix(Lines, I, Length(OldLines), CandidateIndent);
+
+      // Use the line ending of the matched block
+      for J := I to I + Length(OldLines) - 1 do
+      begin
+        if LinesInfo[J].EolLength > 0 then
+        begin
+          CandidateEOL := Copy(Content, LinesInfo[J].TextStart + LinesInfo[J].TextLength,
+            LinesInfo[J].EolLength);
+          Break;
+        end;
+      end;
     end;
-    Content := StringReplace(Content, OldStr, NewStr, [rfReplaceAll]);
+
+    if MatchCount > 1 then
+    begin
+      Result := '{"error": "old_string is ambiguous after indentation normalization"}';
+      Exit;
+    end;
+
+    if MatchCount = 0 then
+    begin
+      Result := '{"error": "old_string not found"}';
+      Exit;
+    end;
+
+    // Adjust the replacement block to the indentation of the matched block
+    NewContent := BuildIndentedReplacement(NormalizeTextLineBreaks(NewStr, CandidateEOL), IndentPrefix, CandidateEOL);
+
+    Delete(Content, MatchStart, MatchEnd - MatchStart);
+    Insert(NewContent, Content, MatchStart);
+
+    Count := 1;
   end
   else
   begin
-    P := Pos(OldStr, Content);
-    if P = 0 then
+    Count := 0;
+
+    if ReplaceAll then
     begin
-      Result := '{"error": "old_string not found"}';
-      Exit;
-    end;
-    SecondPos := Pos(OldStr, Copy(Content, P + 1, MaxInt));
-    if SecondPos > 0 then
+      P := Pos(OldStr, Content);
+
+      while P > 0 do
+      begin
+        Inc(Count);
+        P := Pos(OldStr, Content, P + Length(OldStr));
+      end;
+
+      Content := StringReplace(Content, OldStr, NewStr, [rfReplaceAll]);
+    end
+    else
     begin
-      Result := '{"error": "old_string is ambiguous, occurs multiple times, provide more context or set replace_all=true"}';
-      Exit;
+      SecondPos := Pos(OldStr, Copy(Content, P + 1, MaxInt));
+
+      if SecondPos > 0 then
+      begin
+        Result := '{"error": "old_string is ambiguous, occurs multiple times, provide more context or set replace_all=true"}';
+        Exit;
+      end;
+
+      Delete(Content, P, Length(OldStr));
+      Insert(NewStr, Content, P);
+      Count := 1;
     end;
-    Delete(Content, P, Length(OldStr));
-    Insert(NewStr, Content, P);
-    Count := 1;
   end;
+
   if not WriteTextFileSafe(FullPath, Content) then
   begin
     Result := '{"error": "cannot write file"}';
     Exit;
   end;
+
   Result := '{"ok": true, "replaced": ' + IntToStr(Count) + '}';
 end;
 

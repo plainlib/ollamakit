@@ -2688,8 +2688,8 @@ begin
     Exit;
 
   // Remove the last agent exchange, including tool messages
-  if Mark.InputKind = Ord(tikAgent) then
-    FAgent.RemoveLastExchange;
+  if (Mark.InputKind = Ord(tikAgent)) and not FAgent.RemoveLastExchange then
+    Exit;
 
   // Remove shell log entries created by this operation
   for I := 1 to Mark.ShellLogCount do
