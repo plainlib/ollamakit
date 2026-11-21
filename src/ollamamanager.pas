@@ -104,6 +104,8 @@ type
     FLastPromptEvalCount: integer;
     // Generated tokens reported by the last completed request
     FLastEvalCount: integer;
+    // Diagnostics reported by the last completed request
+    FLastRequestStats: string;
     FAutoRefresh: boolean;
     FConnectionTimeout: integer;
     FRequestTimeout: integer;
@@ -268,6 +270,7 @@ type
     property LastPromptEvalCount: integer read FLastPromptEvalCount;
     property LastEvalCount: integer read FLastEvalCount;
     property LastUsageTotal: integer read GetLastUsageTotal;
+    property LastRequestStats: string read FLastRequestStats;
     property AutoRefresh: boolean read FAutoRefresh write FAutoRefresh default True;
     property ConnectionTimeout: integer read FConnectionTimeout write FConnectionTimeout default 5000;
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 30000;
@@ -574,6 +577,7 @@ begin
   FNumCtx := 0;
   FLastPromptEvalCount := 0;
   FLastEvalCount := 0;
+  FLastRequestStats := string.Empty;
   FAutoRefresh := True;
   FConnectionTimeout := 5000;
   FRequestTimeout := 30000;
@@ -2213,6 +2217,11 @@ type
     AccumulatedToolCalls: string;
     LastPromptEvalCount: integer;
     LastEvalCount: integer;
+    LastPromptEvalCachedCount: int64;
+    LastPromptEvalDuration: int64;
+    LastEvalDuration: int64;
+    LastTotalDuration: int64;
+    LastLoadDuration: int64;
     Done: boolean;
     Cancelled: boolean;
     UserCallback: TOllamaStreamCallback;
@@ -2255,6 +2264,11 @@ begin
       begin
         LastPromptEvalCount := Obj.Get('prompt_eval_count', 0);
         LastEvalCount := Obj.Get('eval_count', 0);
+        LastPromptEvalCachedCount := Obj.Get('prompt_eval_cached_count', int64(-1));
+        LastPromptEvalDuration := Obj.Get('prompt_eval_duration', int64(0));
+        LastEvalDuration := Obj.Get('eval_duration', int64(0));
+        LastTotalDuration := Obj.Get('total_duration', int64(0));
+        LastLoadDuration := Obj.Get('load_duration', int64(0));
       end;
       Result := True;
     except
@@ -2349,8 +2363,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2365,6 +2379,11 @@ begin
     Helper.Cancelled := False;
     Helper.UserCallback := AOnContent;
     Helper.ThinkingCallback := AOnThinking;
+    Helper.LastPromptEvalCachedCount := -1;
+    Helper.LastPromptEvalDuration := 0;
+    Helper.LastEvalDuration := 0;
+    Helper.LastTotalDuration := 0;
+    Helper.LastLoadDuration := 0;
 
     ErrFromNetwork := '';
     if not TNetwork.WebStreamRequest(wmPost, Url, JsonBody, nil, 'OllamaManager/1.0', 'application/json',
@@ -2398,6 +2417,12 @@ begin
     // Store usage counters reported by the server
     FLastPromptEvalCount := Helper.LastPromptEvalCount;
     FLastEvalCount := Helper.LastEvalCount;
+
+    FLastRequestStats := Format('prompt=%d cached=%d prompt_ms=%d eval=%d eval_ms=%d total_ms=%d load_ms=%d',
+      [Helper.LastPromptEvalCount, Helper.LastPromptEvalCachedCount, Helper.LastPromptEvalDuration div
+      1000000, Helper.LastEvalCount, Helper.LastEvalDuration div 1000000, Helper.LastTotalDuration div
+      1000000, Helper.LastLoadDuration div 1000000]);
+
     Result := Helper.FullFinal;
   finally
     Helper.Free;
@@ -2430,8 +2455,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin

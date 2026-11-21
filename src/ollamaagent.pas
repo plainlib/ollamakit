@@ -2487,6 +2487,11 @@ begin
 
         // Update usage counters from the manager after each step
         FAgent.FContextUsed := FAgent.OllamaManager.LastUsageTotal;
+
+        // Log prompt cache and request timing statistics
+        FAgent.LogLine(Format('Ollama stats: request_bytes=%d %s', [Length(MessagesJson),
+          FAgent.OllamaManager.LastRequestStats]));
+
         // Resolve context total from NumCtx or from loaded model info
         if FAgent.OllamaManager.NumCtx > 0 then
           FAgent.FContextTotal := FAgent.OllamaManager.NumCtx
