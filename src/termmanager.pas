@@ -887,7 +887,7 @@ begin
   if csDesigning in ComponentState then
     Exit;
 
-  Title := 'PlainConsole - ' + GetEffectivePath;
+  Title := 'PlainConsole - ' + GetPromptText;
 
   {$IFDEF WINDOWS}
   SetConsoleTitleW(PWideChar(UTF8Decode(Title)));
