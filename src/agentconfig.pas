@@ -19,6 +19,9 @@ function FormatShortHelp: string;
 // Returns full help text with all commands, settings, examples and shortcuts
 function FormatFullHelp: string;
 
+// Returns help text for Ollama server management commands
+function FormatOllamaHelp: string;
+
 // Returns multi-line list of current agent settings
 function FormatAgentConfig(AAgent: TCustomOllamaAgent): string;
 
@@ -357,22 +360,26 @@ begin
     Row('Ctrl+Left/Right', 'Switch between chats');
     Row('Ctrl+Shift+Del', 'Delete the active chat');
     Row('Ctrl+Backspace', 'Remove the last input and result');
+    Row('Ctrl+Home/End', 'Move to input start/end');
+    Row('Ctrl+Shift+Up/Down', 'First/last history entry');
     Row('Alt+PageUp/Down', 'Navigate between user messages');
     Row('Shift+PageUp/Down', 'Scroll output by one line');
     Row('PageUp/Down', 'Scroll output by page');
 
     Header('Type "help" for the full help.');
+    T.Add('Type "ollama help" for model management commands.');
     Result := T.Text;
   finally
     T.Free;
   end;
 end;
 
+
 function FormatFullHelp: string;
 var
   T: TStringList;
 
-// Adds a section header with a leading blank line
+  // Adds a section header with a leading blank line
   procedure Header(const AText: string);
   begin
     T.Add('');
@@ -399,7 +406,6 @@ begin
     Row('pwd', 'show working directory');
     Row('cls / clear', 'clear the current chat');
     Row('new', 'start a new chat');
-    Row('history', 'show command history');
     Row('exit / quit', 'exit the console');
     Row('set <name> <value>', 'change a property');
     Row('get <name>', 'inspect a property');
@@ -408,9 +414,7 @@ begin
     Row('get chatprompt', 'show additional chat instructions');
     Row('config', 'show current settings');
     Row('models', 'list available models');
-    Row('ollama help', 'model management commands');
-    Row('help', 'show full help');
-    Row('h / ?', 'show short help');
+    Row('history', 'show command history');
 
     Header('OllamaManager');
     Row('baseurl', 'server URL, e.g. http://localhost:11434');
@@ -420,7 +424,7 @@ begin
     Row('manager.timeout', 'default request timeout ms');
     Row('pulltimeout', 'pull timeout ms, 0 = none');
     Row('modeltimeout', 'model load/unload timeout ms');
-    Row('numctx', 'context override, 0 = model default');
+    Row('context', 'context window in tokens, 0 = Ollama default');
     Row('active', 'background refresh and connection');
 
     Header('Agent');
@@ -458,20 +462,28 @@ begin
     Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
 
     Header('Values');
-    T.Add('  boolean   on off true false yes no 1 0');
-    T.Add('  list      comma separated, "none" clears');
-    T.Add('  text      single line, or "from <file>"');
-    T.Add('  runtime   numctx and active are not saved');
+    Row('boolean', 'on off true false yes no 1 0');
+    Row('list', 'comma separated, "none" clears');
+    Row('text', 'single line, or "from <file>"');
+    Row('runtime', 'context and active are not saved');
 
     Header('Examples');
-    T.Add('  set baseurl http://192.168.1.10:11434');
-    T.Add('  set model qwen2.5:7b');
-    T.Add('  set tools filetools, exec');
-    T.Add('  set systemprompt from prompt.txt');
-    T.Add('  set chat My project');
-    T.Add('  set chatprompt You are an expert Pascal developer');
-    T.Add('  get chatprompt');
-    T.Add('  get tools');
+    Row('', 'set baseurl http://192.168.1.10:11434');
+    Row('', 'set model qwen2.5:7b');
+    Row('', 'set tools filetools, exec');
+    Row('', 'set systemprompt from prompt.txt');
+    Row('', 'set chat My project');
+    Row('', 'set chatprompt You are an expert Pascal developer');
+    Row('', 'get chatprompt');
+    Row('', 'get tools');
+
+    Header('Context examples');
+    Row('ollama context', 'show current context window');
+    Row('ollama context 8192', 'set 8K tokens');
+    Row('ollama context 32768', 'set 32K tokens');
+    Row('ollama context 262144', 'set 256K tokens');
+    Row('ollama context 0', 'use Ollama default');
+    Row('', 'Values are specified in tokens, not thousands');
 
     Header('Keyboard shortcuts');
     Row('Enter', 'submit input');
@@ -482,10 +494,11 @@ begin
     Row('Ctrl+Shift+Del', 'delete the active chat');
     Row('Ctrl+Backspace', 'remove the last input and result');
     Row('Ctrl+Up/Down', 'navigate command history');
+    Row('Ctrl+Shift+Up/Down', 'select first/last history entry');
+    Row('Ctrl+Home/End', 'move to input start/end');
     Row('Alt+PageUp/Down', 'navigate between user messages');
     Row('Shift+PageUp/Down', 'scroll output by one line');
     Row('PageUp/PageDown', 'scroll output by page');
-    Row('Ctrl+Home/End', 'select first/last history entry');
     Row('Ctrl+Delete', 'delete the current history entry');
     Row('Ctrl+A', 'select input or copy chat when empty');
     Row('Ctrl+C', 'copy selection or cancel current input');
@@ -496,6 +509,70 @@ begin
     Row('Home/End', 'move to line start/end');
     Row('Escape', 'clear current input');
 
+    Header('Additional help');
+    Row('ollama help', 'model management commands');
+    Row('help', 'show full help');
+    Row('h / ?', 'show short help');
+
+    Result := T.Text;
+  finally
+    T.Free;
+  end;
+end;
+
+function FormatOllamaHelp: string;
+var
+  T: TStringList;
+
+// Adds a section header with a leading blank line
+  procedure Header(const AText: string);
+  begin
+    if T.Count > 0 then
+      T.Add('');
+    T.Add(AText);
+  end;
+
+  // Adds an aligned command row
+  procedure Row(const ACmd, ADesc: string);
+  var
+    Pad: string;
+  begin
+    Pad := '  ' + ACmd;
+    while Length(Pad) < 34 do
+      Pad := Pad + ' ';
+    T.Add(Pad + ADesc);
+  end;
+
+begin
+  T := TStringList.Create;
+  try
+    T.Add('Ollama server management via the API, no external CLI');
+
+    Header('List');
+    Row('ollama list', 'installed models');
+    Row('ollama ps', 'running models');
+    Row('ollama show <model>', 'details as JSON');
+    Row('ollama version', 'server version');
+
+    Header('Models');
+    Row('ollama pull <model>', 'download from registry');
+    Row('ollama rm <model>', 'delete installed model');
+    Row('ollama copy <src> <dst>', 'copy under a new name');
+    Row('ollama create <name> <file>', 'build from a Modelfile');
+
+    Header('Memory');
+    Row('ollama load <model>', 'load into memory');
+    Row('ollama unload <model>', 'unload from memory');
+    Row('ollama stop <model>', 'same as unload');
+
+    Header('Other');
+    Row('ollama context', 'show current context window');
+    Row('ollama context <tokens>', 'set context window, 0 = default');
+    Row('ollama help', 'this help');
+
+    T.Add('');
+    T.Add('  Uses baseurl, never invokes the shell');
+    T.Add('');
     Result := T.Text;
   finally
     T.Free;

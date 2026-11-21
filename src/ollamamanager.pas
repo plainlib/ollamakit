@@ -2090,7 +2090,8 @@ var
   Kind: TOllamaErrorKind;
   ErrMsg: string;
 begin
-  JsonBody := Format('{"model":"%s","prompt":"%s","keep_alive":%d,"stream":false}', [ModelName, Prompt.EscapeText, FKeepAlive]);
+  JsonBody := Format('{"model":"%s","prompt":"%s","keep_alive":%d,"stream":false%s}',
+    [ModelName, Prompt.EscapeText, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/generate', JsonBody, Kind, ErrMsg);
   if Kind <> oekNone then
   begin
@@ -2105,8 +2106,8 @@ var
   Kind: TOllamaErrorKind;
   ErrMsg: string;
 begin
-  JsonBody := Format('{"model":"%s","messages":[{"role":"user","content":"%s"}],"keep_alive":%d,"stream":false}',
-    [ModelName, UserMessage.EscapeText, FKeepAlive]);
+  JsonBody := Format('{"model":"%s","messages":[{"role":"user","content":"%s"}],"keep_alive":%d,"stream":false%s}',
+    [ModelName, UserMessage.EscapeText, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, Kind, ErrMsg);
   if Kind <> oekNone then
   begin
@@ -2379,8 +2380,7 @@ begin
           AKind := ClassifyHttp(HttpCode);
       end;
 
-      AErrorMsg := Format('POST %s, model="%s", request_bytes=%d: %s',
-        [Url, ModelName, Length(JsonBody), Trim(ErrFromNetwork)]);
+      AErrorMsg := Format('POST %s, model="%s", request_bytes=%d: %s', [Url, ModelName, Length(JsonBody), Trim(ErrFromNetwork)]);
       if AErrorMsg = '' then
         AErrorMsg := 'Streaming request failed';
 

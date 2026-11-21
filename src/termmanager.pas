@@ -250,8 +250,6 @@ type
     procedure HandleOllamaCreate(const AName, AFile: string);
     // Handles displaying the Ollama version
     procedure HandleOllamaVersion;
-    // Displays help for ollama commands
-    procedure HandleOllamaHelp;
     // Temporary event handlers used while a command is in flight
     procedure HandleOllamaModelsRefreshed(Sender: TObject; const Models: TStringList);
     // Handles an Ollama operation error
@@ -2374,6 +2372,7 @@ procedure TCustomTermManager.HandleOllamaCommand(const AArg: string);
 var
   Parts: TStringList;
   Sub: string;
+  Value: integer;
 begin
   if not Assigned(FAgent) then
   begin
@@ -2387,7 +2386,7 @@ begin
   end;
   if Trim(AArg) = '' then
   begin
-    HandleOllamaHelp;
+    DoOutput(FormatOllamaHelp, False);
     Exit;
   end;
   Parts := TStringList.Create;
@@ -2397,7 +2396,7 @@ begin
     Parts.DelimitedText := Trim(AArg);
     if Parts.Count = 0 then
     begin
-      HandleOllamaHelp;
+      DoOutput(FormatOllamaHelp, False);
       Exit;
     end;
     Sub := LowerCase(Parts[0]);
@@ -2477,10 +2476,31 @@ begin
       end;
       HandleOllamaCreate(Parts[1], Parts[2]);
     end
+    else if Sub = 'context' then
+    begin
+      if Parts.Count = 1 then
+      begin
+        Value := FAgent.OllamaManager.NumCtx;
+        if Value = 0 then
+          DoOutput('num_ctx: 0 (Ollama default)' + LineEnding, False)
+        else
+          DoOutput(Format('num_ctx: %d', [Value]) + LineEnding, False);
+      end
+      else if (Parts.Count <> 2) or not TryStrToInt(Parts[1], Value) or (Value < 0) then
+        DoOutput('usage: ollama context [tokens], 0 = Ollama default' + LineEnding, True)
+      else
+      begin
+        FAgent.OllamaManager.NumCtx := Value;
+        if Value = 0 then
+          DoOutput('context reset to Ollama default' + LineEnding, False)
+        else
+          DoOutput(Format('context set to %d tokens', [Value]) + LineEnding, False);
+      end;
+    end
     else if (Sub = 'version') or (Sub = '--version') or (Sub = '-v') then
       HandleOllamaVersion
     else if (Sub = 'help') or (Sub = '--help') or (Sub = '-h') then
-      HandleOllamaHelp
+      DoOutput(FormatOllamaHelp, False)
     else
     begin
       DoOutput('error: unknown ollama subcommand: ' + Sub + LineEnding, True);
@@ -3074,64 +3094,6 @@ begin
     DoOutput('error: ' + ErrMsg + LineEnding, True)
   else
     DoOutput('ollama version: ' + Ver + LineEnding, False);
-end;
-
-procedure TCustomTermManager.HandleOllamaHelp;
-var
-  T: TStringList;
-
-// Writes a section header with a leading blank line
-  procedure Header(const AText: string);
-  begin
-    if T.Count > 0 then
-      T.Add('');
-    T.Add(AText);
-  end;
-
-  // Writes an aligned command row
-  procedure Row(const ACmd, ADesc: string);
-  var
-    Pad: string;
-  begin
-    Pad := '  ' + ACmd;
-    while Length(Pad) < 28 do
-      Pad := Pad + ' ';
-    T.Add(Pad + ADesc);
-  end;
-
-begin
-  T := TStringList.Create;
-  try
-    T.Add('Ollama server management via the API, no external CLI');
-
-    Header('List');
-    Row('ollama list', 'installed models');
-    Row('ollama ps', 'running models');
-    Row('ollama show <model>', 'details as JSON');
-    Row('ollama version', 'server version');
-
-    Header('Models');
-    Row('ollama pull <model>', 'download from registry');
-    Row('ollama rm <model>', 'delete installed model');
-    Row('ollama copy <src> <dst>', 'copy under a new name');
-    Row('ollama create <name> <file>', 'build from a Modelfile');
-
-    Header('Memory');
-    Row('ollama load <model>', 'load into memory');
-    Row('ollama unload <model>', 'unload from memory');
-    Row('ollama stop <model>', 'same as unload');
-
-    Header('Other');
-    Row('ollama help', 'this help');
-
-    T.Add('');
-    T.Add('  Uses baseurl, never invokes the shell');
-    T.Add('');
-
-    DoOutput(T.Text, False);
-  finally
-    T.Free;
-  end;
 end;
 
 procedure TCustomTermManager.HandleModelsCommand(const AArg: string);
