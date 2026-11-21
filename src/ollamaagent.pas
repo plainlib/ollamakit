@@ -2098,7 +2098,9 @@ const
   // Tool results older than the most recent N are truncated to save context
   KEEP_RECENT_TOOL_RESULTS = 5;
   // Maximum size of a truncated tool result in bytes
-  TRUNCATE_TOOL_BYTES = 3000;
+  TRUNCATE_TOOL_BYTES = 3072;
+  // Maximum size of a new tool result sent to the model
+  MAX_TOOL_RESULT_BYTES = 10240;
   // Retry limit for the chat call on transport timeout
   CHAT_MAX_ATTEMPTS = 3;
   // Maximum retries after an empty model response
@@ -2124,6 +2126,7 @@ var
   ToolCallObj, FuncObj, MsgObj: TJSONObject;
   FinalContent: string;
   Attempt, TruncIdx, TruncSeen, TruncTotalTool: integer;
+  ToolResultBytes, ToolResultCut: integer;
   TruncContent: string;
   ResolvedCtx: int64;
   SystemPromptText: string;
@@ -2740,6 +2743,25 @@ begin
           begin
             if ToolNames[ToolIdx] = '' then
               Continue;
+
+            // Limit every tool result before it enters the conversation context
+            ToolResultBytes := Length(ToolResultArr[ToolIdx]);
+            if ToolResultBytes > MAX_TOOL_RESULT_BYTES then
+            begin
+              ToolResultCut := MAX_TOOL_RESULT_BYTES;
+
+              // Avoid cutting a UTF-8 character in the middle
+              while (ToolResultCut > 0) and ((Ord(ToolResultArr[ToolIdx][ToolResultCut + 1]) and $C0) = $80) do
+                Dec(ToolResultCut);
+
+              ToolResultArr[ToolIdx] := Copy(ToolResultArr[ToolIdx], 1, ToolResultCut) + #10 +
+                '[tool result truncated: original ' + IntToStr(ToolResultBytes) + ' bytes, limit ' +
+                IntToStr(MAX_TOOL_RESULT_BYTES) + ' bytes]';
+
+              FAgent.LogLine(Format('Tool result truncated: name="%s" original=%d limit=%d bytes',
+                [ToolNames[ToolIdx], ToolResultBytes, MAX_TOOL_RESULT_BYTES]));
+            end;
+
             QueueToolResult(ToolNames[ToolIdx], ToolResultArr[ToolIdx]);
             MsgObj := TJSONObject.Create;
             MsgObj.Add('role', 'tool');
