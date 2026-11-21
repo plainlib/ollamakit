@@ -5416,23 +5416,28 @@ begin
             else if CtrlPressed and (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
             begin
               FHistory.Delete(HistIndex);
-            if HistIndex > 0 then
-              Dec(HistIndex);
-            if FHistory.Count = 0 then
-            begin
-              Line := '';
-              CursorPos := 0;
-              HistIndex := 0;
+
+              // Synchronize the active chat terminal history
+              if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+                FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+
+              if HistIndex > 0 then
+                Dec(HistIndex);
+              if FHistory.Count = 0 then
+              begin
+                Line := '';
+                CursorPos := 0;
+                HistIndex := 0;
+              end
+              else
+              begin
+                if HistIndex >= FHistory.Count then
+                  HistIndex := FHistory.Count - 1;
+                Line := FHistory[HistIndex];
+                SetCodePage(Line, CP_UTF8, False);
+                CursorPos := Length(Line);
+              end;
             end
-            else
-            begin
-              if HistIndex >= FHistory.Count then
-                HistIndex := FHistory.Count - 1;
-              Line := FHistory[HistIndex];
-              SetCodePage(Line, CP_UTF8, False);
-              CursorPos := Length(Line);
-            end;
-          end
           else if CursorPos < Length(Line) then
           begin
             if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and
