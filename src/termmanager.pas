@@ -1024,6 +1024,9 @@ begin
     Exit;
 
   Result := FAgent.MoveActiveChat(ADelta);
+
+  if Result then
+    UpdateConsoleTitle;
 end;
 
 procedure TCustomTermManager.AppendChatOutput(const AText: string);
@@ -5198,9 +5201,9 @@ begin
         AddToHistory(Line);
 
       if Rec.Event.KeyEvent.wVirtualKeyCode = VK_LEFT then
-        HasMore := SwitchActiveChat(-1)
+        HasMore := MoveActiveChat(-1)
       else
-        HasMore := SwitchActiveChat(1);
+        HasMore := MoveActiveChat(1);
 
       if HasMore then
       begin
