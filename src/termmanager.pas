@@ -5061,6 +5061,17 @@ var
     Result := 0;
   end;
 
+  // Moves the cursor to the beginning or end of the input text
+  procedure PositionInputCursor(AToEnd: Boolean);
+  begin
+    if AToEnd then
+      CursorPos := Length(Line)
+    else
+      CursorPos := 0;
+
+    ClearSelection;
+  end;
+
   // Returns byte offset of the end of the logical line containing APos
   function FindLineEnd(APos: integer): integer;
   var
@@ -5431,16 +5442,7 @@ begin
       VK_HOME:
         begin
           if CtrlPressed then
-          begin
-            if FHistory.Count > 0 then
-            begin
-              HistIndex := 0;
-              Line := FHistory[HistIndex];
-              SetCodePage(Line, CP_UTF8, False);
-              CursorPos := Length(Line);
-              ClearSelection;
-            end;
-          end
+            PositionInputCursor(False)
           else if Line = string.Empty then
           begin
             ScrollOutput(-2);
@@ -5461,16 +5463,7 @@ begin
       VK_END:
         begin
           if CtrlPressed then
-          begin
-            if FHistory.Count > 0 then
-            begin
-              HistIndex := FHistory.Count - 1;
-              Line := FHistory[HistIndex];
-              SetCodePage(Line, CP_UTF8, False);
-              CursorPos := Length(Line);
-              ClearSelection;
-            end;
-          end
+            PositionInputCursor(True)
           else if Line = string.Empty then
           begin
             ScrollOutput(2);
@@ -5489,7 +5482,17 @@ begin
           end;
         end;
       VK_UP:
-        if CtrlPressed then
+        if CtrlPressed and ShiftPressed then
+        begin
+          if FHistory.Count > 0 then
+          begin
+            HistIndex := 0;
+            Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
+            PositionInputCursor(False);
+          end;
+        end
+        else if CtrlPressed then
         begin
           if HistIndex = FHistory.Count then
           begin
@@ -5504,7 +5507,7 @@ begin
           begin
             Line := FHistory[HistIndex];
             SetCodePage(Line, CP_UTF8, False);
-            CursorPos := Length(Line);
+            PositionInputCursor(False);
           end;
         end
         else
@@ -5536,12 +5539,22 @@ begin
             begin
               Line := FHistory[HistIndex];
               SetCodePage(Line, CP_UTF8, False);
-              CursorPos := Length(Line);
+              PositionInputCursor(False);
             end;
           end;
         end;
       VK_DOWN:
-        if CtrlPressed then
+        if CtrlPressed and ShiftPressed then
+        begin
+          if FHistory.Count > 0 then
+          begin
+            HistIndex := FHistory.Count - 1;
+            Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
+            PositionInputCursor(True);
+          end;
+        end
+        else if CtrlPressed then
         begin
           if HistIndex < FHistory.Count - 1 then
           begin
@@ -5572,7 +5585,7 @@ begin
               Inc(HistIndex);
               Line := FHistory[HistIndex];
               SetCodePage(Line, CP_UTF8, False);
-              CursorPos := Length(Line);
+              PositionInputCursor(True);
             end
             else if HistIndex = FHistory.Count - 1 then
             begin
