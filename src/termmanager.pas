@@ -267,6 +267,8 @@ type
     procedure RestoreTerminalHistory;
     // Removes the last terminal input and its conversation exchange
     function RemoveLastInput: boolean;
+    // Asks the user to confirm chat deletion
+    function ConfirmDeleteChat(const AChatName: string): boolean;
   protected
     // Clears agent reference when it is removed at runtime
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -2737,6 +2739,61 @@ begin
   Result := True;
 end;
 
+function TCustomTermManager.ConfirmDeleteChat(const AChatName: string): boolean;
+{$IFDEF WINDOWS}
+var
+  Handle: THandle;
+  Rec: INPUT_RECORD;
+  N: DWORD = 0;
+  C: WideChar;
+begin
+  Result := False;
+  Rec:=Default(INPUT_RECORD);
+
+  Write('Delete chat "' + AChatName + '"? [y/N]: ');
+  Flush(Output);
+
+  Handle := GetStdHandle(STD_INPUT_HANDLE);
+  if (Handle = 0) or (Handle = INVALID_HANDLE_VALUE) then
+    Exit;
+
+  while ReadConsoleInput(Handle, Rec, 1, N) do
+  begin
+    if (Rec.EventType <> KEY_EVENT) or not Rec.Event.KeyEvent.bKeyDown then
+      Continue;
+
+    C := Rec.Event.KeyEvent.UnicodeChar;
+
+    if Rec.Event.KeyEvent.wVirtualKeyCode = VK_RETURN then
+      Break;
+
+    if (C = 'y') or (C = 'Y') then
+    begin
+      Result := True;
+      Write('y');
+      Break;
+    end;
+
+    if (C = 'n') or (C = 'N') or
+      (Rec.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE) then
+    begin
+      Write('n');
+      Break;
+    end;
+  end;
+
+  WriteLine(string.Empty);
+end;
+  {$ELSE}
+var
+  Answer: string;
+begin
+  Write('Delete chat "' + AChatName + '"? [y/N]: ');
+  ReadLn(Answer);
+  Result := SameText(Trim(Answer), 'y') or SameText(Trim(Answer), 'yes');
+end;
+{$ENDIF}
+
 procedure TCustomTermManager.HandleOllamaPs;
 var
   Mgr: TCustomOllamaManager;
@@ -5184,9 +5241,17 @@ begin
     if CtrlPressed and ShiftPressed and
       (Rec.Event.KeyEvent.wVirtualKeyCode = VK_DELETE) then
     begin
-      if Assigned(FAgent) and FAgent.DeleteActiveChat then
+      if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
       begin
-        RestoreActiveChat;
+        if ConfirmDeleteChat(FAgent.ActiveChat.Name) then
+        begin
+          if FAgent.DeleteActiveChat then
+          begin
+            RestoreActiveChat;
+            UpdateConsoleTitle;
+          end;
+        end;
+
         ResetInput;
         Continue;
       end;
