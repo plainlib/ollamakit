@@ -376,8 +376,8 @@ type
     procedure DoLog(const AText: string); virtual;
     // Emits a truncated tool result preview when LogToolResult is enabled
     procedure EmitToolResult(const AName, AResult: string); virtual;
-    // Resolves placeholders in SystemPrompt using current values
-    function BuildSystemPrompt: string; virtual;
+    // Builds the system prompt using the current runtime capabilities
+    function BuildSystemPrompt(ASendTools: boolean = True): string; virtual;
     // Resolves model context window size and updates ContextTotal
     procedure RefreshContextInfo(AQueryOllama: boolean = True);
     // Resets usage counters in the manager and this agent
@@ -2339,7 +2339,7 @@ begin
 
       // Always send the system message, BuildSystemPrompt adds platform,
       // workspace and enabled tools even when the user prompt is empty
-      SystemPromptText := FAgent.BuildSystemPrompt;
+      SystemPromptText := FAgent.BuildSystemPrompt(SendTools);
       FAgent.LogLine(Format('System prompt len=%d preview="%s"', [Length(SystemPromptText), Copy(SystemPromptText, 1, 400)]));
       MsgObj := TJSONObject.Create;
       MsgObj.Add('role', 'system');
@@ -4135,26 +4135,37 @@ begin
   end;
 end;
 
-function TCustomOllamaAgent.BuildSystemPrompt: string;
+function TCustomOllamaAgent.BuildSystemPrompt(ASendTools: boolean): string;
 const
   MAX_AGENTS_BYTES = 16384;
 var
   ToolList, PlatformName, EnvironmentBlock, ShellDesc: string;
   AgentsPath, AgentsContent: string;
+  HasTools, HasFileTools, HasExecCommand: boolean;
 begin
+  // Determine the capabilities available in this request
+  ToolList := string.Empty;
+  if ASendTools then
+    ToolList := BuildToolsNames;
+
+  HasTools := ASendTools and (ToolList <> string.Empty);
+  HasFileTools := HasTools and (afFileTools in FFeatures);
+  HasExecCommand := HasTools and (afExecCommand in FFeatures);
+
+  if not HasTools then
+    ToolList := 'none';
+
   // Resolve user-provided placeholders first
   Result := string(FSystemPrompt);
   Result := StringReplace(Result, '{path}', GetEffectiveRootPath, [rfReplaceAll]);
   Result := StringReplace(Result, '{model}', FModelName, [rfReplaceAll]);
+
   if Assigned(FActiveChat) then
     Result := StringReplace(Result, '{chat}', FActiveChat.Name, [rfReplaceAll])
   else
     Result := StringReplace(Result, '{chat}', string.Empty, [rfReplaceAll]);
-  ToolList := BuildToolsNames;
-  if ToolList = '' then
-    ToolList := 'none';
+
   Result := StringReplace(Result, '{tools}', ToolList, [rfReplaceAll]);
-  // Drop trailing whitespace so the environment block starts on a clean line
   Result := TrimRight(Result);
 
   // Append chat-specific system instructions
@@ -4176,79 +4187,94 @@ begin
   {$ENDIF}
   {$ENDIF}
 
-  // Append environment facts the model can rely on, host-neutral wording
+  // Append environment facts the model can rely on
   EnvironmentBlock :=
     'Environment facts:' + LineEnding + '- Platform: ' + PlatformName + LineEnding + '- Path delimiter: "' +
     PathDelim + '"' + LineEnding + '- Workspace root: ' + GetEffectiveRootPath + LineEnding +
     '- The workspace root may change during the session. Always re-check file ' +
     'existence after any directory change with a fresh tool call, results from ' + 'previous locations may be stale.' + LineEnding;
 
-  // The actual shell behind exec_command when known, else platform default
-  if Trim(FExecShellInfo) <> '' then
-    ShellDesc := Trim(FExecShellInfo)
-  else
+  // Add shell information only when exec_command is available
+  if HasExecCommand then
   begin
+    if Trim(FExecShellInfo) <> string.Empty then
+      ShellDesc := Trim(FExecShellInfo)
+    else
+    begin
+      {$IFDEF WINDOWS}
+      ShellDesc := 'cmd.exe';
+      {$ELSE}
+      ShellDesc := '/bin/sh';
+      {$ENDIF}
+    end;
+
+    EnvironmentBlock := EnvironmentBlock + '- Shell for exec_command: ' + ShellDesc + LineEnding;
+
+    // Platform-specific shell notes
     {$IFDEF WINDOWS}
-    ShellDesc := 'cmd.exe';
+    EnvironmentBlock := EnvironmentBlock +
+      '- Use "nul" instead of "/dev/null" to discard output, ";" does not chain commands, use "&&".' +
+      LineEnding;
     {$ELSE}
-    ShellDesc := '/bin/sh';
+    EnvironmentBlock := EnvironmentBlock + '- Use "/dev/null" to discard output, ";" and "&&" both chain commands.' + LineEnding;
     {$ENDIF}
   end;
-  EnvironmentBlock := EnvironmentBlock + '- Shell for exec_command: ' + ShellDesc + LineEnding;
 
-  // Platform-specific shell notes, factual and short
-  {$IFDEF WINDOWS}
-  EnvironmentBlock := EnvironmentBlock +
-    '- Use "nul" instead of "/dev/null" to discard output, ";" does not chain commands, use "&&".' + LineEnding;
-  {$ELSE}
-  EnvironmentBlock := EnvironmentBlock + '- Use "/dev/null" to discard output, ";" and "&&" both chain commands.' + LineEnding;
-  {$ENDIF}
+  // Add file operation rules only when file tools are available
+  if HasFileTools then
+  begin
+    EnvironmentBlock := EnvironmentBlock + '- Do NOT redirect listing or search output to files with ">", use list_files, glob ' +
+      'or grep tools instead. Those tools return results directly and do not pollute the workspace.' +
+      LineEnding + '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding;
+  end;
 
-  // Universal rules: prefer dedicated tools over shell for file work
-  EnvironmentBlock := EnvironmentBlock + '- Do NOT redirect listing or search output to files with ">", use list_files, find_files ' +
-    'or grep tools instead. Those tools return results directly and do not pollute the workspace.' + LineEnding;
-  EnvironmentBlock := EnvironmentBlock + '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding;
   Result := Result + #10#10 + EnvironmentBlock;
 
-  // Append the workspace root instruction file when present
-  if FLoadAgentsMd then
+  // Append the workspace root instruction file when file tools are available
+  if HasFileTools and FLoadAgentsMd then
   begin
     AgentsPath := IncludeTrailingPathDelimiter(GetEffectiveRootPath) + FAgentsFileName;
+
     if FileExists(AgentsPath) then
     begin
       if ReadTextFileSafe(AgentsPath, AgentsContent) then
       begin
         AgentsContent := TrimRight(AgentsContent);
+
         if Length(AgentsContent) > MAX_AGENTS_BYTES then
           AgentsContent := Copy(AgentsContent, 1, MAX_AGENTS_BYTES) + LineEnding + '[... truncated at ' +
             IntToStr(MAX_AGENTS_BYTES) + ' bytes]';
-        if AgentsContent <> '' then
+
+        if AgentsContent <> string.Empty then
         begin
           Result := Result + #10#10 + 'Project instructions from ' + FAgentsFileName + ':' + LineEnding + AgentsContent;
           LogLine(Format('Loaded %s, %d bytes', [FAgentsFileName, Length(AgentsContent)]));
         end;
       end;
     end;
+
     Result := Result + #10 + 'Subdirectories may have their own ' + FAgentsFileName +
       '. Use read_agents_md with a path to load the local rules before editing files there.';
   end;
 
-  // Append authoritative tool list so the model cannot claim disabled tools
-  if ToolList = 'none' then
-    Result := Result + #10 + 'IMPORTANT: no tools are currently enabled. You cannot run shell commands, ' +
-      'read or write files, list directories, search the workspace, access the ' +
-      'internet, or call any other external function. If the user asks for such ' +
-      'actions, explain that no tools are enabled and ask them to enable the ' + 'corresponding feature in the agent settings.'
+  // Append authoritative tool availability information
+  if not HasTools then
+    Result := Result + #10 + 'IMPORTANT: no external tools are available in this request. ' +
+      'You cannot run shell commands, read or write files, list directories, ' +
+      'search the workspace, access the internet, or call external functions. ' +
+      'If the user asks for such actions, explain that the required tools are unavailable.'
   else
-    Result := Result + #10 + 'IMPORTANT: the only tools currently enabled are: ' + ToolList + '. ' +
+    Result := Result + #10 + 'IMPORTANT: the only tools currently available are: ' + ToolList + '. ' +
       'You must not claim access to any tool that is not in this list. ' +
       'If the user asks for an action that requires an unavailable tool, ' + 'explain that the tool is not enabled.';
-  // Enforce file reading strategy when the tools are available
-  if Pos('read_file_preview', ToolList) > 0 then
+
+  // Enforce file reading strategy only when the corresponding tools are available
+  if HasFileTools and (Pos('read_file_preview', ToolList) > 0) then
     Result := Result + #10 + 'When exploring an unknown file or a file larger than 50 KB, ALWAYS call ' +
       'read_file_preview first to see its size, structure and first/last lines. ' +
       'Only then decide whether to read the whole file with read_file or specific ' + 'ranges with read_file_lines.';
-  if Pos('read_file_lines', ToolList) > 0 then
+
+  if HasFileTools and (Pos('read_file_lines', ToolList) > 0) then
     Result := Result + #10 + 'When read_file returns a truncation notice, use read_file_lines with ' +
       'start_line and end_line to read further parts of the file in chunks. ' +
       'Do not give up on large files, read them in sections until you have the ' + 'content you need.';
