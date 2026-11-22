@@ -202,6 +202,10 @@ type
     FPendingScreenCol: integer;
     FLastInputScreenCleared: boolean;
     FCurrentOutputMark: boolean;
+    {$IFDEF WINDOWS}
+    FDefaultConsoleAttr: Word;
+    FDefaultConsoleAttrCaptured: boolean;
+    {$ENDIF}
     // Updates the native terminal window title with the current directory
     procedure UpdateConsoleTitle;
     // Sets the working directory and synchronizes the agent root path
@@ -858,6 +862,10 @@ begin
   FPendingScreenCol := -1;
   FLastInputScreenCleared := False;
   FCurrentOutputMark := False;
+  {$IFDEF WINDOWS}
+  FDefaultConsoleAttr := 0;
+  FDefaultConsoleAttrCaptured := False;
+  {$ENDIF}
   FPrevAgentOnChunk := nil;
   FPrevAgentOnThinking := nil;
   FPrevAgentOnToolCall := nil;
@@ -2787,6 +2795,8 @@ begin
   RestoreTerminalHistory;
   FShellLog.Assign(FAgent.ActiveChat.ShellLog);
 
+  // Use the default output color when clearing the screen
+  SetColor(tcDefault);
   ClearScreen;
 
   // Replay the saved terminal output without recording it a second time
@@ -2807,6 +2817,7 @@ var
   Info: TConsoleScreenBufferInfo;
   Coord: TCoord;
   Count, Written: DWORD;
+  DefaultAttr: Word;
   {$ENDIF}
 begin
   Result := False;
@@ -2871,10 +2882,22 @@ begin
       (Written = Count) then
     begin
       Written := 0;
-      if FillConsoleOutputAttribute(GetStdHandle(STD_OUTPUT_HANDLE), Info.wAttributes,
+      DefaultAttr := Info.wAttributes;
+
+      // Get the default output attributes
+      SetColor(tcDefault);
+      if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+        DefaultAttr := Info.wAttributes;
+
+      if FillConsoleOutputAttribute(GetStdHandle(STD_OUTPUT_HANDLE), DefaultAttr,
         Count, Coord, Written) and (Written = Count) then
+      begin
+        // Restore the previous prompt attributes
+        SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE),
+          DefaultAttr xor (DefaultAttr xor Info.wAttributes));
         FLastInputScreenCleared :=
           SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), Coord);
+      end;
     end;
   end;
   {$ENDIF}
@@ -4213,9 +4236,9 @@ end;
 {$IFDEF WINDOWS}
 
 // Maps palette color to Windows foreground attribute bits
-function ColorToAttr(AColor: TConsoleColor): Word;
+function ColorToAttr(AColor: TConsoleColor): word;
 const
-  MAP: array[TConsoleColor] of Word = (
+  MAP: array[TConsoleColor] of word = (
     // Standard colors, 0 to 7
     0,                                                     // ccBlack
     FOREGROUND_RED,                                        // ccRed
@@ -4234,13 +4257,13 @@ const
     FOREGROUND_RED or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightMagenta
     FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightCyan
     FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY // ccWhite
-  );
+    );
 begin
   Result := MAP[AColor];
 end;
 
 // Applies console text attribute directly, ignored for redirected handles
-procedure SetConsoleColor(AAttr: Word);
+procedure SetConsoleColor(AAttr: word);
 var
   Handle: THandle;
 begin
@@ -4250,10 +4273,11 @@ end;
 
 procedure TCustomTermManager.SetColor(AColor: TTermColor);
 var
-  Attr: Word;
+  Attr: word;
+  Info: TConsoleScreenBufferInfo;
 
-  // Combines background and foreground of a pair into a single attribute
-  function PairAttr(const APair: TConsoleColorPair): Word;
+// Combines background and foreground of a pair into a single attribute
+  function PairAttr(const APair: TConsoleColorPair): word;
   begin
     Result := (ColorToAttr(APair.Background) shl 4) or ColorToAttr(APair.Foreground);
   end;
@@ -4261,9 +4285,18 @@ var
 begin
   // Store color changes as control markers for chat history replay
   AppendChatOutput(#2 + Chr(Ord(AColor)));
+  Info := Default(TConsoleScreenBufferInfo);
 
   if not FColorOutput then
     Exit;
+
+  // Preserve the original console background before applying prompt colors
+  if (AColor = tcPromptInput) and not FDefaultConsoleAttrCaptured then
+    if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+    begin
+      FDefaultConsoleAttr := Info.wAttributes;
+      FDefaultConsoleAttrCaptured := True;
+    end;
 
   case AColor of
     tcDim: Attr := ColorToAttr(FColors.ThinkingText);
@@ -4273,6 +4306,11 @@ begin
     tcErrorBadge: Attr := PairAttr(FColors.ErrorBadge);
     tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
     tcPromptInput: Attr := PairAttr(FColors.PromptInput);
+    tcDefault:
+      if FDefaultConsoleAttrCaptured then
+        Attr := (FDefaultConsoleAttr and $F0) or ColorToAttr(FColors.DefaultText)
+      else
+        Attr := ColorToAttr(FColors.DefaultText);
     else
       Attr := ColorToAttr(FColors.DefaultText);
   end;
@@ -4316,7 +4354,6 @@ var
     end;
   end;
   {$ENDIF}
-
 begin
   {$IFDEF WINDOWS}
   I := 1;
@@ -4389,13 +4426,13 @@ begin
 end;
 
 // Writes UTF-8 bytes directly to handle bypassing codepage conversion
-procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString);
+procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: rawbytestring);
 const
   ENABLE_VIRTUAL_TERMINAL_PROCESSING = $0004;
 var
   Mode: DWORD;
   Written: DWORD;
-  Wide: UnicodeString;
+  Wide: unicodestring;
   Ok: boolean;
 begin
   if Length(ABytes) = 0 then
@@ -4413,7 +4450,7 @@ begin
 
     Wide := UTF8Decode(ABytes);
     if Length(Wide) > 0 then
-      Ok := WriteConsoleW(AHandle, PWideChar(Wide), Length(Wide), Written, nil);
+      Ok := WriteConsoleW(AHandle, pwidechar(Wide), Length(Wide), Written, nil);
   end;
 
   // Fallback when WriteConsoleW fails or handle is not a console
@@ -4427,7 +4464,7 @@ begin
   WriteUtf8ToHandle(GetStdHandle(STD_OUTPUT_HANDLE), UTF8Encode(AText));
 end;
 
-procedure ConGotoXY(X, Y: Integer);
+procedure ConGotoXY(X, Y: integer);
 var
   Coord: TCoord;
 begin
@@ -4436,7 +4473,7 @@ begin
   SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), Coord);
 end;
 
-function ConWhereY: Integer;
+function ConWhereY: integer;
 var
   Info: TConsoleScreenBufferInfo;
 begin
@@ -4498,7 +4535,7 @@ var
   NumRead: DWORD = 0;
   I, CancelIdx: integer;
 
-  // Returns True when event is Esc or Ctrl+C keydown
+// Returns True when event is Esc or Ctrl+C keydown
   function IsCancelEvent(const AR: INPUT_RECORD): boolean;
   begin
     Result := False;
@@ -4508,9 +4545,8 @@ var
       Exit;
     if AR.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE then
       Exit(True);
-    if (AR.Event.KeyEvent.wVirtualKeyCode = VK_C) and
-       ((AR.Event.KeyEvent.dwControlKeyState and
-         (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0) then
+    if (AR.Event.KeyEvent.wVirtualKeyCode = VK_C) and ((AR.Event.KeyEvent.dwControlKeyState and
+      (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0) then
       Exit(True);
   end;
 
@@ -4558,18 +4594,19 @@ var
   Handle: THandle;
   Rec, NextRec: INPUT_RECORD;
   N: DWORD = 0;
-  Line, PromptText: RawByteString;
-   CursorPos, HistIndex, PromptRow, PromptCol: Integer;
+  Line, PromptText: rawbytestring;
+  CursorPos, HistIndex, PromptRow, PromptCol: integer;
   ScreenInfo: TConsoleScreenBufferInfo;
-  C: WideChar;
-  Wide: UnicodeString;
-  LastRedrawRows: Integer;
-  HasMore, IsModifier, ShiftPressed, CtrlPressed, AltPressed: Boolean;
-  SelAnchor, SelStart, SelEnd: Integer;
-  HasSelection: Boolean;
+  C: widechar;
+  Wide: unicodestring;
+  LastRedrawRows: integer;
+  HasMore, IsModifier, ShiftPressed, CtrlPressed, AltPressed: boolean;
+  SelAnchor, SelStart, SelEnd: integer;
+  HasSelection: boolean;
   MessageNavIndex: integer;
+  DefaultAttr: word;
 
-  // Saves the cursor position where the current prompt begins
+// Saves the cursor position where the current prompt begins
   procedure CapturePromptPosition;
   var
     Info: TConsoleScreenBufferInfo;
@@ -4586,11 +4623,11 @@ var
   end;
 
   // Scrolls the console viewport without moving the input cursor
-  procedure ScrollOutput(ADirection: Integer);
+  procedure ScrollOutput(ADirection: integer);
   var
     Info: TConsoleScreenBufferInfo;
     Rect: SMALL_RECT;
-    ViewHeight, MaxTop, NewTop: Integer;
+    ViewHeight, MaxTop, NewTop: integer;
   begin
     Info := Default(TConsoleScreenBufferInfo);
     if not GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
@@ -4614,15 +4651,15 @@ var
 
     case ADirection of
       -2: NewTop := 0;
-       2:
-       begin
-         // Place the current prompt near the middle of the viewport
-         NewTop := Info.dwCursorPosition.Y - ViewHeight div 2;
-       end;
+      2:
+      begin
+        // Place the current prompt near the middle of the viewport
+        NewTop := Info.dwCursorPosition.Y - ViewHeight div 2;
+      end;
       -3: NewTop := Rect.Top - 1;
-       3: NewTop := Rect.Top + 1;
+      3: NewTop := Rect.Top + 1;
       -1: NewTop := Rect.Top - ViewHeight;
-       1: NewTop := Rect.Top + ViewHeight;
+      1: NewTop := Rect.Top + ViewHeight;
       else
         Exit;
     end;
@@ -4732,19 +4769,19 @@ var
   end;
 
   // Collects full UTF-8 sequence that conhost splits across key events
-  procedure CollectBrokenUtf8(var AC: WideChar);
+  procedure CollectBrokenUtf8(var AC: widechar);
   const
     WAIT_TIMEOUT_MS = 100;
     MAX_CONSUMED = 64;
   var
-    Raw: RawByteString;
-    B, Nb, Attempts, TotalConsumed: Integer;
+    Raw: rawbytestring;
+    B, Nb, Attempts, TotalConsumed: integer;
     Skip: boolean;
   begin
     B := Ord(AC) and $FF;
     if not (B in [$C2..$F4]) then
       Exit;
-    Raw := AnsiChar(B);
+    Raw := ansichar(B);
     if B >= $F0 then
       Nb := 3
     else if B >= $E0 then
@@ -4776,14 +4813,14 @@ var
           Inc(TotalConsumed);
           Continue;
         end;
-        B := Ord(NextRec.Event.KeyEvent.UnicodeChar) and $FF;
+        B := Ord(NextRec.Event.KeyEvent.unicodechar) and $FF;
         if (B < $80) or (B > $BF) then
         begin
           Skip := True;
           Break;
         end;
         ReadConsoleInput(Handle, NextRec, 1, N);
-        Raw := Raw + AnsiChar(B);
+        Raw := Raw + ansichar(B);
         Dec(Nb);
         Break;
       end;
@@ -4801,9 +4838,9 @@ var
   end;
 
   // Splits text into lines, preserving trailing empty line after a line break
-  function SplitLines(const S: RawByteString): TStringList;
+  function SplitLines(const S: rawbytestring): TStringList;
   var
-    I, Start: Integer;
+    I, Start: integer;
   begin
     Result := TStringList.Create;
     Start := 1;
@@ -4855,6 +4892,7 @@ var
     end;
   end;
 
+  // Resets the current text selection state
   procedure ClearSelection;
   begin
     SelAnchor := -1;
@@ -4864,9 +4902,9 @@ var
   end;
 
   // Copies UTF-8 text to the Windows clipboard as CF_UNICODETEXT
-  procedure CopyTextToClipboard(AText: RawByteString);
+  procedure CopyTextToClipboard(AText: rawbytestring);
   var
-    SelWide: UnicodeString;
+    SelWide: unicodestring;
     hData: THandle;
     P: Pointer;
     Size, SelLen: SizeInt;
@@ -4878,7 +4916,7 @@ var
       Exit;
     try
       EmptyClipboard;
-      Size := (SelLen + 1) * SizeOf(WideChar);
+      Size := (SelLen + 1) * SizeOf(widechar);
       hData := GlobalAlloc(GMEM_MOVEABLE or GMEM_ZEROINIT, Size);
       if hData = 0 then
         Exit;
@@ -4889,8 +4927,8 @@ var
         Exit;
       end;
       if SelLen > 0 then
-        Move(SelWide[1], P^, SelLen * SizeOf(WideChar));
-      PWideChar(P)[SelLen] := #0;
+        Move(SelWide[1], P^, SelLen * SizeOf(widechar));
+      pwidechar(P)[SelLen] := #0;
       GlobalUnlock(hData);
       if SetClipboardData(CF_UNICODETEXT, hData) = 0 then
         GlobalFree(hData);
@@ -4902,7 +4940,7 @@ var
   // Copies the selected input range to the clipboard
   procedure CopySelectionToClipboard;
   var
-    SelText: RawByteString;
+    SelText: rawbytestring;
   begin
     if not HasSelection then
       Exit;
@@ -4913,8 +4951,8 @@ var
   // Copies the active chat output without internal color markers
   procedure CopyChatToClipboard;
   var
-    ChatText: RawByteString;
-    I: Integer;
+    ChatText: rawbytestring;
+    I: integer;
   begin
     if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
       Exit;
@@ -4933,7 +4971,7 @@ var
   end;
 
   // Reads clipboard text as a Unicode string, returns empty when clipboard has no text
-  function ReadClipboardText: UnicodeString;
+  function ReadClipboardText: unicodestring;
   var
     hData: THandle;
     P: Pointer;
@@ -4951,7 +4989,7 @@ var
       if P = nil then
         Exit;
       try
-        Result := PWideChar(P);
+        Result := pwidechar(P);
       finally
         GlobalUnlock(hData);
       end;
@@ -4961,9 +4999,9 @@ var
   end;
 
   // Normalizes line endings to CRLF and inserts clipboard text at cursor
-  procedure PasteText(const AText: UnicodeString);
+  procedure PasteText(const AText: unicodestring);
   var
-    Utf8: RawByteString;
+    Utf8: rawbytestring;
   begin
     if Length(AText) = 0 then
       Exit;
@@ -4985,10 +5023,10 @@ var
   end;
 
   // Moves cursor vertically within logical lines, returns False at edges
-  function MoveCursorVertical(ADelta: Integer): Boolean;
+  function MoveCursorVertical(ADelta: integer): boolean;
   var
-    I, Idx, LineStart, TargetStart, TargetLen, Col: Integer;
-    TargetPos, TargetBytePos: Integer;
+    I, Idx, LineStart, TargetStart, TargetLen, Col: integer;
+    TargetPos, TargetBytePos: integer;
     Lines: TStringList;
   begin
     Result := False;
@@ -5035,11 +5073,11 @@ var
   end;
 
   // Moves cursor vertically within a visually wrapped line
-  function MoveCursorWrapped(ADelta: Integer): Boolean;
+  function MoveCursorWrapped(ADelta: integer): boolean;
   var
     Info: TConsoleScreenBufferInfo;
-    Width, CharCol, TotalChars, CurrentRow, CurrentCol: Integer;
-    TargetRow, TargetCharCol, TargetBytePos, I: Integer;
+    Width, CharCol, TotalChars, CurrentRow, CurrentCol: integer;
+    TargetRow, TargetCharCol, TargetBytePos, I: integer;
   begin
     Result := False;
     if (Length(Line) = 0) or (Pos(LineEnding, Line) > 0) then
@@ -5077,9 +5115,9 @@ var
   end;
 
   // Inserts a UTF-8 char at the cursor, replacing the selection when active
-  procedure InsertTypedChar(const AUtf8: RawByteString);
+  procedure InsertTypedChar(const AUtf8: rawbytestring);
   var
-    OldLen: Integer;
+    OldLen: integer;
   begin
     if HasSelection then
     begin
@@ -5096,17 +5134,17 @@ var
   // Redraws prompt and content, tracks visual wrapping and selection highlight
   procedure Redraw;
   var
-    I, J, J2, LenS, GlobalPos, LineStart: Integer;
-    S: RawByteString;
+    I, J, J2, LenS, GlobalPos, LineStart: integer;
+    S: rawbytestring;
     Lines: TStringList;
     Info: CONSOLE_SCREEN_BUFFER_INFO;
-    NormalAttr, InvAttr: Word;
-    IsSel, PrevIsSel: Boolean;
-    CurRow, CurCol, NewRows: Integer;
-    CursorSaved: Boolean;
+    NormalAttr, InvAttr: word;
+    IsSel, PrevIsSel: boolean;
+    CurRow, CurCol, NewRows: integer;
+    CursorSaved: boolean;
   begin
     HideConsoleCursor;
-    Info:=Default(CONSOLE_SCREEN_BUFFER_INFO);
+    Info := Default(CONSOLE_SCREEN_BUFFER_INFO);
     GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
     NormalAttr := Info.wAttributes;
     // Swap foreground and background to build the selection highlight
@@ -5189,8 +5227,10 @@ var
 
         if I < Lines.Count - 1 then
         begin
-          // Wipe stale content on the current row before moving on
+          // Clear unused space with the default console attributes
+          SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), DefaultAttr);
           ConClearLineFromCursor;
+          SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), NormalAttr);
           GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
           if Info.dwCursorPosition.X > 0 then
             ConGotoXY(1, Info.dwCursorPosition.Y + 2)
@@ -5207,7 +5247,10 @@ var
         CurCol := Info.dwCursorPosition.X + 1;
       end;
 
-      // Wipe stale content on the last visible row
+      GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
+
+      // Clear unused space with the default console attributes
+      SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), DefaultAttr);
       ConClearLineFromCursor;
 
       GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
@@ -5224,6 +5267,9 @@ var
           ConGotoXY(1, PromptRow + I);
           ConClearLineFromCursor;
         end;
+
+      // Restore prompt attributes for subsequent input editing
+      SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), NormalAttr);
       LastRedrawRows := NewRows;
     finally
       Lines.Free;
@@ -5233,7 +5279,7 @@ var
     ShowConsoleCursor;
   end;
 
-    // Returns byte offset of the start of the logical line containing APos
+  // Returns byte offset of the start of the logical line containing APos
   function FindLineStart(APos: integer): integer;
   var
     I: integer;
@@ -5249,7 +5295,7 @@ var
   end;
 
   // Moves the cursor to the beginning or end of the input text
-  procedure PositionInputCursor(AToEnd: Boolean);
+  procedure PositionInputCursor(AToEnd: boolean);
   begin
     if AToEnd then
       CursorPos := Length(Line)
@@ -5305,8 +5351,7 @@ var
       RedrawWindow(ConsoleWindow, nil, 0,
         RDW_INVALIDATE or RDW_ERASE or RDW_UPDATENOW);
   end;
- {$ENDIF}
-
+  {$ENDIF}
 begin
   Result := '';
   Rec := Default(INPUT_RECORD);
@@ -5339,6 +5384,13 @@ begin
   except
     ; // Console may be detached
   end;
+
+  // Preserve the default console attributes for clearing unused line space
+  ScreenInfo := Default(TConsoleScreenBufferInfo);
+  DefaultAttr := 0;
+  if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
+    DefaultAttr := ScreenInfo.wAttributes;
+
   SetColor(tcPromptInput);
   ConWriteUtf8(PromptText);
   FLastCharWasNewLine := False;
@@ -5358,7 +5410,7 @@ begin
     if not Rec.Event.KeyEvent.bKeyDown then
       Continue;
 
-    C := Rec.Event.KeyEvent.UnicodeChar;
+    C := Rec.Event.KeyEvent.unicodechar;
     // Two conhost variants observed in the wild for UTF-8 input:
     //   high-byte wrapper ($FFxx) - raw byte sits in the low 8 bits
     //   plain byte       ($00xx) - UTF-8 lead byte sits in the low 8 bits
@@ -5367,18 +5419,15 @@ begin
       CollectBrokenUtf8(C);
 
     ShiftPressed := (Rec.Event.KeyEvent.dwControlKeyState and SHIFT_PRESSED) <> 0;
-    CtrlPressed := (Rec.Event.KeyEvent.dwControlKeyState and
-      (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
-    AltPressed := (Rec.Event.KeyEvent.dwControlKeyState and
-      (LEFT_ALT_PRESSED or RIGHT_ALT_PRESSED)) <> 0;
+    CtrlPressed := (Rec.Event.KeyEvent.dwControlKeyState and (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0;
+    AltPressed := (Rec.Event.KeyEvent.dwControlKeyState and (LEFT_ALT_PRESSED or RIGHT_ALT_PRESSED)) <> 0;
 
     // Ignore standalone modifier keys to preserve the current viewport
     if Rec.Event.KeyEvent.wVirtualKeyCode in [VK_SHIFT, VK_CONTROL, VK_MENU] then
       Continue;
 
     // Delete the active chat with Ctrl+Shift+Delete
-    if CtrlPressed and ShiftPressed and
-      (Rec.Event.KeyEvent.wVirtualKeyCode = VK_DELETE) then
+    if CtrlPressed and ShiftPressed and (Rec.Event.KeyEvent.wVirtualKeyCode = VK_DELETE) then
     begin
       if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
       begin
@@ -5397,8 +5446,7 @@ begin
     end;
 
     // Move the active chat with Ctrl+Shift+Left and Ctrl+Shift+Right
-    if CtrlPressed and ShiftPressed and
-      (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
+    if CtrlPressed and ShiftPressed and (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
     begin
       // Preserve the current input in the active chat before switching
       if Line <> string.Empty then
@@ -5431,8 +5479,7 @@ begin
     end;
 
     // Switch chats with Ctrl+Left and Ctrl+Right
-    if CtrlPressed and not ShiftPressed and
-      (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
+    if CtrlPressed and not ShiftPressed and (Rec.Event.KeyEvent.wVirtualKeyCode in [VK_LEFT, VK_RIGHT]) then
     begin
       // Save the current input before changing the active chat
       if Line <> string.Empty then
@@ -5466,228 +5513,224 @@ begin
 
     case Rec.Event.KeyEvent.wVirtualKeyCode of
       VK_RETURN:
+      begin
+        IsModifier := ShiftPressed or CtrlPressed;
+        HasMore := False;
+        if not IsModifier then
         begin
-          IsModifier := ShiftPressed or CtrlPressed;
-          HasMore := False;
-          if not IsModifier then
+          while PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) do
           begin
-            while PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) do
+            if (NextRec.EventType = KEY_EVENT) and NextRec.Event.KeyEvent.bKeyDown then
             begin
-              if (NextRec.EventType = KEY_EVENT) and NextRec.Event.KeyEvent.bKeyDown then
-              begin
-                HasMore := True;
-                Break;
-              end;
-              if not ReadConsoleInput(Handle, NextRec, 1, N) then
-                Break;
+              HasMore := True;
+              Break;
             end;
-          end
-          else
-          begin
-            if PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) then
-              if (NextRec.EventType = KEY_EVENT) and
-                (NextRec.Event.KeyEvent.wVirtualKeyCode = VK_RETURN) and
-                (not NextRec.Event.KeyEvent.bKeyDown) then
-                ReadConsoleInput(Handle, NextRec, 1, N);
+            if not ReadConsoleInput(Handle, NextRec, 1, N) then
+              Break;
           end;
-          if IsModifier or HasMore then
-          begin
-            // Replace selection and insert the line ending at the cursor
-            if HasSelection then
-            begin
-              Delete(Line, SelStart + 1, SelEnd - SelStart);
-              CursorPos := SelStart;
-              ClearSelection;
-            end;
-
-            Insert(LineEnding, Line, CursorPos + 1);
-            Inc(CursorPos, Length(LineEnding));
-          end
-          else
-          begin
-            // Move below all visual rows occupied by the input
-            ConGotoXY(1, PromptRow + LastRedrawRows);
-            ForceConsoleRedraw;
-            FLastCharWasNewLine := True;
-            Break;
-          end;
+        end
+        else
+        begin
+          if PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) then
+            if (NextRec.EventType = KEY_EVENT) and (NextRec.Event.KeyEvent.wVirtualKeyCode = VK_RETURN) and
+              (not NextRec.Event.KeyEvent.bKeyDown) then
+              ReadConsoleInput(Handle, NextRec, 1, N);
         end;
-      VK_BACK:
+        if IsModifier or HasMore then
         begin
-          // Remove the previous input and its result with Ctrl+Backspace
-          if CtrlPressed and RemoveLastInput then
-          begin
-            if not FLastInputScreenCleared then
-              RestoreActiveChat
-            else
-              ScrollOutput(2);
-
-            ResetInput;
-            Continue;
-          end;
-
+          // Replace selection and insert the line ending at the cursor
           if HasSelection then
           begin
             Delete(Line, SelStart + 1, SelEnd - SelStart);
             CursorPos := SelStart;
             ClearSelection;
-          end
-          else if CursorPos > 0 then
-          begin
-            if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
-            begin
-              Dec(CursorPos, 2);
-              Delete(Line, CursorPos + 1, 2);
-            end
-            else
-            begin
-              CursorPos := Utf8PrevPos(Line, CursorPos);
-              Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
-            end;
           end;
-        end;
-      VK_DELETE:
-          begin
-            if HasSelection then
-            begin
-              Delete(Line, SelStart + 1, SelEnd - SelStart);
-              CursorPos := SelStart;
-              ClearSelection;
-            end
-            else if CtrlPressed and (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
-            begin
-              FHistory.Delete(HistIndex);
 
-              // Synchronize the active chat terminal history
-              if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
-              begin
-                FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
-                FAgent.ActiveChat.MarkSessionActive;
-              end;
-
-              if HistIndex > 0 then
-                Dec(HistIndex);
-              if FHistory.Count = 0 then
-              begin
-                Line := '';
-                CursorPos := 0;
-                HistIndex := 0;
-              end
-              else
-              begin
-                if HistIndex >= FHistory.Count then
-                  HistIndex := FHistory.Count - 1;
-                Line := FHistory[HistIndex];
-                SetCodePage(Line, CP_UTF8, False);
-                CursorPos := Length(Line);
-              end;
-            end
-          else if CursorPos < Length(Line) then
-          begin
-            if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and
-              (Line[CursorPos + 2] = #10) then
-              Delete(Line, CursorPos + 1, 2)
-            else
-              Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
-          end;
-        end;
-      VK_LEFT:
+          Insert(LineEnding, Line, CursorPos + 1);
+          Inc(CursorPos, Length(LineEnding));
+        end
+        else
         begin
-          if ShiftPressed and not HasSelection then
-            SelAnchor := CursorPos
-          else if not ShiftPressed then
-            ClearSelection;
-          if CursorPos > 0 then
-          begin
-            if (CursorPos >= 2) and (Line[CursorPos] = #10) and
-              (Line[CursorPos - 1] = #13) then
-              Dec(CursorPos, 2)
-            else
-              CursorPos := Utf8PrevPos(Line, CursorPos);
-          end;
-          if ShiftPressed then
-            UpdateSelection;
+          // Move below all visual rows occupied by the input
+          ConGotoXY(1, PromptRow + LastRedrawRows);
+          ForceConsoleRedraw;
+          FLastCharWasNewLine := True;
+          Break;
         end;
-      VK_RIGHT:
+      end;
+      VK_BACK:
+      begin
+        // Remove the previous input and its result with Ctrl+Backspace
+        if CtrlPressed and RemoveLastInput then
         begin
-          if ShiftPressed and not HasSelection then
-            SelAnchor := CursorPos
-          else if not ShiftPressed then
-            ClearSelection;
-          // Utf8NextPos returns 1-based next char start, subtract 1 for byte count
-          if CursorPos < Length(Line) then
-          begin
-            if (CursorPos + 2 <= Length(Line)) and
-              (Line[CursorPos + 1] = #13) and (Line[CursorPos + 2] = #10) then
-              Inc(CursorPos, 2)
-            else
-              CursorPos := Utf8NextPos(Line, CursorPos + 1) - 1;
-          end;
-          if ShiftPressed then
-            UpdateSelection;
-        end;
-      VK_PRIOR:
-        begin
-          if AltPressed and not CtrlPressed then
-            NavigateMessage(-1)
-          else if ShiftPressed and not CtrlPressed then
-            ScrollOutput(-3)
+          if not FLastInputScreenCleared then
+            RestoreActiveChat
           else
-            ScrollOutput(-1);
-          Continue;
-        end;
-      VK_NEXT:
-        begin
-          if AltPressed and not CtrlPressed then
-            NavigateMessage(1)
-          else if ShiftPressed and not CtrlPressed then
-            ScrollOutput(3)
-          else
-            ScrollOutput(1);
-          Continue;
-        end;
-      VK_HOME:
-        begin
-          if CtrlPressed then
-            PositionInputCursor(False)
-          else if Line = string.Empty then
-          begin
-            ScrollOutput(-2);
-            Continue;
-          end
-          else
-          begin
-            if ShiftPressed and not HasSelection then
-              SelAnchor := CursorPos
-            else if not ShiftPressed then
-              ClearSelection;
-            // Jump to start of the current logical line, not the buffer
-            CursorPos := FindLineStart(CursorPos);
-            if ShiftPressed then
-              UpdateSelection;
-          end;
-        end;
-      VK_END:
-        begin
-          if CtrlPressed then
-            PositionInputCursor(True)
-          else if Line = string.Empty then
-          begin
             ScrollOutput(2);
-            Continue;
+
+          ResetInput;
+          Continue;
+        end;
+
+        if HasSelection then
+        begin
+          Delete(Line, SelStart + 1, SelEnd - SelStart);
+          CursorPos := SelStart;
+          ClearSelection;
+        end
+        else if CursorPos > 0 then
+        begin
+          if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
+          begin
+            Dec(CursorPos, 2);
+            Delete(Line, CursorPos + 1, 2);
           end
           else
           begin
-            if ShiftPressed and not HasSelection then
-              SelAnchor := CursorPos
-            else if not ShiftPressed then
-              ClearSelection;
-            // Jump to end of the current logical line, not the buffer
-            CursorPos := FindLineEnd(CursorPos);
-            if ShiftPressed then
-              UpdateSelection;
+            CursorPos := Utf8PrevPos(Line, CursorPos);
+            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
           end;
         end;
+      end;
+      VK_DELETE:
+      begin
+        if HasSelection then
+        begin
+          Delete(Line, SelStart + 1, SelEnd - SelStart);
+          CursorPos := SelStart;
+          ClearSelection;
+        end
+        else if CtrlPressed and (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
+        begin
+          FHistory.Delete(HistIndex);
+
+          // Synchronize the active chat terminal history
+          if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+          begin
+            FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+            FAgent.ActiveChat.MarkSessionActive;
+          end;
+
+          if HistIndex > 0 then
+            Dec(HistIndex);
+          if FHistory.Count = 0 then
+          begin
+            Line := '';
+            CursorPos := 0;
+            HistIndex := 0;
+          end
+          else
+          begin
+            if HistIndex >= FHistory.Count then
+              HistIndex := FHistory.Count - 1;
+            Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
+            CursorPos := Length(Line);
+          end;
+        end
+        else if CursorPos < Length(Line) then
+        begin
+          if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and (Line[CursorPos + 2] = #10) then
+            Delete(Line, CursorPos + 1, 2)
+          else
+            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+        end;
+      end;
+      VK_LEFT:
+      begin
+        if ShiftPressed and not HasSelection then
+          SelAnchor := CursorPos
+        else if not ShiftPressed then
+          ClearSelection;
+        if CursorPos > 0 then
+        begin
+          if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
+            Dec(CursorPos, 2)
+          else
+            CursorPos := Utf8PrevPos(Line, CursorPos);
+        end;
+        if ShiftPressed then
+          UpdateSelection;
+      end;
+      VK_RIGHT:
+      begin
+        if ShiftPressed and not HasSelection then
+          SelAnchor := CursorPos
+        else if not ShiftPressed then
+          ClearSelection;
+        // Utf8NextPos returns 1-based next char start, subtract 1 for byte count
+        if CursorPos < Length(Line) then
+        begin
+          if (CursorPos + 2 <= Length(Line)) and (Line[CursorPos + 1] = #13) and (Line[CursorPos + 2] = #10) then
+            Inc(CursorPos, 2)
+          else
+            CursorPos := Utf8NextPos(Line, CursorPos + 1) - 1;
+        end;
+        if ShiftPressed then
+          UpdateSelection;
+      end;
+      VK_PRIOR:
+      begin
+        if AltPressed and not CtrlPressed then
+          NavigateMessage(-1)
+        else if ShiftPressed and not CtrlPressed then
+          ScrollOutput(-3)
+        else
+          ScrollOutput(-1);
+        Continue;
+      end;
+      VK_NEXT:
+      begin
+        if AltPressed and not CtrlPressed then
+          NavigateMessage(1)
+        else if ShiftPressed and not CtrlPressed then
+          ScrollOutput(3)
+        else
+          ScrollOutput(1);
+        Continue;
+      end;
+      VK_HOME:
+      begin
+        if CtrlPressed then
+          PositionInputCursor(False)
+        else if Line = string.Empty then
+        begin
+          ScrollOutput(-2);
+          Continue;
+        end
+        else
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          // Jump to start of the current logical line, not the buffer
+          CursorPos := FindLineStart(CursorPos);
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      end;
+      VK_END:
+      begin
+        if CtrlPressed then
+          PositionInputCursor(True)
+        else if Line = string.Empty then
+        begin
+          ScrollOutput(2);
+          Continue;
+        end
+        else
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          // Jump to end of the current logical line, not the buffer
+          CursorPos := FindLineEnd(CursorPos);
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      end;
       VK_UP:
         if CtrlPressed and ShiftPressed then
         begin
@@ -5803,11 +5846,11 @@ begin
           end;
         end;
       VK_ESCAPE:
-        begin
-          Line := '';
-          CursorPos := 0;
-          ClearSelection;
-        end;
+      begin
+        Line := '';
+        CursorPos := 0;
+        ClearSelection;
+      end;
       VK_N:
         if CtrlPressed then
         begin
@@ -5869,9 +5912,9 @@ begin
         end
         else if Ord(C) >= 32 then
           InsertTypedChar(WideCharToUtf8(C));
-    else
-      if Ord(C) >= 32 then
-        InsertTypedChar(WideCharToUtf8(C));
+      else
+        if Ord(C) >= 32 then
+          InsertTypedChar(WideCharToUtf8(C));
     end;
 
     try
