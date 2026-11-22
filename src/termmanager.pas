@@ -670,6 +670,31 @@ begin
   Result := UTF8Encode(Filtered);
 end;
 
+// Converts interactive cmd FOR variables to batch-file syntax
+function PrepareCmdBatchScript(const ACommand: string): string;
+var
+  I: integer;
+begin
+  Result := string.Empty;
+  I := 1;
+
+  while I <= Length(ACommand) do
+  begin
+    if (ACommand[I] = '%') and ((I = 1) or (ACommand[I - 1] <> '%')) and (I < Length(ACommand)) and
+      (ACommand[I + 1] in ['A'..'Z', 'a'..'z']) and ((I + 2 > Length(ACommand)) or not (ACommand[I + 2] in
+      ['A'..'Z', 'a'..'z', '0'..'9', '_', '%'])) then
+    begin
+      Result := Result + '%%' + ACommand[I + 1];
+      Inc(I, 2);
+      Continue;
+    end
+    else
+      Result := Result + ACommand[I];
+
+    Inc(I);
+  end;
+end;
+
 { TAgentShellHistory }
 
 constructor TAgentShellHistory.Create;
@@ -1711,6 +1736,8 @@ begin
 end;
 
 procedure TCustomTermManager.DoOutput(const AText: string; AIsStderr: boolean);
+var
+  I, Start, BreakLength: integer;
 begin
   // Accumulate output of the currently running command for the shell log
   if FCapturing and FShellHistory.Enabled then
@@ -1721,14 +1748,50 @@ begin
       FCaptureError := True;
   end;
 
-  // Apply error color to all stderr output
-  if AIsStderr then
+  if not AIsStderr then
+  begin
+    WriteText(AText, False);
+    Exit;
+  end;
+
+  // Color non-empty error text without coloring line breaks
+  Start := 1;
+  I := 1;
+
+  while I <= Length(AText) do
+  begin
+    if AText[I] in [#10, #13] then
+    begin
+      if I > Start then
+      begin
+        SetColor(tcErrorBadge);
+        try
+          WriteText(Copy(AText, Start, I - Start), True);
+        finally
+          SetColor(tcDefault);
+        end;
+      end;
+
+      BreakLength := 1;
+      if (AText[I] = #13) and (I < Length(AText)) and (AText[I + 1] = #10) then
+        BreakLength := 2;
+
+      WriteText(Copy(AText, I, BreakLength), True);
+      Inc(I, BreakLength);
+      Start := I;
+    end
+    else
+      Inc(I);
+  end;
+
+  if Start <= Length(AText) then
+  begin
     SetColor(tcErrorBadge);
-  try
-    WriteText(AText, AIsStderr);
-  finally
-    if AIsStderr then
+    try
+      WriteText(Copy(AText, Start, MaxInt), True);
+    finally
       SetColor(tcDefault);
+    end;
   end;
 end;
 
@@ -1818,8 +1881,8 @@ end;
 
 function TCustomTermManager.ClassifyLine(const ALine: string; out APayload: string): TTermInputKind;
 var
-  S, FirstLine, First: string;
-  P, I: integer;
+  S, FirstLine, First, GroupCommand: string;
+  P, I, GroupPos: integer;
   HasMultipleLines, InQuotes: boolean;
 begin
   APayload := '';
@@ -1870,9 +1933,56 @@ begin
       Exit(tikCommand);
   end;
 
-  // Detect cmd.exe compound commands and shell operators outside quotes
+  // Detect cmd.exe command groups and shell operators outside quotes
   if DetectShellFamily(FShellExec) = sfCmd then
   begin
+    // Recognize a command group only when it starts the input
+    if (FirstLine <> '') and (FirstLine[1] = '(') then
+    begin
+      GroupPos := 1;
+
+      // Skip opening parentheses and whitespace
+      while (GroupPos <= Length(S)) and (S[GroupPos] in ['(', ' ', #9, #10, #13]) do
+        Inc(GroupPos);
+
+      GroupCommand := string.Empty;
+
+      // Extract the first command token, including quoted executable paths
+      if GroupPos <= Length(S) then
+      begin
+        if S[GroupPos] = '"' then
+        begin
+          Inc(GroupPos);
+          P := GroupPos;
+
+          while (GroupPos <= Length(S)) and (S[GroupPos] <> '"') do
+            Inc(GroupPos);
+
+          GroupCommand := Copy(S, P, GroupPos - P);
+        end
+        else
+        begin
+          P := GroupPos;
+
+          while (GroupPos <= Length(S)) and not (S[GroupPos] in [' ', #9, #10, #13, '(', ')']) do
+            Inc(GroupPos);
+
+          GroupCommand := Copy(S, P, GroupPos - P);
+        end;
+      end;
+
+      GroupCommand := LowerCase(ExtractFileName(StringReplace(GroupCommand, '\', '/', [rfReplaceAll])));
+
+      // Support batch commands prefixed with @
+      while (GroupCommand <> '') and (GroupCommand[1] = '@') do
+        Delete(GroupCommand, 1, 1);
+
+      // Only route actual shell commands as command groups
+      if (GroupCommand <> '') and ((FBuiltinCommands.IndexOf(GroupCommand) >= 0) or IsExternalCommand(GroupCommand)) then
+        Exit(tikCommand);
+    end;
+
+    // Detect shell operators outside quotes
     InQuotes := False;
     I := 1;
 
@@ -1886,7 +1996,7 @@ begin
 
       if S[I] = '"' then
         InQuotes := not InQuotes
-      else if not InQuotes and (S[I] in ['(', ')', '&', '|', '<', '>']) then
+      else if not InQuotes and (S[I] in ['&', '|', '<', '>']) then
         Exit(tikCommand);
 
       Inc(I);
@@ -3414,8 +3524,7 @@ begin
             raise Exception.Create('Cannot create temporary batch file');
 
           // Append the final working directory to a separate file
-          ScriptData := RawByteString(ACommand + LineEnding +
-            '@echo %CD%> "' + CwdFileName + '"' + LineEnding);
+          ScriptData := rawbytestring(PrepareCmdBatchScript(ACommand) + LineEnding + '@echo %CD%> "' + CwdFileName + '"' + LineEnding);
 
           ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
           try
@@ -3450,15 +3559,11 @@ begin
             raise Exception.Create('Cannot create temporary PowerShell script');
 
           // Configure UTF-8 output and save the final working directory
-          ScriptData := UTF8Encode(UTF8Decode(
-            '$ProgressPreference = ''SilentlyContinue''' + LineEnding +
-            '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false' +
-            LineEnding +
-            '[Console]::OutputEncoding = $utf8' + LineEnding +
-            '$OutputEncoding = $utf8' + LineEnding +
-            ACommand + LineEnding +
-            '[IO.File]::WriteAllText(''' + StringReplace(CwdFileName, '''', '''''', [rfReplaceAll]) +
-            ''', (Get-Location).Path, $utf8)' + LineEnding));
+          ScriptData := UTF8Encode(UTF8Decode('$ProgressPreference = ''SilentlyContinue''' +
+            LineEnding + '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false' + LineEnding +
+            '[Console]::OutputEncoding = $utf8' + LineEnding + '$OutputEncoding = $utf8' +
+            LineEnding + ACommand + LineEnding + '[IO.File]::WriteAllText(''' +
+            StringReplace(CwdFileName, '''', '''''', [rfReplaceAll]) + ''', (Get-Location).Path, $utf8)' + LineEnding));
 
           ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
           try
@@ -3489,11 +3594,9 @@ begin
           Process.Parameters.Add('-ExecutionPolicy');
           Process.Parameters.Add('Bypass');
           Process.Parameters.Add('-EncodedCommand');
-          Process.Parameters.Add(EncodePowerShellCommand(
-            '$ProgressPreference = ''SilentlyContinue''; ' +
+          Process.Parameters.Add(EncodePowerShellCommand('$ProgressPreference = ''SilentlyContinue''; ' +
             '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false; ' +
-            '[Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; ' +
-            ACommand));
+            '[Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; ' + ACommand));
         end;
       end;
 
