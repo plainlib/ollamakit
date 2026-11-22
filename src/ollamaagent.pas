@@ -2231,10 +2231,6 @@ end;
 
 procedure TOllamaAgentThread.Execute;
 const
-  // Tool results older than the most recent N are truncated to save context
-  KEEP_RECENT_TOOL_RESULTS = 5;
-  // Maximum size of a truncated tool result in bytes
-  TRUNCATE_TOOL_BYTES = 3072;
   // Maximum size of a new tool result sent to the model
   MAX_TOOL_RESULT_BYTES = 10240;
   // Retry limit for the chat call on transport timeout
@@ -2357,9 +2353,7 @@ begin
       end;
 
       // Prepare only previous requests before starting a new generation
-      if FAgent.KeepHistory then
-        TruncateOldToolResults(MessagesArr, KEEP_RECENT_TOOL_RESULTS, TRUNCATE_TOOL_BYTES)
-      else
+      if not FAgent.KeepHistory then
         FilterHistoryToChat(MessagesArr);
 
       MsgObj := TJSONObject.Create;
