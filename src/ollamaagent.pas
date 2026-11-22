@@ -1424,9 +1424,7 @@ begin
   try
     for I := 0 to AMessages.Count - 1 do
     begin
-      IncludeThinking := False;
-      if AMessages.Items[I].JSONType = jtObject then
-        IncludeThinking := TJSONObject(AMessages.Items[I]).Get('_current_run', False);
+      IncludeThinking := True;
 
       MsgJson := BuildContextMessageJson(AMessages.Items[I], IncludeThinking);
       if MsgJson <> string.Empty then
@@ -1436,6 +1434,96 @@ begin
     Result := ResultArr.AsJSON;
   finally
     ResultArr.Free;
+  end;
+end;
+
+// Truncates older tool results while preserving the most recent ones
+procedure TruncateOldToolResults(AMessages: TJSONArray; AKeepRecent, AMaxBytes: integer);
+var
+  I, Total, Seen, Cut: integer;
+  MsgObj: TJSONObject;
+  Content: string;
+begin
+  if AMessages = nil then
+    Exit;
+
+  Total := 0;
+  for I := 0 to AMessages.Count - 1 do
+  begin
+    if AMessages.Items[I].JSONType <> jtObject then
+      Continue;
+
+    MsgObj := TJSONObject(AMessages.Items[I]);
+    if MsgObj.Get('role', '') = 'tool' then
+      Inc(Total);
+  end;
+
+  Seen := 0;
+  for I := 0 to AMessages.Count - 1 do
+  begin
+    if AMessages.Items[I].JSONType <> jtObject then
+      Continue;
+
+    MsgObj := TJSONObject(AMessages.Items[I]);
+    if MsgObj.Get('role', '') <> 'tool' then
+      Continue;
+
+    Inc(Seen);
+    if Seen > Total - AKeepRecent then
+      Continue;
+
+    Content := MsgObj.Get('content', '');
+    if Length(Content) <= AMaxBytes then
+      Continue;
+
+    Cut := AMaxBytes;
+
+    // Avoid cutting a UTF-8 character in the middle
+    while (Cut > 0) and ((Ord(Content[Cut + 1]) and $C0) = $80) do
+      Dec(Cut);
+
+    MsgObj.Strings['content'] := Copy(Content, 1, Cut) + '...[truncated, original ' + IntToStr(Length(Content)) + ' bytes]';
+  end;
+end;
+
+// Keeps only user messages and final assistant answers
+procedure FilterHistoryToChat(AMessages: TJSONArray);
+var
+  I: integer;
+  MsgObj: TJSONObject;
+  Role: string;
+begin
+  if AMessages = nil then
+    Exit;
+
+  for I := AMessages.Count - 1 downto 0 do
+  begin
+    if AMessages.Items[I].JSONType <> jtObject then
+    begin
+      AMessages.Delete(I);
+      Continue;
+    end;
+
+    MsgObj := TJSONObject(AMessages.Items[I]);
+    Role := MsgObj.Get('role', '');
+
+    if (Role <> 'user') and (Role <> 'assistant') then
+    begin
+      AMessages.Delete(I);
+      Continue;
+    end;
+
+    if Role = 'assistant' then
+    begin
+      // Tool calls are internal agent operations, not final answers
+      if MsgObj.Find('tool_calls') <> nil then
+      begin
+        AMessages.Delete(I);
+        Continue;
+      end;
+
+      MsgObj.Delete('thinking');
+    end;
   end;
 end;
 
@@ -2161,9 +2249,8 @@ var
   ToolCallObj, FuncObj, MsgObj: TJSONObject;
   FinalContent: string;
   CurrentResponseAdded: boolean;
-  Attempt, TruncIdx, TruncSeen, TruncTotalTool: integer;
+  Attempt: integer;
   ToolResultBytes, ToolResultCut: integer;
-  TruncContent: string;
   ResolvedCtx: int64;
   SystemPromptText: string;
   CutPoint: integer;
@@ -2177,7 +2264,6 @@ var
   AllParallelSafe: boolean;
   Threads: TList;
   SupportsTools: boolean;
-  StoredHistory: TJSONArray;
   UserMessageAdded: boolean;
   ContextToolBytes, ContextThinkingBytes: integer;
   ContextMessages, ContextPercent: integer;
@@ -2238,7 +2324,7 @@ begin
       MsgObj.Add('content', SystemPromptText);
       MessagesArr.Add(MsgObj);
 
-      if FAgent.KeepHistory and (FAgent.FHistory <> '') then
+      if FAgent.FHistory <> string.Empty then
       begin
         Data := nil;
         try
@@ -2247,10 +2333,7 @@ begin
             if (Data <> nil) and (Data.JSONType = jtArray) then
             begin
               for I := 0 to TJSONArray(Data).Count - 1 do
-              begin
-                MsgObj := TJSONObject(TJSONArray(Data).Items[I].Clone);
-                MessagesArr.Add(MsgObj);
-              end;
+                MessagesArr.Add(TJSONArray(Data).Items[I].Clone);
             end;
           except
             ; // Ignore invalid history
@@ -2259,6 +2342,12 @@ begin
           Data.Free;
         end;
       end;
+
+      // Prepare only previous requests before starting a new generation
+      if FAgent.KeepHistory then
+        TruncateOldToolResults(MessagesArr, KEEP_RECENT_TOOL_RESULTS, TRUNCATE_TOOL_BYTES)
+      else
+        FilterHistoryToChat(MessagesArr);
 
       MsgObj := TJSONObject.Create;
       MsgObj.Add('role', 'user');
@@ -2365,37 +2454,6 @@ begin
           end
           else
             FAgent.LogLine('Compaction skipped, no safe cut point');
-        end;
-
-        // Truncate old tool results from both history and current run
-        TruncTotalTool := 0;
-        for TruncIdx := 0 to MessagesArr.Count - 1 do
-        begin
-          if MessagesArr.Items[TruncIdx].JSONType <> jtObject then
-            Continue;
-          MsgObj := TJSONObject(MessagesArr.Items[TruncIdx]);
-          if MsgObj.Get('role', '') = 'tool' then
-            Inc(TruncTotalTool);
-        end;
-
-        TruncSeen := 0;
-        for TruncIdx := 0 to MessagesArr.Count - 1 do
-        begin
-          if MessagesArr.Items[TruncIdx].JSONType <> jtObject then
-            Continue;
-          MsgObj := TJSONObject(MessagesArr.Items[TruncIdx]);
-          if MsgObj.Get('role', '') <> 'tool' then
-            Continue;
-          Inc(TruncSeen);
-          if TruncSeen > TruncTotalTool - KEEP_RECENT_TOOL_RESULTS then
-            Continue;
-          TruncContent := MsgObj.Get('content', '');
-          if Length(TruncContent) > TRUNCATE_TOOL_BYTES then
-          begin
-            TruncContent := Copy(TruncContent, 1, TRUNCATE_TOOL_BYTES) + '...[truncated, original ' +
-              IntToStr(Length(TruncContent)) + ' bytes]';
-            MsgObj.Strings['content'] := TruncContent;
-          end;
         end;
 
         // Collect context statistics after tool result truncation
@@ -2845,7 +2903,7 @@ begin
       if not UserMessageAdded then
       begin
         // Restore previous history when it is normally sent to the model
-        if FAgent.KeepHistory and (FAgent.FHistory <> string.Empty) then
+        if FAgent.FHistory <> string.Empty then
         begin
           Data := nil;
           try
@@ -2885,34 +2943,9 @@ begin
         FAgent.FHistory := MessagesArr.AsJSON
       else
       begin
-        // Preserve previous messages without sending them to the model
-        StoredHistory := TJSONArray.Create;
-        try
-          if FAgent.FHistory <> string.Empty then
-          begin
-            Data := nil;
-            try
-              try
-                Data := GetJSON(FAgent.FHistory);
-                if (Data <> nil) and (Data.JSONType = jtArray) then
-                  for I := 0 to TJSONArray(Data).Count - 1 do
-                    StoredHistory.Add(TJSONArray(Data).Items[I].Clone);
-              except
-                ; // Ignore invalid stored history
-              end;
-            finally
-              Data.Free;
-            end;
-          end;
-
-          // Append messages from the current run
-          for I := 0 to MessagesArr.Count - 1 do
-            StoredHistory.Add(MessagesArr.Items[I].Clone);
-
-          FAgent.FHistory := StoredHistory.AsJSON;
-        finally
-          StoredHistory.Free;
-        end;
+        // Keep only user messages and final assistant answers between runs
+        FilterHistoryToChat(MessagesArr);
+        FAgent.FHistory := MessagesArr.AsJSON;
       end;
 
       if Assigned(FAgent.FActiveChat) then
