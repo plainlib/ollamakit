@@ -2160,6 +2160,7 @@ var
   ToolCallsArr: TJSONArray;
   ToolCallObj, FuncObj, MsgObj: TJSONObject;
   FinalContent: string;
+  CurrentResponseAdded: boolean;
   Attempt, TruncIdx, TruncSeen, TruncTotalTool: integer;
   ToolResultBytes, ToolResultCut: integer;
   TruncContent: string;
@@ -2185,6 +2186,7 @@ begin
   Reason := afrError;
   ErrMsg := '';
   FinalContent := '';
+  CurrentResponseAdded := False;
   EmptyResponseRetries := 0;
   // Initialize managed array locals to silence compiler hints
   ToolNames := nil;
@@ -2293,6 +2295,8 @@ begin
           Reason := afrCancelled;
           Exit;
         end;
+
+        CurrentResponseAdded := False;
 
         QueueRoute(aoChat, 'step ' + IntToStr(Step), Allow);
         if not Allow then
@@ -2561,6 +2565,7 @@ begin
             // Mark messages created during the current run
             MsgObj.Add('_current_run', True);
             MessagesArr.Add(MsgObj);
+            CurrentResponseAdded := True;
           end;
 
           ToolCallsArr := nil;
@@ -2786,8 +2791,12 @@ begin
       end;
     end;
   finally
-    if FinalContent = '' then
+    // Use the current partial response when the request was cancelled
+    if Reason = afrCancelled then
+      FinalContent := FCurrentContent
+    else if FinalContent = '' then
       FinalContent := FCurrentContent;
+
     FAgent.FFinalAnswer := FinalContent;
     try
       // Resolve orphaned tool calls for both cancelled and error paths,
@@ -2820,11 +2829,15 @@ begin
       begin
         MsgObj := TJSONObject.Create;
         MsgObj.Add('role', 'assistant');
-        if FinalContent <> '' then
-          MsgObj.Add('content', FinalContent + #10#10 +
-            '[cancelled by user, partial answer above may be incomplete, user may refer to it]')
+
+        if CurrentResponseAdded then
+          MsgObj.Add('content', '[cancelled by user]')
+        else if FinalContent <> '' then
+          MsgObj.Add('content', FinalContent + #10#10 + '[cancelled by user, partial answer above may be incomplete]')
         else
-          MsgObj.Add('content', '[cancelled by user before any answer was produced, user may refer to this request]');
+          MsgObj.Add('content', '[cancelled by user before any answer was produced]');
+
+        // Append the cancellation message after all tool results
         MessagesArr.Add(MsgObj);
       end;
 
