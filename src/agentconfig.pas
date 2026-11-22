@@ -374,12 +374,11 @@ begin
   end;
 end;
 
-
 function FormatFullHelp: string;
 var
   T: TStringList;
 
-  // Adds a section header with a leading blank line
+// Adds a section header with a leading blank line
   procedure Header(const AText: string);
   begin
     T.Add('');
@@ -461,6 +460,24 @@ begin
     Row('term.maxcapturebytes', 'captured output limit per command');
     Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
 
+    Header('Terminal colors');
+    Row('term.color', '<role> [foreground|background] <color>');
+    Row('get term.color', 'show the current color scheme');
+    Row('defaulttext', 'regular terminal output');
+    Row('thinkingtext', 'agent thinking text');
+    Row('welcomebadge', 'welcome banner');
+    Row('thinkingbadge', 'thinking label');
+    Row('toolbadge', 'tool call label');
+    Row('errorbadge', 'error messages');
+    Row('warnbadge', 'warning messages');
+    Row('promptinput', 'user prompt and input');
+    Row('log', 'agent log messages');
+    Row('colors', 'black red green yellow blue magenta cyan gray');
+    Row('', 'darkgray lightred lightgreen lightyellow lightblue');
+    Row('', 'lightmagenta lightcyan white');
+    Row('', 'defaulttext and thinkingtext use a single color');
+    Row('', 'other roles support foreground and background');
+
     Header('Values');
     Row('boolean', 'on off true false yes no 1 0');
     Row('list', 'comma separated, "none" clears');
@@ -476,6 +493,10 @@ begin
     Row('', 'set chatprompt You are an expert Pascal developer');
     Row('', 'get chatprompt');
     Row('', 'get tools');
+    Row('', 'set term.color defaulttext white');
+    Row('', 'set term.color thinkingtext gray');
+    Row('', 'set term.color toolbadge background blue');
+    Row('', 'set term.color errorbadge foreground white');
 
     Header('Context examples');
     Row('ollama context', 'show current context window');

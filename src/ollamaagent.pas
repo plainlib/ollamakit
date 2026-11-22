@@ -1997,10 +1997,9 @@ begin
     // Log inside Invoke so it runs after the finish handler and before Done is set
     if Agent.FLog then
     begin
-      WriteLn(ErrOutput, Format('[agent] Finish reason=%s answer_len=%d error="%s"',
-        [AgentFinishReasonName(Reason), Length(Answer), ErrorMsg]));
-      WriteLn(ErrOutput);
-      Flush(ErrOutput);
+      Agent.DoLog(Format('[agent] Finish reason=%s answer_len=%d error="%s"', [AgentFinishReasonName(Reason),
+        Length(Answer), ErrorMsg]));
+      Agent.DoLog(string.Empty);
     end;
   finally
     Free;

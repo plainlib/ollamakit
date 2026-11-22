@@ -28,7 +28,8 @@ type
     );
 
   // Semantic color roles used by terminal output
-  TTermColor = (tcDefault, tcDim, tcWelcome, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge, tcPromptInput);
+  TTermColor = (tcDefault, tcDim, tcWelcome, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge,
+    tcPromptInput, tcLog);
 
   TTermRouteEvent = procedure(Sender: TObject; const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean) of object;
   TTermOutputEvent = procedure(Sender: TObject; const AText: string; AIsStderr: boolean) of object;
@@ -62,12 +63,14 @@ type
     FErrorBadge: TConsoleColorPair;
     FWarnBadge: TConsoleColorPair;
     FPromptInput: TConsoleColorPair;
+    FLog: TConsoleColorPair;
     procedure SetWelcomeBadge(const AValue: TConsoleColorPair);
     procedure SetThinkingBadge(const AValue: TConsoleColorPair);
     procedure SetToolBadge(const AValue: TConsoleColorPair);
     procedure SetErrorBadge(const AValue: TConsoleColorPair);
     procedure SetWarnBadge(const AValue: TConsoleColorPair);
     procedure SetPromptInput(const AValue: TConsoleColorPair);
+    procedure SetLog(const AValue: TConsoleColorPair);
   public
     constructor Create;
     destructor Destroy; override;
@@ -89,6 +92,8 @@ type
     property WarnBadge: TConsoleColorPair read FWarnBadge write SetWarnBadge;
     // Style for the entire user input prompt and entered text
     property PromptInput: TConsoleColorPair read FPromptInput write SetPromptInput;
+    // Style for agent log messages
+    property Log: TConsoleColorPair read FLog write SetLog;
   end;
 
   // Shell history sharing options passed to the agent as context prelude
@@ -703,6 +708,55 @@ begin
   end;
 end;
 
+// Converts a color name to the console palette
+function TryParseTermColor(const AValue: string; out AColor: TConsoleColor): boolean;
+begin
+  Result := True;
+  case LowerCase(Trim(AValue)) of
+    'black': AColor := ccBlack;
+    'red': AColor := ccRed;
+    'green': AColor := ccGreen;
+    'yellow': AColor := ccYellow;
+    'blue': AColor := ccBlue;
+    'magenta': AColor := ccMagenta;
+    'cyan': AColor := ccCyan;
+    'gray', 'lightgray': AColor := ccLightGray;
+    'darkgray': AColor := ccDarkGray;
+    'lightred': AColor := ccLightRed;
+    'lightgreen': AColor := ccLightGreen;
+    'lightyellow': AColor := ccLightYellow;
+    'lightblue': AColor := ccLightBlue;
+    'lightmagenta': AColor := ccLightMagenta;
+    'lightcyan': AColor := ccLightCyan;
+    'white': AColor := ccWhite;
+    else
+      Result := False;
+  end;
+end;
+
+// Converts a console palette value to its short name
+function TermColorName(AColor: TConsoleColor): string;
+begin
+  case AColor of
+    ccBlack: Result := 'black';
+    ccRed: Result := 'red';
+    ccGreen: Result := 'green';
+    ccYellow: Result := 'yellow';
+    ccBlue: Result := 'blue';
+    ccMagenta: Result := 'magenta';
+    ccCyan: Result := 'cyan';
+    ccLightGray: Result := 'gray';
+    ccDarkGray: Result := 'darkgray';
+    ccLightRed: Result := 'lightred';
+    ccLightGreen: Result := 'lightgreen';
+    ccLightYellow: Result := 'lightyellow';
+    ccLightBlue: Result := 'lightblue';
+    ccLightMagenta: Result := 'lightmagenta';
+    ccLightCyan: Result := 'lightcyan';
+    ccWhite: Result := 'white';
+  end;
+end;
+
 { TAgentShellHistory }
 
 constructor TAgentShellHistory.Create;
@@ -778,6 +832,9 @@ begin
   FPromptInput := TConsoleColorPair.Create;
   FPromptInput.Background := ccBlack;
   FPromptInput.Foreground := ccWhite;
+  FLog := TConsoleColorPair.Create;
+  FLog.Background := ccBlack;
+  FLog.Foreground := ccCyan;
 end;
 
 destructor TTermColorScheme.Destroy;
@@ -788,6 +845,7 @@ begin
   FErrorBadge.Free;
   FWarnBadge.Free;
   FPromptInput.Free;
+  FLog.Free;
   inherited Destroy;
 end;
 
@@ -821,6 +879,11 @@ begin
   FPromptInput.Assign(AValue);
 end;
 
+procedure TTermColorScheme.SetLog(const AValue: TConsoleColorPair);
+begin
+  FLog.Assign(AValue);
+end;
+
 procedure TTermColorScheme.Assign(Source: TPersistent);
 var
   Src: TTermColorScheme;
@@ -835,6 +898,8 @@ begin
     FToolBadge.Assign(Src.FToolBadge);
     FErrorBadge.Assign(Src.FErrorBadge);
     FWarnBadge.Assign(Src.FWarnBadge);
+    FPromptInput.Assign(Src.FPromptInput);
+    FLog.Assign(Src.FLog);
   end
   else
     inherited Assign(Source);
@@ -1250,9 +1315,14 @@ begin
   CloseThinking;
   if not FLastCharWasNewLine then
     WriteLine('', True);
-  SetColor(tcDim);
-  WriteText(AText, True);
-  SetColor(tcDefault);
+
+  SetColor(tcLog);
+  try
+    WriteText(AText, True);
+  finally
+    SetColor(tcDefault);
+  end;
+
   WriteLine('', True);
 end;
 
@@ -2318,12 +2388,18 @@ var
   IntVal: integer;
   BoolVal: boolean;
   V: string;
+  ColorVal: TConsoleColor;
+  Parts: TStringList;
+  Role, Part: string;
+  Pair: TConsoleColorPair;
 begin
   N := LowerCase(Trim(AName));
   V := Trim(AValue);
+
   // Strip surrounding quotes for string values
   if (Length(V) >= 2) and (V[1] = '"') and (V[Length(V)] = '"') then
     V := Copy(V, 2, Length(V) - 2);
+
   if N = 'path' then
   begin
     if V = '' then
@@ -2352,6 +2428,85 @@ begin
         Exit;
     end;
     FShowThinking := BoolVal;
+  end
+  else if N = 'color' then
+  begin
+    Parts := TStringList.Create;
+    try
+      Parts.Delimiter := ' ';
+      Parts.StrictDelimiter := True;
+      Parts.DelimitedText := StringReplace(V, #9, ' ', [rfReplaceAll]);
+
+      if (Parts.Count <> 2) and (Parts.Count <> 3) then
+      begin
+        DoOutput('usage: set term.color <role> [foreground|background] <color>' + LineEnding, True);
+        Exit;
+      end;
+
+      Role := LowerCase(Parts[0]);
+      Pair := nil;
+
+      if Parts.Count = 2 then
+      begin
+        if not TryParseTermColor(Parts[1], ColorVal) then
+        begin
+          DoOutput('error: invalid color name' + LineEnding, True);
+          Exit;
+        end;
+
+        if Role = 'defaulttext' then
+          FColors.DefaultText := ColorVal
+        else if Role = 'thinkingtext' then
+          FColors.ThinkingText := ColorVal
+        else
+        begin
+          DoOutput('error: this color role requires foreground or background' + LineEnding, True);
+          Exit;
+        end;
+      end
+      else
+      begin
+        Part := LowerCase(Parts[1]);
+
+        if not TryParseTermColor(Parts[2], ColorVal) then
+        begin
+          DoOutput('error: invalid color name' + LineEnding, True);
+          Exit;
+        end;
+
+        if Role = 'welcomebadge' then
+          Pair := FColors.WelcomeBadge
+        else if Role = 'thinkingbadge' then
+          Pair := FColors.ThinkingBadge
+        else if Role = 'toolbadge' then
+          Pair := FColors.ToolBadge
+        else if Role = 'errorbadge' then
+          Pair := FColors.ErrorBadge
+        else if Role = 'warnbadge' then
+          Pair := FColors.WarnBadge
+        else if Role = 'promptinput' then
+          Pair := FColors.PromptInput
+        else if Role = 'log' then
+          Pair := FColors.Log
+        else
+        begin
+          DoOutput('error: unknown color role: ' + Role + LineEnding, True);
+          Exit;
+        end;
+
+        if Part = 'foreground' then
+          Pair.Foreground := ColorVal
+        else if Part = 'background' then
+          Pair.Background := ColorVal
+        else
+        begin
+          DoOutput('error: expected foreground or background' + LineEnding, True);
+          Exit;
+        end;
+      end;
+    finally
+      Parts.Free;
+    end;
   end
   else if N = 'commandtimeout' then
   begin
@@ -2385,6 +2540,7 @@ begin
     DoOutput('error: unknown term property: ' + AName + ', use "help agent"' + LineEnding, True);
     Exit;
   end;
+
   DoOutput('term.' + N + ' = ' + V + LineEnding, False);
 end;
 
@@ -2392,9 +2548,39 @@ procedure TCustomTermManager.HandleTermGet(const AName: string);
 var
   N: string;
   Val: string;
+  T: TStringList;
+
+// Formats a foreground/background color pair
+  function PairValue(const APair: TConsoleColorPair): string;
+  begin
+    Result := 'foreground ' + TermColorName(APair.Foreground) + ', background ' + TermColorName(APair.Background);
+  end;
+
 begin
   N := LowerCase(Trim(AName));
-  if N = 'path' then
+
+  if N = 'color' then
+  begin
+    T := TStringList.Create;
+    try
+      T.Add('Terminal colors:');
+      T.Add('  defaulttext    ' + TermColorName(FColors.DefaultText));
+      T.Add('  thinkingtext   ' + TermColorName(FColors.ThinkingText));
+      T.Add('  welcomebadge   ' + PairValue(FColors.WelcomeBadge));
+      T.Add('  thinkingbadge  ' + PairValue(FColors.ThinkingBadge));
+      T.Add('  toolbadge      ' + PairValue(FColors.ToolBadge));
+      T.Add('  errorbadge     ' + PairValue(FColors.ErrorBadge));
+      T.Add('  warnbadge      ' + PairValue(FColors.WarnBadge));
+      T.Add('  promptinput    ' + PairValue(FColors.PromptInput));
+      T.Add('  log            ' + PairValue(FColors.Log));
+      Val := T.Text;
+    finally
+      T.Free;
+    end;
+    DoOutput(Val, False);
+    Exit;
+  end
+  else if N = 'path' then
     Val := GetEffectivePath
   else if N = 'shell' then
     Val := FShellExec
@@ -2416,6 +2602,7 @@ begin
     DoOutput('error: unknown term property: ' + AName + ', use "help agent"' + LineEnding, True);
     Exit;
   end;
+
   DoOutput('term.' + N + ' = ' + Val + LineEnding, False);
 end;
 
@@ -2434,6 +2621,12 @@ var
     T.Add(Col + ': ' + AValue);
   end;
 
+  // Formats a foreground/background color pair
+  function PairValue(const APair: TConsoleColorPair): string;
+  begin
+    Result := 'foreground ' + TermColorName(APair.Foreground) + ', background ' + TermColorName(APair.Background);
+  end;
+
 begin
   T := TStringList.Create;
   try
@@ -2444,6 +2637,19 @@ begin
     Row('term.commandtimeout', IntToStr(FCommandTimeout));
     Row('term.maxcapturebytes', IntToStr(FMaxCaptureBytes));
     Row('term.agentcommandtimeout', IntToStr(FAgentCommandTimeout));
+
+    T.Add('');
+    T.Add('Terminal colors');
+    Row('defaulttext', TermColorName(FColors.DefaultText));
+    Row('thinkingtext', TermColorName(FColors.ThinkingText));
+    Row('welcomebadge', PairValue(FColors.WelcomeBadge));
+    Row('thinkingbadge', PairValue(FColors.ThinkingBadge));
+    Row('toolbadge', PairValue(FColors.ToolBadge));
+    Row('errorbadge', PairValue(FColors.ErrorBadge));
+    Row('warnbadge', PairValue(FColors.WarnBadge));
+    Row('promptinput', PairValue(FColors.PromptInput));
+    Row('log', PairValue(FColors.Log));
+
     Result := T.Text;
   finally
     T.Free;
@@ -4306,6 +4512,7 @@ begin
     tcErrorBadge: Attr := PairAttr(FColors.ErrorBadge);
     tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
     tcPromptInput: Attr := PairAttr(FColors.PromptInput);
+    tcLog: Attr := PairAttr(FColors.Log);
     tcDefault:
       if FDefaultConsoleAttrCaptured then
         Attr := (FDefaultConsoleAttr and $F0) or ColorToAttr(FColors.DefaultText)
