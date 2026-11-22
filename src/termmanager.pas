@@ -4087,6 +4087,10 @@ end;
 
 procedure TCustomTermManager.Stop;
 begin
+  // Stop the active agent before leaving the console loop
+  if Assigned(FAgent) and not FAgent.Done then
+    FAgent.Cancel;
+
   FRunning := False;
 end;
 
