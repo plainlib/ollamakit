@@ -1862,6 +1862,7 @@ begin
     begin
       WriteLn(ErrOutput, Format('[agent] Finish reason=%s answer_len=%d error="%s"',
         [AgentFinishReasonName(Reason), Length(Answer), ErrorMsg]));
+      WriteLn(ErrOutput);
       Flush(ErrOutput);
     end;
   finally
@@ -1930,7 +1931,7 @@ type
     procedure QueueRoute(AOp: TAgentOperation; const APayload: string; out AAllow: boolean);
     procedure QueueChunk(const AText: string);
     procedure QueueThinking(const AText: string);
-    procedure QueueToolCall(const AName, AArgs: string);
+    procedure QueueToolCall(const AName, AArgs: string; AIndex, ACount: integer);
     procedure QueueToolResult(const AName, AResult: string);
     procedure QueueFinish(AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
     procedure QueueContextUsage;
@@ -1994,7 +1995,6 @@ var
   Call: TRouteCall;
 begin
   AAllow := True;
-  FAgent.LogLine(Format('Route op=%s payload="%s"', [AgentOpName(AOp), Copy(APayload, 1, 200)]));
   if not Assigned(FAgent.FOnRoute) then
     Exit;
   Call := TRouteCall.Create;
@@ -2036,11 +2036,11 @@ begin
   TThread.Queue(nil, @Call.Invoke);
 end;
 
-procedure TOllamaAgentThread.QueueToolCall(const AName, AArgs: string);
+procedure TOllamaAgentThread.QueueToolCall(const AName, AArgs: string; AIndex, ACount: integer);
 var
   Call: TToolCallCall;
 begin
-  FAgent.LogLine(Format('ToolCall name="%s" args="%s"', [AName, Copy(AArgs, 1, 200)]));
+  FAgent.LogLine(Format('ToolCall (%d/%d) name="%s" args="%s"', [AIndex, ACount, AName, Copy(AArgs, 1, 200)]));
   if not Assigned(FAgent.FOnToolCall) then
     Exit;
   Call := TToolCallCall.Create;
@@ -2385,38 +2385,8 @@ begin
         // Build request using the original conversation history
         MessagesJson := BuildRequestMessagesJson(MessagesArr);
 
-        FAgent.LogLine(Format('Context step=%d usage=%d/%d (%d%%) messages=%d thinking=%d bytes tool_results=%d bytes',
-          [Step, FAgent.FContextUsed, FAgent.FContextTotal, ContextPercent, ContextMessages, ContextThinkingBytes,
-          ContextToolBytes]));
-
-        FAgent.LogLine(Format('Step %d messages=%d timeout=%d request_json_bytes=%d',
-          [Step, MessagesArr.Count, FAgent.OllamaManager.RequestTimeout, Length(MessagesJson)]));
-
-        // Log the last assistant tool call
-        for I := MessagesArr.Count - 1 downto 0 do
-        begin
-          if MessagesArr.Items[I].JSONType <> jtObject then
-            Continue;
-          MsgObj := TJSONObject(MessagesArr.Items[I]);
-          if (MsgObj.Get('role', '') = 'assistant') and (MsgObj.Find('tool_calls') <> nil) then
-          begin
-            FAgent.LogLine('Last assistant tool call: ' + MsgObj.AsJSON);
-            Break;
-          end;
-        end;
-
-        // Log metadata of the last tool result without duplicating its content
-        for I := MessagesArr.Count - 1 downto 0 do
-        begin
-          if MessagesArr.Items[I].JSONType <> jtObject then
-            Continue;
-          MsgObj := TJSONObject(MessagesArr.Items[I]);
-          if MsgObj.Get('role', '') = 'tool' then
-          begin
-            FAgent.LogLine(Format('Last tool result: content_len=%d', [Length(MsgObj.Get('content', ''))]));
-            Break;
-          end;
-        end;
+        FAgent.LogLine(Format('Context %d/%d (%d%%) | messages=%d | tool_results=%d bytes',
+          [FAgent.FContextUsed, FAgent.FContextTotal, ContextPercent, ContextMessages, ContextToolBytes]));
 
         // Temporarily override manager timeout when agent has its own
         SavedTimeout := FAgent.OllamaManager.RequestTimeout;
@@ -2520,8 +2490,7 @@ begin
         // Notify the host to refresh context indicators
         QueueContextUsage;
 
-        FAgent.LogLine(Format('Chat done raw_len=%d usage=%d/%d', [Length(FinalJson), FAgent.FContextUsed,
-          FAgent.FContextTotal]));
+        FAgent.LogLine(Format('Chat completed | context=%d/%d', [FAgent.FContextUsed, FAgent.FContextTotal]));
 
         Data := nil;
         try
@@ -2607,8 +2576,6 @@ begin
             Exit;
           end;
 
-          FAgent.LogLine(Format('ToolCalls count=%d', [ToolCallsArr.Count]));
-
           // Parse all tool calls first so they can be emitted and run as a batch
           ToolCount := ToolCallsArr.Count;
           SetLength(ToolNames, ToolCount);
@@ -2647,7 +2614,7 @@ begin
             else
               ToolArgArr[ToolIdx] := ArgsData.AsJSON;
 
-            QueueToolCall(ToolNames[ToolIdx], ToolArgArr[ToolIdx]);
+            QueueToolCall(ToolNames[ToolIdx], ToolArgArr[ToolIdx], ToolIdx + 1, ToolCount);
 
             // finish and non-safe tools break the parallel batch
             if (ToolNames[ToolIdx] = 'finish') or not IsParallelSafeTool(ToolNames[ToolIdx]) then
@@ -4217,9 +4184,9 @@ begin
   Display := StringReplace(Display, #13, ' ', [rfReplaceAll]);
   if Length(Display) > PREVIEW_CHARS then
     Display := Copy(Display, 1, PREVIEW_CHARS) + ' ...';
-  DoLog('  [' + AName + '] ' + Display);
+  DoLog('[' + AName + '] ' + Display);
   // Separate the preview from the next block (thinking or another tool call)
-  DoLog('');
+  if not FLog then DoLog('');
 end;
 
 function TCustomOllamaAgent.GetEffectiveRootPath: string;
@@ -7470,7 +7437,6 @@ begin
   CleanName := Trim(CleanName);
   if CleanName = '' then
     CleanName := AName;
-  LogLine(Format('DispatchTool name="%s" args="%s"', [CleanName, Copy(AArgsJson, 1, 200)]));
 
   // Reject malformed JSON before attempting to parse tool arguments
   if not AArgsJson.IsJson then
