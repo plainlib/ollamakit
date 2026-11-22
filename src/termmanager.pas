@@ -28,7 +28,7 @@ type
     );
 
   // Semantic color roles used by terminal output
-  TTermColor = (tcDefault, tcDim, tcWelcome, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge);
+  TTermColor = (tcDefault, tcDim, tcWelcome, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge, tcPromptInput);
 
   TTermRouteEvent = procedure(Sender: TObject; const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean) of object;
   TTermOutputEvent = procedure(Sender: TObject; const AText: string; AIsStderr: boolean) of object;
@@ -61,11 +61,13 @@ type
     FToolBadge: TConsoleColorPair;
     FErrorBadge: TConsoleColorPair;
     FWarnBadge: TConsoleColorPair;
+    FPromptInput: TConsoleColorPair;
     procedure SetWelcomeBadge(const AValue: TConsoleColorPair);
     procedure SetThinkingBadge(const AValue: TConsoleColorPair);
     procedure SetToolBadge(const AValue: TConsoleColorPair);
     procedure SetErrorBadge(const AValue: TConsoleColorPair);
     procedure SetWarnBadge(const AValue: TConsoleColorPair);
+    procedure SetPromptInput(const AValue: TConsoleColorPair);
   public
     constructor Create;
     destructor Destroy; override;
@@ -85,6 +87,8 @@ type
     property ErrorBadge: TConsoleColorPair read FErrorBadge write SetErrorBadge;
     // Badge style for warning messages such as max steps reached
     property WarnBadge: TConsoleColorPair read FWarnBadge write SetWarnBadge;
+    // Style for the entire user input prompt and entered text
+    property PromptInput: TConsoleColorPair read FPromptInput write SetPromptInput;
   end;
 
   // Shell history sharing options passed to the agent as context prelude
@@ -767,6 +771,9 @@ begin
   FWarnBadge := TConsoleColorPair.Create;
   FWarnBadge.Background := ccYellow;
   FWarnBadge.Foreground := ccWhite;
+  FPromptInput := TConsoleColorPair.Create;
+  FPromptInput.Background := ccBlack;
+  FPromptInput.Foreground := ccWhite;
 end;
 
 destructor TTermColorScheme.Destroy;
@@ -776,6 +783,7 @@ begin
   FToolBadge.Free;
   FErrorBadge.Free;
   FWarnBadge.Free;
+  FPromptInput.Free;
   inherited Destroy;
 end;
 
@@ -802,6 +810,11 @@ end;
 procedure TTermColorScheme.SetWarnBadge(const AValue: TConsoleColorPair);
 begin
   FWarnBadge.Assign(AValue);
+end;
+
+procedure TTermColorScheme.SetPromptInput(const AValue: TConsoleColorPair);
+begin
+  FPromptInput.Assign(AValue);
 end;
 
 procedure TTermColorScheme.Assign(Source: TPersistent);
@@ -4259,6 +4272,7 @@ begin
     tcToolBadge: Attr := PairAttr(FColors.ToolBadge);
     tcErrorBadge: Attr := PairAttr(FColors.ErrorBadge);
     tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
+    tcPromptInput: Attr := PairAttr(FColors.PromptInput);
     else
       Attr := ColorToAttr(FColors.DefaultText);
   end;
@@ -5270,6 +5284,7 @@ var
 
     PromptText := GetPromptText;
     CapturePromptPosition;
+    SetColor(tcPromptInput);
     ConWriteUtf8(PromptText);
     FLastCharWasNewLine := False;
     PromptRow := ConWhereY;
@@ -5324,6 +5339,7 @@ begin
   except
     ; // Console may be detached
   end;
+  SetColor(tcPromptInput);
   ConWriteUtf8(PromptText);
   FLastCharWasNewLine := False;
   PromptRow := ConWhereY;
@@ -5401,6 +5417,7 @@ begin
         ClearSelection;
 
         PromptText := GetPromptText;
+        SetColor(tcPromptInput);
         Redraw;
         FLastCharWasNewLine := False;
 
@@ -5434,6 +5451,7 @@ begin
         ClearSelection;
 
         PromptText := GetPromptText;
+        SetColor(tcPromptInput);
         ConWriteUtf8(PromptText);
         FLastCharWasNewLine := False;
         PromptRow := ConWhereY;
@@ -5841,6 +5859,7 @@ begin
             Line := '';
             CursorPos := 0;
             HistIndex := FHistory.Count;
+            SetColor(tcPromptInput);
             ConWriteUtf8(PromptText);
             FLastCharWasNewLine := False;
             PromptRow := ConWhereY;
@@ -5873,6 +5892,8 @@ begin
 
     AppendChatOutput(string(PromptText) + string(Line) + LineEnding);
   end;
+
+  SetColor(tcDefault);
 end;
 
 {$ELSE}
