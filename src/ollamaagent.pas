@@ -494,6 +494,19 @@ type
   // Encoding selector for ReadTextFileSafe
   TFileEncoding = (feAuto, feUTF8, feANSI, feUTF16LE, feUTF16BE);
 
+// Converts a string to JSON and releases the temporary object
+function JSONQuote(const AValue: string): string;
+var
+  JsonString: TJSONString;
+begin
+  JsonString := TJSONString.Create(AValue);
+  try
+    Result := JsonString.AsJSON;
+  finally
+    JsonString.Free;
+  end;
+end;
+
 // Returns display name for an agent operation kind
 function AgentOpName(AOp: TAgentOperation): string;
 begin
@@ -1905,7 +1918,7 @@ begin
     FResult := FAgent.DispatchTool(FToolName, FToolArgs);
   except
     on E: Exception do
-      FResult := '{"error": ' + TJSONString.Create(E.Message).AsJSON + '}';
+      FResult := '{"error": ' + JSONQuote(E.Message) + '}';
   end;
 end;
 
@@ -4874,7 +4887,7 @@ begin
       SuggestNames := SuggestNames + '"' + Candidates[I] + '"';
     end;
 
-    Result := '{"error": "file not found: ' + TJSONString.Create(ARelPath).AsJSON;
+    Result := '{"error": "file not found: ' + JSONQuote(ARelPath);
     if SuggestNames <> '' then
       Result := Result + ', "did_you_mean": [' + SuggestNames + ']';
     Result := Result + '}';
@@ -4951,7 +4964,7 @@ begin
       'or call read_file again with a larger max_bytes value if the file is small]';
     Content := Content + Suffix;
   end;
-  Result := TJSONString.Create(Content).AsJSON;
+  Result := JSONQuote(Content);
 end;
 
 function TCustomOllamaAgent.DoReadFilePreview(AArgs: TJSONObject): string;
@@ -5074,7 +5087,7 @@ begin
         Buf.Append('This file is ' + IntToStr(Size) + ' bytes, larger than the 50 KB default. ');
         Buf.Append('Use read_file for the first 50 KB, then read_file_lines with start_line/end_line for more.');
       end;
-      Result := TJSONString.Create(Buf.ToString).AsJSON;
+      Result := JSONQuote(Buf.ToString);
     finally
       Buf.Free;
     end;
@@ -5175,7 +5188,7 @@ begin
         Arr.Add(Items[I]);
       // Report local instruction file so the model can load it explicitly
       if FLoadAgentsMd and FileExists(IncludeTrailingPathDelimiter(FullPath) + FAgentsFileName) then
-        Result := '{"files": ' + Arr.AsJSON + ', "agents_md": ' + TJSONString.Create(FAgentsFileName).AsJSON + '}'
+        Result := '{"files": ' + Arr.AsJSON + ', "agents_md": ' + JSONQuote(FAgentsFileName) + '}'
       else
         Result := '{"files": ' + Arr.AsJSON + '}';
     finally
@@ -7194,8 +7207,7 @@ begin
       on E: Exception do
       begin
         Regex.Free;
-        Result := '{"error": "invalid regex: ' + TJSONString.Create(E.Message).AsJSON +
-          '", "hint": "set literal=true to search for the exact string"}';
+        Result := '{"error": "invalid regex: ' + JSONQuote(E.Message) + '", "hint": "set literal=true to search for the exact string"}';
         Exit;
       end;
     end;
@@ -7325,21 +7337,18 @@ begin
   end;
   if IsBinaryFile(FoundPath) then
   begin
-    Result := '{"found": true, "path": ' + TJSONString.Create(RelativeToRoot(Root, FoundPath)).AsJSON +
-      ', "error": "binary file detected"}';
+    Result := '{"found": true, "path": ' + JSONQuote(RelativeToRoot(Root, FoundPath)) + ', "error": "binary file detected"}';
     Exit;
   end;
   if not ReadTextFileSafe(FoundPath, Content) then
   begin
-    Result := '{"found": true, "path": ' + TJSONString.Create(RelativeToRoot(Root, FoundPath)).AsJSON +
-      ', "error": "cannot read file"}';
+    Result := '{"found": true, "path": ' + JSONQuote(RelativeToRoot(Root, FoundPath)) + ', "error": "cannot read file"}';
     Exit;
   end;
   Content := TrimRight(Content);
   if Length(Content) > MAX_AGENTS_BYTES then
     Content := Copy(Content, 1, MAX_AGENTS_BYTES) + LineEnding + '[... truncated at ' + IntToStr(MAX_AGENTS_BYTES) + ' bytes]';
-  Result := '{"found": true, "path": ' + TJSONString.Create(RelativeToRoot(Root, FoundPath)).AsJSON +
-    ', "content": ' + TJSONString.Create(Content).AsJSON + '}';
+  Result := '{"found": true, "path": ' + JSONQuote(RelativeToRoot(Root, FoundPath)) + ', "content": ' + JSONQuote(Content) + '}';
 end;
 
 function TCustomOllamaAgent.DoGitCommand(const AFullCommand: string): string;
@@ -7453,7 +7462,7 @@ begin
     Call.Free;
   end;
   if Allow then
-    Result := '{"answer": ' + TJSONString.Create(Answer).AsJSON + '}'
+    Result := '{"answer": ' + JSONQuote(Answer) + '}'
   else
     Result := '{"error": "user cancelled the question"}';
 end;
@@ -7548,7 +7557,7 @@ begin
   end;
   if not CheckUrlSafety(Url, ErrorMsg) then
   begin
-    Result := '{"error": ' + TJSONString.Create(ErrorMsg).AsJSON + '}';
+    Result := '{"error": ' + JSONQuote(ErrorMsg) + '}';
     Exit;
   end;
   // Skip request entirely when cancellation is already requested
@@ -7560,7 +7569,7 @@ begin
   LogLine(Format('WebFetch url="%s"', [Copy(Url, 1, 200)]));
   if not DoWebFetchInternal(Url, Content, ErrorMsg) then
   begin
-    Result := '{"error": ' + TJSONString.Create(ErrorMsg).AsJSON + '}';
+    Result := '{"error": ' + JSONQuote(ErrorMsg) + '}';
     Exit;
   end;
   if Length(Content) > FWebOptions.MaxResponseBytes then
@@ -7568,7 +7577,7 @@ begin
       IntToStr(FWebOptions.MaxResponseBytes) + ' bytes]';
   if FWebOptions.StripHtml then
     Content := StripHtmlTags(Content);
-  Result := '{"url": ' + TJSONString.Create(Url).AsJSON + ', "content": ' + TJSONString.Create(Content).AsJSON + '}';
+  Result := '{"url": ' + JSONQuote(Url) + ', "content": ' + JSONQuote(Content) + '}';
 end;
 
 function TCustomOllamaAgent.DoWebSearch(AArgs: TJSONObject): string;
@@ -7594,7 +7603,7 @@ begin
   // Apply the same safety checks as web_fetch, search URL comes from config
   if not CheckUrlSafety(Url, ErrorMsg) then
   begin
-    Result := '{"error": ' + TJSONString.Create(ErrorMsg).AsJSON + '}';
+    Result := '{"error": ' + JSONQuote(ErrorMsg) + '}';
     Exit;
   end;
   // Skip request entirely when cancellation is already requested
@@ -7614,7 +7623,7 @@ begin
       IntToStr(FWebOptions.MaxResponseBytes) + ' bytes]';
   if FWebOptions.StripHtml then
     Content := StripHtmlTags(Content);
-  Result := '{"query": ' + TJSONString.Create(Query).AsJSON + ', "content": ' + TJSONString.Create(Content).AsJSON + '}';
+  Result := '{"query": ' + JSONQuote(Query) + ', "content": ' + JSONQuote(Content) + '}';
 end;
 
 function TCustomOllamaAgent.DispatchTool(const AName, AArgsJson: string): string;
@@ -7854,8 +7863,8 @@ begin
 
   Result := '{"error": "unknown tool: ' + AName + '", ';
   if Hint <> '' then
-    Result := Result + '"hint": ' + TJSONString.Create(Hint).AsJSON + ', ';
-  Result := Result + '"available_tools": ' + TJSONString.Create(Available).AsJSON + '}';
+    Result := Result + '"hint": ' + JSONQuote(Hint) + ', ';
+  Result := Result + '"available_tools": ' + JSONQuote(Available) + '}';
 end;
 
 end.
