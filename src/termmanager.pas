@@ -4410,28 +4410,14 @@ end;
 
 // Hides console cursor, used to suppress flicker during redraw
 procedure HideConsoleCursor;
-var
-  Info: TConsoleCursorInfo;
 begin
-  Info := Default(TConsoleCursorInfo);
-  if GetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
-  begin
-    Info.bVisible := False;
-    SetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
-  end;
+  ConWriteUtf8(#27'[?25l');
 end;
 
 // Restores console cursor visibility, used after redraw
 procedure ShowConsoleCursor;
-var
-  Info: TConsoleCursorInfo;
 begin
-  Info := Default(TConsoleCursorInfo);
-  if GetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
-  begin
-    Info.bVisible := True;
-    SetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info);
-  end;
+  ConWriteUtf8(#27'[?25h');
 end;
 
 function TCustomTermManager.ReadLine: string;
