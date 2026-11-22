@@ -81,19 +81,32 @@ type
     FContextUsed: integer;
     FContextTotal: integer;
     FOutputMarks: TTerminalOutputMarks;
+    FSessionActive: boolean;
+
+    procedure SetName(const AValue: string);
+    procedure SetWorkingDirectory(const AValue: string);
+    procedure SetHistory(const AValue: string);
+    procedure SetChatPrompt(const AValue: string);
+    procedure SetTerminalOutput(const AValue: string);
+    procedure SetContextUsed(AValue: integer);
+    procedure SetContextTotal(AValue: integer);
   public
     constructor Create(AID: integer; const AName: string);
     destructor Destroy; override;
 
     property ID: integer read FID;
-    property Name: string read FName write FName;
-    property WorkingDirectory: string read FWorkingDirectory write FWorkingDirectory;
-    property History: string read FHistory write FHistory;
+    property Name: string read FName write SetName;
+    property WorkingDirectory: string read FWorkingDirectory write SetWorkingDirectory;
+    property History: string read FHistory write SetHistory;
     // Additional system instructions for this chat
-    property ChatPrompt: string read FChatPrompt write FChatPrompt;
+    property ChatPrompt: string read FChatPrompt write SetChatPrompt;
     property TerminalHistory: TStringList read FTerminalHistory;
     property ShellLog: TStringList read FShellLog;
-    property TerminalOutput: string read FTerminalOutput write FTerminalOutput;
+    property TerminalOutput: string read FTerminalOutput write SetTerminalOutput;
+
+    procedure MarkSessionActive;
+    procedure ResetSessionActive;
+
     procedure AddOutputMark(const AMark: TTerminalOutputMark);
     procedure IncrementLastOutputMarkShellLogCount;
     function GetLastOutputMark(out AMark: TTerminalOutputMark): boolean;
@@ -101,8 +114,9 @@ type
     procedure SetOutputMarkScreenPosition(AIndex, ARow, ACol: integer);
 
     property OutputMarks: TTerminalOutputMarks read FOutputMarks;
-    property ContextUsed: integer read FContextUsed write FContextUsed;
-    property ContextTotal: integer read FContextTotal write FContextTotal;
+    property ContextUsed: integer read FContextUsed write SetContextUsed;
+    property ContextTotal: integer read FContextTotal write SetContextTotal;
+    property SessionActive: boolean read FSessionActive;
   end;
 
   // Web access options used by web_fetch and web_search tools
@@ -3007,6 +3021,7 @@ begin
   FContextUsed := 0;
   FContextTotal := 0;
   FOutputMarks := nil;
+  FSessionActive := False;
 end;
 
 destructor TAgentChat.Destroy;
@@ -3015,6 +3030,16 @@ begin
   FShellLog.Free;
   FOutputMarks := nil;
   inherited Destroy;
+end;
+
+procedure TAgentChat.MarkSessionActive;
+begin
+  FSessionActive := True;
+end;
+
+procedure TAgentChat.ResetSessionActive;
+begin
+  FSessionActive := False;
 end;
 
 procedure TAgentChat.AddOutputMark(const AMark: TTerminalOutputMark);
@@ -3061,6 +3086,62 @@ begin
 
   FOutputMarks[AIndex].ScreenRow := ARow;
   FOutputMarks[AIndex].ScreenCol := ACol;
+end;
+
+procedure TAgentChat.SetName(const AValue: string);
+begin
+  if FName = AValue then
+    Exit;
+  FName := AValue;
+  MarkSessionActive;
+end;
+
+procedure TAgentChat.SetWorkingDirectory(const AValue: string);
+begin
+  if FWorkingDirectory = AValue then
+    Exit;
+  FWorkingDirectory := AValue;
+  MarkSessionActive;
+end;
+
+procedure TAgentChat.SetHistory(const AValue: string);
+begin
+  if FHistory = AValue then
+    Exit;
+  FHistory := AValue;
+  MarkSessionActive;
+end;
+
+procedure TAgentChat.SetChatPrompt(const AValue: string);
+begin
+  if FChatPrompt = AValue then
+    Exit;
+  FChatPrompt := AValue;
+  MarkSessionActive;
+end;
+
+procedure TAgentChat.SetTerminalOutput(const AValue: string);
+begin
+  if FTerminalOutput = AValue then
+    Exit;
+  FTerminalOutput := AValue;
+  MarkSessionActive;
+end;
+
+procedure TAgentChat.SetContextUsed(AValue: integer);
+begin
+  if FContextUsed = AValue then
+    Exit;
+  FContextUsed := AValue;
+  MarkSessionActive;
+end;
+
+procedure TAgentChat.SetContextTotal(AValue: integer);
+begin
+  if FContextTotal = AValue then
+    Exit;
+  FContextTotal := AValue;
+  MarkSessionActive;
 end;
 
 { TCustomOllamaAgent }
@@ -3233,6 +3314,7 @@ begin
 
   Result := TAgentChat.Create(FNextChatID, ChatName);
   Result.WorkingDirectory := FRootPath;
+  Result.MarkSessionActive;
   FChats.Add(Result);
   FActiveChat := Result;
   FHistory := Result.History;
@@ -3715,6 +3797,7 @@ begin
         Chats[ChatIndex].Name := ChatName;
         // Reassign the directory so the chat is found on the next launch
         Chats[ChatIndex].WorkingDirectory := LaunchDirectory;
+        Chats[ChatIndex].MarkSessionActive;
         RootPath := LaunchDirectory;
       end
       else
@@ -3750,6 +3833,11 @@ begin
   Result := False;
   if not Assigned(AChat) or (Trim(AFileName) = string.Empty) then
     Exit;
+  if not AChat.SessionActive then
+  begin
+    Result := True;
+    Exit;
+  end;
 
   Root := TJSONObject.Create;
   try
@@ -3794,6 +3882,7 @@ begin
       Data.Text := Root.FormatJSON([], 2);
       Data.SaveToFile(AFileName);
       Result := True;
+      AChat.ResetSessionActive;
     finally
       Data.Free;
     end;
@@ -3913,6 +4002,8 @@ begin
         end;
       end;
 
+      // Loaded data must not count as session changes
+      Result.ResetSessionActive;
       FChats.Add(Result);
       FActiveChat := Result;
       FHistory := Result.History;
@@ -3936,7 +4027,10 @@ begin
   if not FDone then
     Exit;
   if Assigned(FActiveChat) then
+  begin
     FHistory := FActiveChat.History;
+    FActiveChat.MarkSessionActive;
+  end;
   FDone := False;
   FCancelled := False;
   FFinalAnswer := '';

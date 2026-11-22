@@ -1045,6 +1045,7 @@ begin
   if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
     Exit;
 
+  FAgent.ActiveChat.MarkSessionActive;
   FAgent.ActiveChat.TerminalOutput :=
     FAgent.ActiveChat.TerminalOutput + AText;
 end;
@@ -1301,6 +1302,7 @@ begin
       FAgent.ActiveChat.IncrementLastOutputMarkShellLogCount;
 
     FAgent.ActiveChat.ShellLog.Assign(FShellLog);
+    FAgent.ActiveChat.MarkSessionActive;
   end;
 end;
 
@@ -2016,6 +2018,7 @@ begin
       begin
         FAgent.ActiveChat.TerminalOutput := string.Empty;
         FAgent.ActiveChat.ShellLog.Clear;
+        FAgent.ActiveChat.MarkSessionActive;
       end;
     end;
 
@@ -2720,6 +2723,9 @@ begin
 
   // Remove the completed operation mark
   Chat.DeleteLastOutputMark;
+
+  // Mark the chat as modified after removing the last operation
+  Chat.MarkSessionActive;
 
   {$IFDEF WINDOWS}
   // Clear the screen buffer from the saved input position
@@ -3823,7 +3829,10 @@ begin
     FHistory.Delete(0);
 
   if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+  begin
     FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+    FAgent.ActiveChat.MarkSessionActive;
+  end;
 end;
 
 procedure TCustomTermManager.Run;
@@ -3978,7 +3987,10 @@ begin
               begin
                 FShellLog.Clear;
                 if Assigned(FAgent.ActiveChat) then
+                begin
                   FAgent.ActiveChat.ShellLog.Clear;
+                  FAgent.ActiveChat.MarkSessionActive;
+                end;
               end;
             end;
             // Save user handlers, install our own for the duration of the run
@@ -5423,7 +5435,10 @@ begin
 
               // Synchronize the active chat terminal history
               if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+              begin
                 FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+                FAgent.ActiveChat.MarkSessionActive;
+              end;
 
               if HistIndex > 0 then
                 Dec(HistIndex);
