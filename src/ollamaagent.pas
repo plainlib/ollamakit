@@ -6719,16 +6719,15 @@ const
   MAX_TOTAL_BYTES = 50000;
 var
   RelPath, FullPath, Pattern, BaseRoot, RelativePath: string;
-  Recursive: boolean;
+  Recursive, PatternHasPath, Truncated: boolean;
   Files, Patterns, Matches: TStringList;
   Arr: TJSONArray;
-  I, P, TotalBytes: integer;
-  Truncated: boolean;
+  I, J, P, TotalBytes: integer;
   Regex: TRegExpr;
 
   function EscapeRegexChar(const AChar: char): string;
   begin
-    if AChar in ['\', '.', '+', '(', ')', '^', '$', '|'] then
+    if AChar in ['\', '.', '+', '(', ')', '^', '$', '|', '{', '}', ']'] then
       Result := '\' + AChar
     else
       Result := AChar;
@@ -6737,29 +6736,29 @@ var
   // Converts a glob pattern into an anchored regular expression
   function GlobToRegex(const APattern: string): string;
   var
-    J, ClassEnd: integer;
+    K, ClassEnd, ClassIndex: integer;
     C: char;
-    ClassContent: string;
+    ClassContent, ClassChar: string;
   begin
     Result := '^';
-    J := 1;
+    K := 1;
 
-    while J <= Length(APattern) do
+    while K <= Length(APattern) do
     begin
-      C := APattern[J];
+      C := APattern[K];
 
       case C of
         '*':
         begin
-          if (J < Length(APattern)) and (APattern[J + 1] = '*') then
+          if (K < Length(APattern)) and (APattern[K + 1] = '*') then
           begin
-            Inc(J, 2);
+            Inc(K, 2);
 
-            // **/ also matches files in the current directory
-            if (J <= Length(APattern)) and (APattern[J] = '/') then
+            // **/ matches zero or more directory levels
+            if (K <= Length(APattern)) and (APattern[K] = '/') then
             begin
-              Result := Result + '(.*\/)?';
-              Inc(J);
+              Result := Result + '(.*/)?';
+              Inc(K);
             end
             else
               Result := Result + '.*';
@@ -6767,50 +6766,63 @@ var
           else
           begin
             Result := Result + '[^/]*';
-            Inc(J);
+            Inc(K);
           end;
         end;
 
         '?':
         begin
+          // Match exactly one character except a path separator
           Result := Result + '[^/]';
-          Inc(J);
+          Inc(K);
         end;
 
         '[':
         begin
-          ClassEnd := J + 1;
+          ClassEnd := K + 1;
+
           while (ClassEnd <= Length(APattern)) and (APattern[ClassEnd] <> ']') do
             Inc(ClassEnd);
 
-          if ClassEnd > Length(APattern) then
+          if (ClassEnd > Length(APattern)) or (ClassEnd = K + 1) then
           begin
             Result := Result + '\[';
-            Inc(J);
+            Inc(K);
           end
           else
           begin
-            ClassContent := Copy(APattern, J + 1, ClassEnd - J - 1);
+            ClassContent := Copy(APattern, K + 1, ClassEnd - K - 1);
 
-            if ClassContent = string.Empty then
-              Result := Result + '\['
-            else
+            // Support [!abc] negated character classes
+            if ClassContent[1] = '!' then
+              ClassContent[1] := '^';
+
+            // Escape special characters inside character classes
+            Result := Result + '[';
+
+            for ClassIndex := 1 to Length(ClassContent) do
             begin
-              if ClassContent[1] = '!' then
-                ClassContent[1] := '^';
+              ClassChar := ClassContent[ClassIndex];
 
-              Result := Result + '[' + ClassContent + ']';
-              J := ClassEnd;
+              if ClassChar = '\' then
+                Result := Result + '\\'
+              else if (ClassChar = '^') and (ClassIndex = 1) then
+                Result := Result + '\^'
+              else if ClassChar = ']' then
+                Result := Result + '\]'
+              else
+                Result := Result + ClassChar;
             end;
 
-            Inc(J);
+            Result := Result + ']';
+            K := ClassEnd + 1;
           end;
         end;
 
         else
         begin
           Result := Result + EscapeRegexChar(C);
-          Inc(J);
+          Inc(K);
         end;
       end;
     end;
@@ -6818,13 +6830,22 @@ var
     Result := Result + '$';
   end;
 
-  // Expands brace alternatives, including nested expressions
+  // Expands brace alternatives, including multiple and nested expressions
   procedure ExpandPattern(const APattern: string);
   var
-    OpenPos, ClosePos, J, Depth, StartPos: integer;
+    OpenPos, ClosePos, K, Depth, StartPos: integer;
     Prefix, Suffix, Body, Item: string;
   begin
-    OpenPos := Pos('{', APattern);
+    OpenPos := 0;
+
+    // Find the first opening brace
+    for K := 1 to Length(APattern) do
+      if APattern[K] = '{' then
+      begin
+        OpenPos := K;
+        Break;
+      end;
+
     if OpenPos = 0 then
     begin
       Patterns.Add(APattern);
@@ -6834,16 +6855,17 @@ var
     Depth := 0;
     ClosePos := 0;
 
-    for J := OpenPos to Length(APattern) do
+    // Find the matching closing brace
+    for K := OpenPos to Length(APattern) do
     begin
-      if APattern[J] = '{' then
+      if APattern[K] = '{' then
         Inc(Depth)
-      else if APattern[J] = '}' then
+      else if APattern[K] = '}' then
       begin
         Dec(Depth);
         if Depth = 0 then
         begin
-          ClosePos := J;
+          ClosePos := K;
           Break;
         end;
       end;
@@ -6862,20 +6884,27 @@ var
     Depth := 0;
     StartPos := 1;
 
-    for J := 1 to Length(Body) + 1 do
+    // Split alternatives only at the current brace level
+    for K := 1 to Length(Body) + 1 do
     begin
-      if J <= Length(Body) then
+      if K <= Length(Body) then
       begin
-        if Body[J] = '{' then
+        if Body[K] = '{' then
           Inc(Depth)
-        else if Body[J] = '}' then
+        else if Body[K] = '}' then
           Dec(Depth);
       end;
 
-      if (J > Length(Body)) or ((Body[J] = ',') and (Depth = 0)) then
+      if K > Length(Body) then
       begin
-        Item := Copy(Body, StartPos, J - StartPos);
-        StartPos := J + 1;
+        Item := Copy(Body, StartPos, K - StartPos);
+        ExpandPattern(Prefix + Item + Suffix);
+      end
+      else if (Body[K] = ',') and (Depth = 0) then
+      begin
+        Item := Copy(Body, StartPos, K - StartPos);
+        StartPos := K + 1;
+
         ExpandPattern(Prefix + Item + Suffix);
       end;
     end;
@@ -6887,37 +6916,25 @@ begin
   if AArgs = nil then
     Exit;
 
-  RelPath := AArgs.Get('path', '');
+  RelPath := AArgs.Get('path', string.Empty);
   Pattern := AArgs.Get('pattern', '*');
   Recursive := GetBoolArg(AArgs, 'recursive', True);
 
-  if Pattern = '' then
+  if Pattern = string.Empty then
     Pattern := '*';
 
-  // Normalize separators before processing the pattern
+  // Normalize path separators and remove leading current-directory segments
   Pattern := StringReplace(Pattern, '\', '/', [rfReplaceAll]);
 
-  // A ** pattern always requires recursive traversal
+  while Copy(Pattern, 1, 2) = './' do
+    Delete(Pattern, 1, 2);
+
+  // Double-star patterns always require recursive traversal
   if Pos('**', Pattern) > 0 then
     Recursive := True;
 
-  // Support path-style patterns such as src/*.pas
-  P := LastDelimiter('/', Pattern);
-  if P > 0 then
-  begin
-    if RelPath <> '' then
-      RelPath := IncludeTrailingPathDelimiter(RelPath) + Copy(Pattern, 1, P - 1)
-    else
-      RelPath := Copy(Pattern, 1, P - 1);
-
-    Pattern := Copy(Pattern, P + 1, MaxInt);
-
-    if Pattern = '' then
-      Pattern := '*';
-  end;
-
   FullPath := SafePath(RelPath);
-  if FullPath = '' then
+  if FullPath = string.Empty then
   begin
     Result := SafePathError;
     Exit;
@@ -6949,27 +6966,36 @@ begin
 
     ExpandPattern(Pattern);
 
-    // Collect files once; matching is performed against their relative paths
+    // Collect files once; match patterns against their relative paths
     FindAllFiles(Files, FullPath, '*', Recursive);
 
     Regex := TRegExpr.Create;
 
-    for P := 0 to Patterns.Count - 1 do
+    for I := 0 to Patterns.Count - 1 do
     begin
-      Regex.Expression := GlobToRegex(Patterns[P]);
+      Regex.Expression := GlobToRegex(Patterns[I]);
 
       {$IFDEF MSWINDOWS}
       Regex.ModifierI := True;
       {$ENDIF}
 
-      for I := 0 to Files.Count - 1 do
-      begin
-        RelativePath := ExtractRelativePath(IncludeTrailingPathDelimiter(FullPath), Files[I]);
+      // Patterns without a slash match filenames at any directory depth
+      PatternHasPath := Pos('/', Patterns[I]) > 0;
 
+      for J := 0 to Files.Count - 1 do
+      begin
+        RelativePath := ExtractRelativePath(IncludeTrailingPathDelimiter(FullPath), Files[J]);
         RelativePath := StringReplace(RelativePath, '\', '/', [rfReplaceAll]);
 
+        if not PatternHasPath then
+        begin
+          P := LastDelimiter('/', RelativePath);
+          if P > 0 then
+            RelativePath := Copy(RelativePath, P + 1, MaxInt);
+        end;
+
         if Regex.Exec(RelativePath) then
-          Matches.Add(Files[I]);
+          Matches.Add(Files[J]);
 
         // Stop once enough unique matches have been collected
         if Matches.Count > MAX_RESULTS then
