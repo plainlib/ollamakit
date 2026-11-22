@@ -472,6 +472,16 @@ begin
     Row('warnbadge', 'warning messages');
     Row('promptinput', 'user prompt and input');
     Row('log', 'agent log messages');
+    Row('markdown.marker', 'Markdown delimiters');
+    Row('markdown.bold', 'bold text');
+    Row('markdown.italic', 'italic text');
+    Row('markdown.strikethrough', 'strikethrough text');
+    Row('markdown.inlinecode', 'inline code');
+    Row('markdown.fencedcode', 'fenced code block text');
+    Row('markdown.highlight', 'highlighted text');
+    Row('markdown.heading', 'heading text');
+    Row('markdown.quote', 'blockquote text');
+    Row('markdown.listmarker', 'list markers');
     Row('colors', 'black red green yellow blue magenta cyan gray');
     Row('', 'darkgray lightred lightgreen lightyellow lightblue');
     Row('', 'lightmagenta lightcyan white');
@@ -497,6 +507,9 @@ begin
     Row('', 'set term.color thinkingtext gray');
     Row('', 'set term.color toolbadge background blue');
     Row('', 'set term.color errorbadge foreground white');
+    Row('', 'set term.color markdown.marker darkgray');
+    Row('', 'set term.color markdown.bold white');
+    Row('', 'set term.color markdown.inlinecode lightgreen');
 
     Header('Context examples');
     Row('ollama context', 'show current context window');

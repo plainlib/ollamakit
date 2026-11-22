@@ -29,7 +29,8 @@ type
 
   // Semantic color roles used by terminal output
   TTermColor = (tcDefault, tcDim, tcWelcome, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge,
-    tcPromptInput, tcLog);
+    tcPromptInput, tcLog, tcMarkdownMarker, tcMarkdownBold, tcMarkdownItalic, tcMarkdownStrike,
+    tcMarkdownCode, tcMarkdownFencedCode, tcMarkdownHighlight, tcMarkdownHeading, tcMarkdownQuote, tcMarkdownList);
 
   TTermRouteEvent = procedure(Sender: TObject; const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean) of object;
   TTermOutputEvent = procedure(Sender: TObject; const AText: string; AIsStderr: boolean) of object;
@@ -52,6 +53,45 @@ type
     property Foreground: TConsoleColor read FForeground write FForeground default ccWhite;
   end;
 
+  // Colors used to highlight Markdown syntax in model responses
+  TMarkdownColorScheme = class(TPersistent)
+  private
+    FMarker: TConsoleColor;
+    FBold: TConsoleColor;
+    FItalic: TConsoleColor;
+    FStrikethrough: TConsoleColor;
+    FInlineCode: TConsoleColor;
+    FFencedCode: TConsoleColor;
+    FHighlight: TConsoleColor;
+    FHeading: TConsoleColor;
+    FQuote: TConsoleColor;
+    FListMarker: TConsoleColor;
+  public
+    constructor Create;
+    procedure Assign(Source: TPersistent); override;
+  published
+    // Markdown delimiters such as **, ` and ##
+    property Marker: TConsoleColor read FMarker write FMarker default ccDarkGray;
+    // Bold text
+    property Bold: TConsoleColor read FBold write FBold default ccWhite;
+    // Italic text
+    property Italic: TConsoleColor read FItalic write FItalic default ccLightCyan;
+    // Strikethrough text
+    property Strikethrough: TConsoleColor read FStrikethrough write FStrikethrough default ccDarkGray;
+    // Inline code text
+    property InlineCode: TConsoleColor read FInlineCode write FInlineCode default ccLightGreen;
+    // Highlighted text
+    property Highlight: TConsoleColor read FHighlight write FHighlight default ccLightYellow;
+    // Heading text
+    property Heading: TConsoleColor read FHeading write FHeading default ccLightCyan;
+    // Blockquote text
+    property Quote: TConsoleColor read FQuote write FQuote default ccLightGray;
+    // List markers
+    property ListMarker: TConsoleColor read FListMarker write FListMarker default ccLightBlue;
+    // Fenced code block text
+    property FencedCode: TConsoleColor read FFencedCode write FFencedCode default ccLightGreen;
+  end;
+
   // Full color palette used by TermManager output
   TTermColorScheme = class(TPersistent)
   private
@@ -64,6 +104,7 @@ type
     FWarnBadge: TConsoleColorPair;
     FPromptInput: TConsoleColorPair;
     FLog: TConsoleColorPair;
+    FMarkdown: TMarkdownColorScheme;
     procedure SetWelcomeBadge(const AValue: TConsoleColorPair);
     procedure SetThinkingBadge(const AValue: TConsoleColorPair);
     procedure SetToolBadge(const AValue: TConsoleColorPair);
@@ -71,6 +112,7 @@ type
     procedure SetWarnBadge(const AValue: TConsoleColorPair);
     procedure SetPromptInput(const AValue: TConsoleColorPair);
     procedure SetLog(const AValue: TConsoleColorPair);
+    procedure SetMarkdown(const AValue: TMarkdownColorScheme);
   public
     constructor Create;
     destructor Destroy; override;
@@ -94,6 +136,7 @@ type
     property PromptInput: TConsoleColorPair read FPromptInput write SetPromptInput;
     // Style for agent log messages
     property Log: TConsoleColorPair read FLog write SetLog;
+    property Markdown: TMarkdownColorScheme read FMarkdown write SetMarkdown;
   end;
 
   // Shell history sharing options passed to the agent as context prelude
@@ -211,6 +254,11 @@ type
     FDefaultConsoleAttr: Word;
     FDefaultConsoleAttrCaptured: boolean;
     {$ENDIF}
+    // Holds an incomplete Markdown line between streamed chunks
+    FMarkdownPending: string;
+    // True while the response is inside a fenced code block
+    FMarkdownFencedCode: boolean;
+    FMarkdownFenceChar: char;
     // Updates the native terminal window title with the current directory
     procedure UpdateConsoleTitle;
     // Sets the working directory and synchronizes the agent root path
@@ -343,6 +391,10 @@ type
     procedure HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
     // Prompts the user with a question and returns the typed answer
     procedure HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);
+    // Processes streamed model output with Markdown syntax highlighting
+    procedure ProcessMarkdownChunk(const AText: string; AFinal: boolean = False);
+    // Processes one complete Markdown line
+    procedure ProcessMarkdownLine(const ALine: string);
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -754,6 +806,8 @@ begin
     ccLightMagenta: Result := 'lightmagenta';
     ccLightCyan: Result := 'lightcyan';
     ccWhite: Result := 'white';
+    else
+      ;
   end;
 end;
 
@@ -807,6 +861,45 @@ begin
     inherited Assign(Source);
 end;
 
+{ TMarkdownColorScheme }
+
+constructor TMarkdownColorScheme.Create;
+begin
+  inherited Create;
+  FMarker := ccDarkGray;
+  FBold := ccLightBlue;
+  FItalic := ccLightMagenta;
+  FStrikethrough := ccDarkGray;
+  FInlineCode := ccLightGreen;
+  FHighlight := ccLightYellow;
+  FHeading := ccLightYellow;
+  FQuote := ccLightGray;
+  FListMarker := ccLightBlue;
+  FFencedCode := ccLightGray;
+end;
+
+procedure TMarkdownColorScheme.Assign(Source: TPersistent);
+var
+  Src: TMarkdownColorScheme;
+begin
+  if Source is TMarkdownColorScheme then
+  begin
+    Src := TMarkdownColorScheme(Source);
+    FMarker := Src.FMarker;
+    FBold := Src.FBold;
+    FItalic := Src.FItalic;
+    FStrikethrough := Src.FStrikethrough;
+    FInlineCode := Src.FInlineCode;
+    FHighlight := Src.FHighlight;
+    FHeading := Src.FHeading;
+    FQuote := Src.FQuote;
+    FListMarker := Src.FListMarker;
+    FFencedCode := Src.FFencedCode;
+  end
+  else
+    inherited Assign(Source);
+end;
+
 { TTermColorScheme }
 
 constructor TTermColorScheme.Create;
@@ -835,6 +928,7 @@ begin
   FLog := TConsoleColorPair.Create;
   FLog.Background := ccBlack;
   FLog.Foreground := ccCyan;
+  FMarkdown := TMarkdownColorScheme.Create;
 end;
 
 destructor TTermColorScheme.Destroy;
@@ -846,6 +940,7 @@ begin
   FWarnBadge.Free;
   FPromptInput.Free;
   FLog.Free;
+  FMarkdown.Free;
   inherited Destroy;
 end;
 
@@ -884,6 +979,11 @@ begin
   FLog.Assign(AValue);
 end;
 
+procedure TTermColorScheme.SetMarkdown(const AValue: TMarkdownColorScheme);
+begin
+  FMarkdown.Assign(AValue);
+end;
+
 procedure TTermColorScheme.Assign(Source: TPersistent);
 var
   Src: TTermColorScheme;
@@ -900,6 +1000,7 @@ begin
     FWarnBadge.Assign(Src.FWarnBadge);
     FPromptInput.Assign(Src.FPromptInput);
     FLog.Assign(Src.FLog);
+    FMarkdown.Assign(Src.FMarkdown);
   end
   else
     inherited Assign(Source);
@@ -1185,12 +1286,349 @@ begin
     FShellHistory.Assign(AValue);
 end;
 
+procedure TCustomTermManager.ProcessMarkdownChunk(const AText: string; AFinal: boolean);
+var
+  P: SizeInt;
+  Line: string;
+begin
+  FMarkdownPending := FMarkdownPending + AText;
+
+  while True do
+  begin
+    P := Pos(#10, FMarkdownPending);
+    if P = 0 then
+      Break;
+
+    Line := Copy(FMarkdownPending, 1, P);
+    Delete(FMarkdownPending, 1, P);
+    ProcessMarkdownLine(Line);
+  end;
+
+  if AFinal and (FMarkdownPending <> string.Empty) then
+  begin
+    ProcessMarkdownLine(FMarkdownPending);
+    FMarkdownPending := string.Empty;
+  end;
+end;
+
+procedure TCustomTermManager.ProcessMarkdownLine(const ALine: string);
+const
+  MARKERS: array[0..4] of string = ('**', '__', '~~', '==', '*');
+  MARKER_COLORS: array[0..4] of TTermColor = (
+    tcMarkdownBold, tcMarkdownBold, tcMarkdownStrike,
+    tcMarkdownHighlight, tcMarkdownItalic);
+var
+  Line, LineEndingText, Content: string;
+  I, J, PrefixStart, ContentStart: SizeInt;
+  FenceChar: char;
+  BaseColor: TTermColor;
+
+  procedure OutputText(const AText: string; AColor: TTermColor);
+  begin
+    if AText = string.Empty then
+      Exit;
+
+    SetColor(AColor);
+    WriteText(AText, False);
+  end;
+
+  function IsEscapedAt(const AText: string; APos: SizeInt): boolean;
+  var
+    P, Count: SizeInt;
+  begin
+    Count := 0;
+    P := APos - 1;
+
+    while (P > 0) and (AText[P] = '\') do
+    begin
+      Inc(Count);
+      Dec(P);
+    end;
+
+    Result := (Count mod 2) = 1;
+  end;
+
+  function IsMarkdownEscapable(AChar: char): boolean;
+  begin
+    Result := AChar in ['\', '`', '*', '_', '~', '='];
+  end;
+
+  function FindClosingCodeMarker(const AText: string; AStart, ALength: SizeInt): SizeInt;
+  var
+    P, RunLength: SizeInt;
+  begin
+    Result := 0;
+    P := AStart;
+
+    while P <= Length(AText) do
+    begin
+      if AText[P] = '`' then
+      begin
+        RunLength := 1;
+        while (P + RunLength <= Length(AText)) and (AText[P + RunLength] = '`') do
+          Inc(RunLength);
+
+        if (RunLength = ALength) and not IsEscapedAt(AText, P) then
+        begin
+          Result := P;
+          Exit;
+        end;
+
+        Inc(P, RunLength);
+      end
+      else
+        Inc(P);
+    end;
+  end;
+
+  function FindClosingMarker(const AText, AMarker: string; AStart: SizeInt): SizeInt;
+  var
+    P, RunLength, CodeClose: SizeInt;
+  begin
+    Result := 0;
+    P := AStart;
+
+    while P <= Length(AText) - Length(AMarker) + 1 do
+    begin
+      // Skip escaped Markdown characters
+      if (AText[P] = '\') and (P < Length(AText)) and IsMarkdownEscapable(AText[P + 1]) then
+      begin
+        Inc(P, 2);
+        Continue;
+      end;
+
+      // Inline code has priority over other Markdown delimiters
+      if AText[P] = '`' then
+      begin
+        RunLength := 1;
+        while (P + RunLength <= Length(AText)) and (AText[P + RunLength] = '`') do
+          Inc(RunLength);
+
+        CodeClose := FindClosingCodeMarker(AText, P + RunLength, RunLength);
+
+        if CodeClose = 0 then
+          Exit;
+
+        P := CodeClose + RunLength;
+        Continue;
+      end;
+
+      if (Copy(AText, P, Length(AMarker)) = AMarker) and not IsEscapedAt(AText, P) then
+      begin
+        Result := P;
+        Exit;
+      end;
+
+      Inc(P);
+    end;
+  end;
+
+  procedure ProcessInlineText(const AText: string; AColor: TTermColor);
+  var
+    P, Q, RunLength, CodeClose, MarkerPos, LocalMarkerIndex: SizeInt;
+    CurrentDelimiter: string;
+  begin
+    P := 1;
+
+    while P <= Length(AText) do
+    begin
+      // Preserve escaped Markdown characters as plain text
+      if (AText[P] = '\') and (P < Length(AText)) and IsMarkdownEscapable(AText[P + 1]) then
+      begin
+        OutputText(Copy(AText, P, 2), AColor);
+        Inc(P, 2);
+        Continue;
+      end;
+
+      // Process inline code before all other Markdown markers
+      if AText[P] = '`' then
+      begin
+        RunLength := 1;
+        while (P + RunLength <= Length(AText)) and (AText[P + RunLength] = '`') do
+          Inc(RunLength);
+
+        CodeClose := FindClosingCodeMarker(AText, P + RunLength, RunLength);
+
+        if CodeClose > 0 then
+        begin
+          OutputText(Copy(AText, P, RunLength), tcMarkdownMarker);
+          OutputText(Copy(AText, P + RunLength, CodeClose - P - RunLength), tcMarkdownCode);
+          OutputText(Copy(AText, CodeClose, RunLength), tcMarkdownMarker);
+          P := CodeClose + RunLength;
+          Continue;
+        end;
+
+        OutputText(Copy(AText, P, RunLength), AColor);
+        Inc(P, RunLength);
+        Continue;
+      end;
+
+      LocalMarkerIndex := -1;
+      CurrentDelimiter := string.Empty;
+
+      for Q := Low(MARKERS) to High(MARKERS) do
+      begin
+        if (Copy(AText, P, Length(MARKERS[Q])) = MARKERS[Q]) and not IsEscapedAt(AText, P) then
+        begin
+          LocalMarkerIndex := Q;
+          CurrentDelimiter := MARKERS[Q];
+          Break;
+        end;
+      end;
+
+      if LocalMarkerIndex >= 0 then
+      begin
+        MarkerPos := FindClosingMarker(AText, CurrentDelimiter, P + Length(CurrentDelimiter));
+
+        if MarkerPos > 0 then
+        begin
+          OutputText(CurrentDelimiter, tcMarkdownMarker);
+          Content := Copy(AText, P + Length(CurrentDelimiter), MarkerPos - P - Length(CurrentDelimiter));
+          OutputText(Content, MARKER_COLORS[LocalMarkerIndex]);
+          OutputText(CurrentDelimiter, tcMarkdownMarker);
+
+          P := MarkerPos + Length(CurrentDelimiter);
+          Continue;
+        end;
+      end;
+
+      // Output regular text until the next possible Markdown marker
+      Q := P + 1;
+      while Q <= Length(AText) do
+      begin
+        if (AText[Q] = '`') or ((AText[Q] = '\') and (Q < Length(AText)) and IsMarkdownEscapable(AText[Q + 1])) or
+          ((Copy(AText, Q, 2) = '**') or (Copy(AText, Q, 2) = '__') or (Copy(AText, Q, 2) = '~~') or
+          (Copy(AText, Q, 2) = '==')) or (AText[Q] = '*') then
+          Break;
+
+        Inc(Q);
+      end;
+
+      OutputText(Copy(AText, P, Q - P), AColor);
+      P := Q;
+    end;
+  end;
+
+begin
+  Line := ALine;
+  LineEndingText := string.Empty;
+
+  // Keep the original line ending unchanged
+  if (Length(Line) > 0) and (Line[Length(Line)] = #10) then
+  begin
+    LineEndingText := #10;
+    Delete(Line, Length(Line), 1);
+
+    if (Length(Line) > 0) and (Line[Length(Line)] = #13) then
+    begin
+      LineEndingText := #13#10;
+      Delete(Line, Length(Line), 1);
+    end;
+  end;
+
+  // Detect fenced code blocks
+  I := 1;
+  while (I <= Length(Line)) and (Line[I] = ' ') do
+    Inc(I);
+
+  if (I <= Length(Line) - 2) and ((Copy(Line, I, 3) = '```') or (Copy(Line, I, 3) = '~~~')) then
+  begin
+    FenceChar := Line[I];
+
+    if not FMarkdownFencedCode then
+    begin
+      FMarkdownFencedCode := True;
+      FMarkdownFenceChar := FenceChar;
+    end
+    else if FMarkdownFenceChar = FenceChar then
+      FMarkdownFencedCode := False;
+
+    OutputText(Copy(Line, 1, I - 1), tcDefault);
+    OutputText(Copy(Line, I, 3), tcMarkdownMarker);
+    OutputText(Copy(Line, I + 3, MaxInt), tcDefault);
+    OutputText(LineEndingText, tcDefault);
+    SetColor(tcDefault);
+    Exit;
+  end;
+
+  if FMarkdownFencedCode then
+  begin
+    OutputText(Line + LineEndingText, tcMarkdownFencedCode);
+    SetColor(tcDefault);
+    Exit;
+  end;
+
+  // Detect Markdown line prefixes
+  PrefixStart := 1;
+  while (PrefixStart <= Length(Line)) and (Line[PrefixStart] = ' ') do
+    Inc(PrefixStart);
+
+  ContentStart := PrefixStart;
+  BaseColor := tcDefault;
+
+  // Detect headings
+  J := PrefixStart;
+  while (J <= Length(Line)) and (Line[J] = '#') do
+    Inc(J);
+
+  if (J > PrefixStart) and (J <= Length(Line)) and (Line[J] = ' ') and (J - PrefixStart <= 6) then
+  begin
+    BaseColor := tcMarkdownHeading;
+
+    OutputText(Copy(Line, 1, PrefixStart - 1), tcDefault);
+    OutputText(Copy(Line, PrefixStart, J - PrefixStart), tcMarkdownMarker);
+    ContentStart := J + 1;
+  end
+  else if (PrefixStart <= Length(Line)) and (Line[PrefixStart] = '>') then
+  begin
+    BaseColor := tcMarkdownQuote;
+
+    OutputText(Copy(Line, 1, PrefixStart - 1), tcDefault);
+    OutputText('>', tcMarkdownMarker);
+    ContentStart := PrefixStart + 1;
+
+    if (ContentStart <= Length(Line)) and (Line[ContentStart] = ' ') then
+      Inc(ContentStart);
+  end
+  else
+  begin
+    // Detect unordered lists
+    if (PrefixStart <= Length(Line)) and (Line[PrefixStart] in ['-', '+', '*']) and (PrefixStart < Length(Line)) and
+      (Line[PrefixStart + 1] = ' ') then
+    begin
+      OutputText(Copy(Line, 1, PrefixStart - 1), tcDefault);
+      OutputText(Line[PrefixStart], tcMarkdownMarker);
+      ContentStart := PrefixStart + 2;
+    end
+    else
+    begin
+      // Detect ordered lists, including nested numbering such as 1.1.
+      J := PrefixStart;
+      while (J <= Length(Line)) and (Line[J] in ['0'..'9', '.']) do
+        Inc(J);
+
+      if (J > PrefixStart) and (J <= Length(Line)) and (Line[J] = ' ') and (Line[J - 1] = '.') then
+      begin
+        OutputText(Copy(Line, 1, PrefixStart - 1), tcDefault);
+        OutputText(Copy(Line, PrefixStart, J - PrefixStart), tcMarkdownMarker);
+        ContentStart := J + 1;
+      end;
+    end;
+  end;
+
+  // Parse the remaining text even when the line has a Markdown prefix
+  ProcessInlineText(Copy(Line, ContentStart, MaxInt), BaseColor);
+
+  OutputText(LineEndingText, tcDefault);
+  SetColor(tcDefault);
+end;
+
 procedure TCustomTermManager.HandleAgentChunk(Sender: TObject; const AText: string);
 begin
   FFirstChunkSeen := True;
   // Close thinking block if open, this also resets color
   CloseThinking;
-  WriteText(AText, False);
+  ProcessMarkdownChunk(AText);
   if Assigned(FPrevAgentOnChunk) then
     FPrevAgentOnChunk(Sender, AText);
 end;
@@ -1339,6 +1777,7 @@ procedure TCustomTermManager.HandleAgentFinish(Sender: TObject; AReason: TAgentF
 var
   Streamed: boolean;
 begin
+  ProcessMarkdownChunk(string.Empty, True);
   CloseThinking;
   // Guarantee default color even if CloseThinking was bypassed
   SetColor(tcDefault);
@@ -2446,6 +2885,45 @@ begin
       Role := LowerCase(Parts[0]);
       Pair := nil;
 
+      // Markdown colors use a single foreground color
+      if Copy(Role, 1, 8) = 'markdown' then
+      begin
+        if (Parts.Count <> 2) or not TryParseTermColor(Parts[1], ColorVal) then
+        begin
+          DoOutput('usage: set term.color markdown.<role> <color>' + LineEnding, True);
+          Exit;
+        end;
+
+        if Role = 'markdown.marker' then
+          FColors.Markdown.Marker := ColorVal
+        else if Role = 'markdown.bold' then
+          FColors.Markdown.Bold := ColorVal
+        else if Role = 'markdown.italic' then
+          FColors.Markdown.Italic := ColorVal
+        else if Role = 'markdown.strikethrough' then
+          FColors.Markdown.Strikethrough := ColorVal
+        else if Role = 'markdown.inlinecode' then
+          FColors.Markdown.InlineCode := ColorVal
+        else if Role = 'markdown.fencedcode' then
+          FColors.Markdown.FencedCode := ColorVal
+        else if Role = 'markdown.highlight' then
+          FColors.Markdown.Highlight := ColorVal
+        else if Role = 'markdown.heading' then
+          FColors.Markdown.Heading := ColorVal
+        else if Role = 'markdown.quote' then
+          FColors.Markdown.Quote := ColorVal
+        else if Role = 'markdown.listmarker' then
+          FColors.Markdown.ListMarker := ColorVal
+        else
+        begin
+          DoOutput('error: unknown Markdown color role: ' + Role + LineEnding, True);
+          Exit;
+        end;
+
+        DoOutput('term.color ' + Role + ' = ' + TermColorName(ColorVal) + LineEnding, False);
+        Exit;
+      end;
+
       if Parts.Count = 2 then
       begin
         if not TryParseTermColor(Parts[1], ColorVal) then
@@ -2573,6 +3051,16 @@ begin
       T.Add('  warnbadge      ' + PairValue(FColors.WarnBadge));
       T.Add('  promptinput    ' + PairValue(FColors.PromptInput));
       T.Add('  log            ' + PairValue(FColors.Log));
+      T.Add('  markdown.marker       ' + TermColorName(FColors.Markdown.Marker));
+      T.Add('  markdown.bold         ' + TermColorName(FColors.Markdown.Bold));
+      T.Add('  markdown.italic       ' + TermColorName(FColors.Markdown.Italic));
+      T.Add('  markdown.strikethrough ' + TermColorName(FColors.Markdown.Strikethrough));
+      T.Add('  markdown.inlinecode   ' + TermColorName(FColors.Markdown.InlineCode));
+      T.Add('  markdown.highlight    ' + TermColorName(FColors.Markdown.Highlight));
+      T.Add('  markdown.heading      ' + TermColorName(FColors.Markdown.Heading));
+      T.Add('  markdown.quote        ' + TermColorName(FColors.Markdown.Quote));
+      T.Add('  markdown.listmarker   ' + TermColorName(FColors.Markdown.ListMarker));
+      T.Add('  markdown.fencedcode  ' + TermColorName(FColors.Markdown.FencedCode));
       Val := T.Text;
     finally
       T.Free;
@@ -2649,7 +3137,16 @@ begin
     Row('warnbadge', PairValue(FColors.WarnBadge));
     Row('promptinput', PairValue(FColors.PromptInput));
     Row('log', PairValue(FColors.Log));
-
+    Row('markdown.marker', TermColorName(FColors.Markdown.Marker));
+    Row('markdown.bold', TermColorName(FColors.Markdown.Bold));
+    Row('markdown.italic', TermColorName(FColors.Markdown.Italic));
+    Row('markdown.strikethrough', TermColorName(FColors.Markdown.Strikethrough));
+    Row('markdown.inlinecode', TermColorName(FColors.Markdown.InlineCode));
+    Row('markdown.highlight', TermColorName(FColors.Markdown.Highlight));
+    Row('markdown.heading', TermColorName(FColors.Markdown.Heading));
+    Row('markdown.quote', TermColorName(FColors.Markdown.Quote));
+    Row('markdown.listmarker', TermColorName(FColors.Markdown.ListMarker));
+    Row('markdown.fencedcode', TermColorName(FColors.Markdown.FencedCode));
     Result := T.Text;
   finally
     T.Free;
@@ -4513,6 +5010,16 @@ begin
     tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
     tcPromptInput: Attr := PairAttr(FColors.PromptInput);
     tcLog: Attr := PairAttr(FColors.Log);
+    tcMarkdownMarker: Attr := ColorToAttr(FColors.Markdown.Marker);
+    tcMarkdownBold: Attr := ColorToAttr(FColors.Markdown.Bold);
+    tcMarkdownItalic: Attr := ColorToAttr(FColors.Markdown.Italic);
+    tcMarkdownStrike: Attr := ColorToAttr(FColors.Markdown.Strikethrough);
+    tcMarkdownCode: Attr := ColorToAttr(FColors.Markdown.InlineCode);
+    tcMarkdownHighlight: Attr := ColorToAttr(FColors.Markdown.Highlight);
+    tcMarkdownHeading: Attr := ColorToAttr(FColors.Markdown.Heading);
+    tcMarkdownQuote: Attr := ColorToAttr(FColors.Markdown.Quote);
+    tcMarkdownList: Attr := ColorToAttr(FColors.Markdown.ListMarker);
+    tcMarkdownFencedCode: Attr := ColorToAttr(FColors.Markdown.FencedCode);
     tcDefault:
       if FDefaultConsoleAttrCaptured then
         Attr := (FDefaultConsoleAttr and $F0) or ColorToAttr(FColors.DefaultText)
