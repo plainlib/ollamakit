@@ -476,6 +476,10 @@ implementation
 uses
   Math, RegExpr, Masks;
 
+type
+  // Encoding selector for ReadTextFileSafe
+  TFileEncoding = (feAuto, feUTF8, feANSI, feUTF16LE, feUTF16BE);
+
 // Returns display name for an agent operation kind
 function AgentOpName(AOp: TAgentOperation): string;
 begin
@@ -556,10 +560,6 @@ begin
     Result := False;
   end;
 end;
-
-type
-  // Encoding selector for ReadTextFileSafe
-  TFileEncoding = (feAuto, feUTF8, feANSI, feUTF16LE, feUTF16BE);
 
 // Returns the first line break sequence found in the text
 function DetectTextLineBreak(const AText: string): string;
@@ -661,6 +661,7 @@ begin
   end;
 end;
 
+// Reads a text file safely with optional encoding, line range and size limits
 function ReadTextFileSafe(const APath: string; out AContent: string; AEncoding: TFileEncoding; AStartLine: integer;
   AEndLine: integer; AMaxBytes: int64; out ATotalLines: integer; out ABytesRead: int64; out AFileSize: int64): boolean;
 var
@@ -775,6 +776,7 @@ begin
   Result := True;
 end;
 
+// Reads a text file safely using the specified encoding
 function ReadTextFileSafe(const APath: string; out AContent: string; AEncoding: TFileEncoding): boolean;
 var
   TotalLines: integer;
@@ -784,6 +786,7 @@ begin
   Result := ReadTextFileSafe(APath, AContent, AEncoding, 0, -1, 0, TotalLines, BytesRead, FileSize);
 end;
 
+// Reads a text file safely using automatic encoding detection
 function ReadTextFileSafe(const APath: string; out AContent: string): boolean;
 begin
   Result := ReadTextFileSafe(APath, AContent, feAuto);
@@ -1614,6 +1617,38 @@ begin
   if (Name = 'id_rsa') or (Name = 'id_ed25519') or (Name = 'id_ecdsa') or (Name = 'id_dsa') then
     Exit(True);
 end;
+
+// Converts JSON history data into a native JSON value
+function HistoryToJSONData(const AHistory: string): TJSONData;
+begin
+  // Convert valid history JSON into a native JSON value
+  if Trim(AHistory) = string.Empty then
+    Exit(TJSONArray.Create);
+
+  try
+    Result := GetJSON(AHistory);
+    if Result is TJSONArray then
+      Exit;
+
+    Result.Free;
+  except
+    ; // Preserve invalid history as a string
+  end;
+
+  Result := TJSONString.Create(AHistory);
+end;
+
+// Converts chat history between JSON strings and JSON data
+function HistoryFromJSON(AData: TJSONData): string;
+begin
+  Result := string.Empty;
+
+  if AData is TJSONArray then
+    Result := AData.AsJSON
+  else if AData is TJSONString then
+    Result := AData.AsString;
+end;
+
 
 { TAgentWebOptions }
 
@@ -3319,7 +3354,7 @@ begin
       ChatObj.Add('id', Chat.ID);
       ChatObj.Add('name', Chat.Name);
       ChatObj.Add('working_directory', Chat.WorkingDirectory);
-      ChatObj.Add('history', Chat.History);
+      ChatObj.Add('history', HistoryToJSONData(Chat.History));
       ChatObj.Add('chat_prompt', Chat.ChatPrompt);
       ChatObj.Add('context_used', Chat.ContextUsed);
       ChatObj.Add('context_total', Chat.ContextTotal);
@@ -3353,7 +3388,7 @@ begin
 
     Data := TStringList.Create;
     try
-      Data.Text := Root.AsJSON;
+      Data.Text := Root.FormatJSON([], 2);
       Data.SaveToFile(AFileName);
       Result := True;
     finally
@@ -3413,7 +3448,8 @@ begin
 
         Chat := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
         Chat.WorkingDirectory := ChatObj.Get('working_directory', string.Empty);
-        Chat.History := ChatObj.Get('history', string.Empty);
+        Item := ChatObj.Find('history');
+        Chat.History := HistoryFromJSON(Item);
         Chat.ChatPrompt := ChatObj.Get('chat_prompt', string.Empty);
         Chat.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
         Chat.ContextUsed := ChatObj.Get('context_used', 0);
@@ -3675,7 +3711,7 @@ begin
     ChatObj.Add('id', AChat.ID);
     ChatObj.Add('name', AChat.Name);
     ChatObj.Add('working_directory', AChat.WorkingDirectory);
-    ChatObj.Add('history', AChat.History);
+    ChatObj.Add('history', HistoryToJSONData(AChat.History));
     ChatObj.Add('chat_prompt', AChat.ChatPrompt);
     ChatObj.Add('context_used', AChat.ContextUsed);
     ChatObj.Add('context_total', AChat.ContextTotal);
@@ -3709,7 +3745,7 @@ begin
 
     Data := TStringList.Create;
     try
-      Data.Text := Root.AsJSON;
+      Data.Text := Root.FormatJSON([], 2);
       Data.SaveToFile(AFileName);
       Result := True;
     finally
@@ -3769,7 +3805,8 @@ begin
 
       Result := TAgentChat.Create(ChatID, ChatObj.Get('name', 'Chat ' + IntToStr(ChatID)));
       Result.WorkingDirectory := ChatObj.Get('working_directory', FRootPath);
-      Result.History := ChatObj.Get('history', string.Empty);
+      Item := ChatObj.Find('history');
+      Result.History := HistoryFromJSON(Item);
       Result.ChatPrompt := ChatObj.Get('chat_prompt', string.Empty);
       Result.TerminalOutput := ChatObj.Get('terminal_output', string.Empty);
       Result.ContextUsed := ChatObj.Get('context_used', 0);
