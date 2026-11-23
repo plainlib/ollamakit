@@ -906,10 +906,10 @@ constructor TTermColorScheme.Create;
 begin
   inherited Create;
   FDefaultText := ccWhite;
-  FThinkingText := ccLightGray;
+  FThinkingText := ccDarkGray;
   FWelcomeBadge := TConsoleColorPair.Create;
   FWelcomeBadge.Background := ccBlack;
-  FWelcomeBadge.Foreground := ccWhite;
+  FWelcomeBadge.Foreground := ccLightGray;
   FThinkingBadge := TConsoleColorPair.Create;
   FThinkingBadge.Background := ccDarkGray;
   FThinkingBadge.Foreground := ccWhite;
