@@ -1677,6 +1677,8 @@ var
   Obj: TJSONObject;
   P, KeyStart, KeyEnd: integer;
 begin
+  // Any tool call means the agent has started working
+  FFirstChunkSeen := True;
   CloseThinking;
 
   if AName = 'finish' then
