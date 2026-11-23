@@ -2345,12 +2345,14 @@ const
   CMD_BUILTINS =
     '|assoc|break|call|cd|chcp|chdir|cls|color|copy|date|del|dir|doskey|' +
     'echo|endlocal|erase|exit|for|ftype|goto|if|md|mkdir|mklink|move|' +
-    'path|pause|popd|prompt|pushd|rd|rem|ren|rename|rmdir|set|setlocal|' + 'shift|start|time|title|type|ver|verify|vol|';
+    'path|pause|popd|prompt|pushd|rd|rem|ren|rename|rmdir|set|setlocal|' +
+    'shift|start|time|title|type|ver|verify|vol|';
 
   POWERSHELL_BUILTINS =
     '|begin|break|catch|class|continue|do|else|elseif|end|exit|filter|' +
     'finally|for|foreach|function|if|in|param|process|return|switch|' + 'throw|trap|try|until|while|' +
-    'get-childitem|gci|dir|ls|get-content|gc|set-content|sc|' + 'get-location|gl|pwd|set-location|sl|cd|push-location|pushd|' +
+    'get-childitem|gci|dir|ls|get-content|gc|set-content|sc|' +
+    'get-location|gl|pwd|set-location|sl|cd|push-location|pushd|' +
     'pop-location|popd|write-output|echo|write-host|write-error|' + 'write-warning|write-verbose|write-debug|select-object|select|' +
     'where-object|where|foreach-object|%|new-item|ni|remove-item|ri|' +
     'copy-item|copy|move-item|move|test-path|resolve-path|get-command|' +
@@ -2368,8 +2370,11 @@ const
     'umask|unalias|unset|wait|';
   {$ENDIF}
 var
-  EnvPath, KnownCommands: string;
+  EnvPath, KnownCommands, CommandName, SearchName: string;
+  HasPath: boolean;
 begin
+  CommandName := LowerCase(ExtractFileName(StringReplace(AName, '\', '/', [rfReplaceAll])));
+
   case DetectShellFamily(FShellExec) of
     sfCmd:
       KnownCommands := CMD_BUILTINS;
@@ -2384,23 +2389,41 @@ begin
   end;
 
   // Check shell-specific builtins first
-  if Pos('|' + LowerCase(AName) + '|', KnownCommands) > 0 then
+  if Pos('|' + CommandName + '|', KnownCommands) > 0 then
     Exit(True);
 
   if DetectShellFamily(FShellExec) = sfPowerShell then
   begin
-    // Recognize PowerShell static .NET method calls
     if (AName <> '') and (AName[1] = '[') and (Pos(']::', AName) > 0) then
       Exit(True);
 
-    // Recognize PowerShell variable expressions
     if (AName <> '') and (AName[1] = '$') then
       Exit(True);
   end;
 
-  EnvPath := SysUtils.GetEnvironmentVariable('PATH');
+  HasPath := ExtractFilePath(AName) <> string.Empty;
+
+  // Resolve the executable relative to the effective working directory
+  if IsAbsolutePath(AName) then
+    SearchName := AName
+  else
+    SearchName := IncludeTrailingPathDelimiter(GetEffectivePath) + AName;
+
+  Result := FileExists(SearchName);
+
+  {$IFDEF WINDOWS}
+  if not Result then
+    Result := FileExists(SearchName + '.exe') or
+      FileExists(SearchName + '.bat') or
+      FileExists(SearchName + '.cmd') or
+      FileExists(SearchName + '.com');
+  {$ENDIF}
+
+  if Result or HasPath then
+    Exit;
 
   // Search executable files in PATH
+  EnvPath := SysUtils.GetEnvironmentVariable('PATH');
   Result := FileSearch(AName, EnvPath) <> '';
 
   {$IFDEF WINDOWS}
@@ -2413,7 +2436,7 @@ end;
 
 function TCustomTermManager.ClassifyLine(const ALine: string; out APayload: string): TTermInputKind;
 var
-  S, FirstLine, First, GroupCommand: string;
+  S, FirstLine, First, GroupCommand, CommandToken: string;
   P, I, GroupPos: integer;
   HasMultipleLines, InQuotes: boolean;
 begin
@@ -2481,6 +2504,8 @@ begin
   // Support batch commands prefixed with @
   while (First <> '') and (First[1] = '@') do
     Delete(First, 1, 1);
+
+  CommandToken := First;
 
   // Application builtins must take precedence over shell commands
   if FBuiltinCommands.IndexOf(ExtractFileName(StringReplace(First, '\', '/', [rfReplaceAll]))) >= 0 then
@@ -2568,7 +2593,8 @@ begin
 
   // Detect drive switches before extracting the executable name
   if (DetectShellFamily(FShellExec) in [sfCmd, sfPowerShell]) and (Length(First) >= 2) and (First[2] = ':') and
-    (First[1] in ['a'..'z']) and ((Length(First) = 2) or ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) then
+    (First[1] in ['a'..'z']) and ((Length(First) = 2) or ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) and
+    not FileExists(CommandToken) then
   begin
     if HasMultipleLines then
       Exit(tikCommand);
@@ -2590,10 +2616,10 @@ begin
   end;
 
   // Multi-line shell input must take precedence over external executables
-  if HasMultipleLines and FSearchPath and IsExternalCommand(First) then
+  if HasMultipleLines and FSearchPath and IsExternalCommand(CommandToken) then
     Exit(tikCommand);
 
-  if FSearchPath and IsExternalCommand(First) then
+  if FSearchPath and IsExternalCommand(CommandToken) then
     Exit(tikCommand);
 
   Result := tikAgent;
@@ -4179,7 +4205,8 @@ begin
 
   // Drive switch "d:", "d:\", "d:\path" must run in-process
   if (ShellFamily in [sfCmd, sfPowerShell]) and (Length(ACommand) >= 2) and (ACommand[2] = ':') and
-    (ACommand[1] in ['a'..'z', 'A'..'Z']) and ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) then
+    (ACommand[1] in ['a'..'z', 'A'..'Z']) and ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) and
+    (Pos(' ', ACommand) = 0) and (Pos(#9, ACommand) = 0) and not FileExists(ACommand) then
   begin
     if Length(ACommand) = 2 then
       DrivePath := UpCase(ACommand[1]) + ':\'
