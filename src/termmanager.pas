@@ -2449,9 +2449,40 @@ begin
   // Classify using only the first line of a pasted block
   FirstLine := S;
   P := Pos(#10, FirstLine);
+  if P = 0 then
+    P := Pos(#13, FirstLine);
+
   if P > 0 then
     SetLength(FirstLine, P - 1);
+
   FirstLine := Trim(FirstLine);
+
+  // Extract the first command token, including quoted executable paths
+  if (FirstLine <> '') and (FirstLine[1] = '"') then
+  begin
+    P := Pos('"', Copy(FirstLine, 2, MaxInt));
+    if P > 0 then
+      First := Copy(FirstLine, 2, P - 1)
+    else
+      First := Copy(FirstLine, 2, MaxInt);
+  end
+  else
+  begin
+    P := 1;
+    while (P <= Length(FirstLine)) and not (FirstLine[P] in [#9, ' ']) do
+      Inc(P);
+    First := Copy(FirstLine, 1, P - 1);
+  end;
+
+  First := LowerCase(First);
+
+  // Support batch commands prefixed with @
+  while (First <> '') and (First[1] = '@') do
+    Delete(First, 1, 1);
+
+  // Application builtins must take precedence over shell commands
+  if FBuiltinCommands.IndexOf(ExtractFileName(StringReplace(First, '\', '/', [rfReplaceAll]))) >= 0 then
+    Exit(tikBuiltin);
 
   // PowerShell variable assignments and console methods are valid commands
   if DetectShellFamily(FShellExec) = sfPowerShell then
@@ -2533,29 +2564,6 @@ begin
     end;
   end;
 
-  // Extract the first command token, including quoted executable paths
-  if (FirstLine <> '') and (FirstLine[1] = '"') then
-  begin
-    P := Pos('"', Copy(FirstLine, 2, MaxInt));
-    if P > 0 then
-      First := Copy(FirstLine, 2, P - 1)
-    else
-      First := Copy(FirstLine, 2, MaxInt);
-  end
-  else
-  begin
-    P := 1;
-    while (P <= Length(FirstLine)) and not (FirstLine[P] in [#9, ' ']) do
-      Inc(P);
-    First := Copy(FirstLine, 1, P - 1);
-  end;
-
-  First := LowerCase(First);
-
-  // Support batch commands prefixed with @
-  while (First <> '') and (First[1] = '@') do
-    Delete(First, 1, 1);
-
   // Detect drive switches before extracting the executable name
   if (DetectShellFamily(FShellExec) in [sfCmd, sfPowerShell]) and (Length(First) >= 2) and (First[2] = ':') and
     (First[1] in ['a'..'z']) and ((Length(First) = 2) or ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) then
@@ -2578,10 +2586,6 @@ begin
     APayload := 'cd ' + Copy(S, 3, MaxInt);
     Exit(tikBuiltin);
   end;
-
-  // Application builtins must take precedence over shell commands
-  if FBuiltinCommands.IndexOf(First) >= 0 then
-    Exit(tikBuiltin);
 
   // Multi-line shell input must take precedence over external executables
   if HasMultipleLines and FSearchPath and IsExternalCommand(First) then
