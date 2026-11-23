@@ -456,6 +456,7 @@ begin
     Row('term.path', 'working directory');
     Row('term.shell', 'executable, e.g. cmd.exe or pwsh.exe');
     Row('term.showthinking', 'on|off, show agent reasoning text');
+    Row('term.showagentstats', 'on|off, show final agent run statistics');
     Row('term.commandtimeout', 'ms, user command timeout, 0 = none');
     Row('term.maxcapturebytes', 'captured output limit per command');
     Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
@@ -470,6 +471,7 @@ begin
     Row('toolbadge', 'tool call label');
     Row('errorbadge', 'error messages');
     Row('warnbadge', 'warning messages');
+    Row('agentdonebadge', 'successful agent completion statistics');
     Row('promptinput', 'user prompt and input');
     Row('log', 'agent log messages');
     Row('markdown.marker', 'Markdown delimiters');
@@ -507,6 +509,8 @@ begin
     Row('', 'set term.color thinkingtext gray');
     Row('', 'set term.color toolbadge background blue');
     Row('', 'set term.color errorbadge foreground white');
+    Row('', 'set term.color agentdonebadge background yellow');
+    Row('', 'set term.color agentdonebadge foreground black');
     Row('', 'set term.color markdown.marker darkgray');
     Row('', 'set term.color markdown.bold white');
     Row('', 'set term.color markdown.inlinecode lightgreen');

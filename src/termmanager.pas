@@ -30,7 +30,8 @@ type
   // Semantic color roles used by terminal output
   TTermColor = (tcDefault, tcDim, tcWelcome, tcThinkingBadge, tcToolBadge, tcErrorBadge, tcWarnBadge,
     tcPromptInput, tcLog, tcMarkdownMarker, tcMarkdownBold, tcMarkdownItalic, tcMarkdownStrike,
-    tcMarkdownCode, tcMarkdownFencedCode, tcMarkdownHighlight, tcMarkdownHeading, tcMarkdownQuote, tcMarkdownList);
+    tcMarkdownCode, tcMarkdownFencedCode, tcMarkdownHighlight, tcMarkdownHeading, tcMarkdownQuote, tcMarkdownList,
+    tcAgentDone);
 
   TTermRouteEvent = procedure(Sender: TObject; const ALine, APayload: string; var AKind: TTermInputKind; var AAllow: boolean) of object;
   TTermOutputEvent = procedure(Sender: TObject; const AText: string; AIsStderr: boolean) of object;
@@ -102,6 +103,7 @@ type
     FToolBadge: TConsoleColorPair;
     FErrorBadge: TConsoleColorPair;
     FWarnBadge: TConsoleColorPair;
+    FAgentDoneBadge: TConsoleColorPair;
     FPromptInput: TConsoleColorPair;
     FLog: TConsoleColorPair;
     FMarkdown: TMarkdownColorScheme;
@@ -110,6 +112,7 @@ type
     procedure SetToolBadge(const AValue: TConsoleColorPair);
     procedure SetErrorBadge(const AValue: TConsoleColorPair);
     procedure SetWarnBadge(const AValue: TConsoleColorPair);
+    procedure SetAgentDoneBadge(const AValue: TConsoleColorPair);
     procedure SetPromptInput(const AValue: TConsoleColorPair);
     procedure SetLog(const AValue: TConsoleColorPair);
     procedure SetMarkdown(const AValue: TMarkdownColorScheme);
@@ -132,6 +135,8 @@ type
     property ErrorBadge: TConsoleColorPair read FErrorBadge write SetErrorBadge;
     // Badge style for warning messages such as max steps reached
     property WarnBadge: TConsoleColorPair read FWarnBadge write SetWarnBadge;
+    // Badge style for successful agent completion statistics
+    property AgentDoneBadge: TConsoleColorPair read FAgentDoneBadge write SetAgentDoneBadge;
     // Style for the entire user input prompt and entered text
     property PromptInput: TConsoleColorPair read FPromptInput write SetPromptInput;
     // Style for agent log messages
@@ -171,6 +176,7 @@ type
     FThinkingLabel: TCaption;
     // When False only the label is printed, thinking text is suppressed
     FShowThinking: boolean;
+    FShowAgentStats: boolean;
     // Label printed on its own line before a tool call, {name} and {args} placeholders
     FToolCallLabel: TCaption;
     // True when last written char was CR or LF, used to keep prompt on fresh line
@@ -419,6 +425,7 @@ type
     property Welcome: TCaption read FWelcome write FWelcome;
     property ThinkingLabel: TCaption read FThinkingLabel write FThinkingLabel;
     property ShowThinking: boolean read FShowThinking write FShowThinking default True;
+    property ShowAgentStats: boolean read FShowAgentStats write FShowAgentStats default True;
     property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
     property ColorOutput: boolean read FColorOutput write FColorOutput default True;
@@ -458,6 +465,8 @@ type
     property ThinkingLabel;
     // Show agent reasoning text; when False only ThinkingLabel is printed
     property ShowThinking;
+    // Show agent completion statistics after a successful run
+    property ShowAgentStats;
     // Line printed before each tool call, supports {name}, {args} and JSON field placeholders like {command}
     property ToolCallLabel;
     // Strip emoji and unsupported symbol ranges that plain console fonts cannot render
@@ -811,6 +820,25 @@ begin
   end;
 end;
 
+// Formats milliseconds as a compact duration
+function FormatElapsed(AMilliseconds: QWord): string;
+var
+  Seconds: QWord;
+  Minutes: QWord;
+  Hours: QWord;
+begin
+  Seconds := AMilliseconds div 1000;
+  Minutes := Seconds div 60;
+  Hours := Minutes div 60;
+
+  if Hours > 0 then
+    Result := Format('%d:%02d:%02d', [Hours, Minutes mod 60, Seconds mod 60])
+  else if Minutes > 0 then
+    Result := Format('%d:%02d', [Minutes, Seconds mod 60])
+  else
+    Result := Format('%ds', [Seconds]);
+end;
+
 { TAgentShellHistory }
 
 constructor TAgentShellHistory.Create;
@@ -922,6 +950,9 @@ begin
   FWarnBadge := TConsoleColorPair.Create;
   FWarnBadge.Background := ccYellow;
   FWarnBadge.Foreground := ccWhite;
+  FAgentDoneBadge := TConsoleColorPair.Create;
+  FAgentDoneBadge.Background := ccYellow;
+  FAgentDoneBadge.Foreground := ccBlack;
   FPromptInput := TConsoleColorPair.Create;
   FPromptInput.Background := ccBlack;
   FPromptInput.Foreground := ccWhite;
@@ -938,6 +969,7 @@ begin
   FToolBadge.Free;
   FErrorBadge.Free;
   FWarnBadge.Free;
+  FAgentDoneBadge.Free;
   FPromptInput.Free;
   FLog.Free;
   FMarkdown.Free;
@@ -969,6 +1001,11 @@ begin
   FWarnBadge.Assign(AValue);
 end;
 
+procedure TTermColorScheme.SetAgentDoneBadge(const AValue: TConsoleColorPair);
+begin
+  FAgentDoneBadge.Assign(AValue);
+end;
+
 procedure TTermColorScheme.SetPromptInput(const AValue: TConsoleColorPair);
 begin
   FPromptInput.Assign(AValue);
@@ -998,6 +1035,7 @@ begin
     FToolBadge.Assign(Src.FToolBadge);
     FErrorBadge.Assign(Src.FErrorBadge);
     FWarnBadge.Assign(Src.FWarnBadge);
+    FAgentDoneBadge.Assign(Src.FAgentDoneBadge);
     FPromptInput.Assign(Src.FPromptInput);
     FLog.Assign(Src.FLog);
     FMarkdown.Assign(Src.FMarkdown);
@@ -1017,6 +1055,7 @@ begin
   FWelcome := '';
   FThinkingLabel := '[Thinking]';
   FShowThinking := True;
+  FShowAgentStats := True;
   FToolCallLabel := '[{name}: {command}]';
   FLastCharWasNewLine := True;
   FStripEmoji := True;
@@ -1778,6 +1817,9 @@ end;
 procedure TCustomTermManager.HandleAgentFinish(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string);
 var
   Streamed: boolean;
+  Stats: TAgentRunStats;
+  TotalOps: integer;
+  Summary: string;
 begin
   ProcessMarkdownChunk(string.Empty, True);
   CloseThinking;
@@ -1799,6 +1841,22 @@ begin
         WriteLine(AAnswer, False)
       else if not FLastCharWasNewLine then
         WriteLine('', False);
+
+      // Print run statistics after the final answer
+      if Assigned(FAgent) and FShowAgentStats then
+      begin
+        Stats := FAgent.RunStats;
+        TotalOps := Stats.ToolCount + Stats.ThinkingCount + Stats.AnswerCount;
+
+        Summary := Format('[DONE] %s | %d ops | Tools: %d/%s | Thinking: %d/%s | Answers: %d/%s',
+          [FormatElapsed(Stats.TotalMs), TotalOps, Stats.ToolCount, FormatElapsed(Stats.ToolMs),
+          Stats.ThinkingCount, FormatElapsed(Stats.ThinkingMs), Stats.AnswerCount, FormatElapsed(Stats.AnswerMs)]);
+
+        SetColor(tcAgentDone);
+        WriteText(Summary, False);
+        SetColor(tcDefault);
+        WriteLine('', False);
+      end;
     end;
     afrCancelled:
       WriteLine('^C', True);
@@ -2900,6 +2958,17 @@ begin
     end;
     FShowThinking := BoolVal;
   end
+  else if N = 'showagentstats' then
+  begin
+    case LowerCase(V) of
+      'on', 'true', 'yes', '1': BoolVal := True;
+      'off', 'false', 'no', '0': BoolVal := False;
+      else
+        DoOutput('error: term.showagentstats must be on/off, true/false, yes/no' + LineEnding, True);
+        Exit;
+    end;
+    FShowAgentStats := BoolVal;
+  end
   else if N = 'color' then
   begin
     Parts := TStringList.Create;
@@ -2994,6 +3063,8 @@ begin
           Pair := FColors.ErrorBadge
         else if Role = 'warnbadge' then
           Pair := FColors.WarnBadge
+        else if Role = 'agentdonebadge' then
+          Pair := FColors.AgentDoneBadge
         else if Role = 'promptinput' then
           Pair := FColors.PromptInput
         else if Role = 'log' then
@@ -3081,6 +3152,7 @@ begin
       T.Add('  toolbadge      ' + PairValue(FColors.ToolBadge));
       T.Add('  errorbadge     ' + PairValue(FColors.ErrorBadge));
       T.Add('  warnbadge      ' + PairValue(FColors.WarnBadge));
+      T.Add('  agentdonebadge ' + PairValue(FColors.AgentDoneBadge));
       T.Add('  promptinput    ' + PairValue(FColors.PromptInput));
       T.Add('  log            ' + PairValue(FColors.Log));
       T.Add('  markdown.marker       ' + TermColorName(FColors.Markdown.Marker));
@@ -3107,6 +3179,13 @@ begin
   else if N = 'showthinking' then
   begin
     if FShowThinking then
+      Val := 'on'
+    else
+      Val := 'off';
+  end
+  else if N = 'showagentstats' then
+  begin
+    if FShowAgentStats then
       Val := 'on'
     else
       Val := 'off';
@@ -3154,6 +3233,7 @@ begin
     Row('term.path', GetEffectivePath);
     Row('term.shell', FShellExec);
     Row('term.showthinking', BoolToStr(FShowThinking, 'on', 'off'));
+    Row('term.showagentstats', BoolToStr(FShowAgentStats, 'on', 'off'));
     Row('term.commandtimeout', IntToStr(FCommandTimeout));
     Row('term.maxcapturebytes', IntToStr(FMaxCaptureBytes));
     Row('term.agentcommandtimeout', IntToStr(FAgentCommandTimeout));
@@ -3167,6 +3247,7 @@ begin
     Row('toolbadge', PairValue(FColors.ToolBadge));
     Row('errorbadge', PairValue(FColors.ErrorBadge));
     Row('warnbadge', PairValue(FColors.WarnBadge));
+    Row('agentdonebadge', PairValue(FColors.AgentDoneBadge));
     Row('promptinput', PairValue(FColors.PromptInput));
     Row('log', PairValue(FColors.Log));
     Row('markdown.marker', TermColorName(FColors.Markdown.Marker));
@@ -5041,6 +5122,7 @@ begin
     tcToolBadge: Attr := PairAttr(FColors.ToolBadge);
     tcErrorBadge: Attr := PairAttr(FColors.ErrorBadge);
     tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
+    tcAgentDone: Attr := PairAttr(FColors.AgentDoneBadge);
     tcPromptInput: Attr := PairAttr(FColors.PromptInput);
     tcLog: Attr := PairAttr(FColors.Log);
     tcMarkdownMarker: Attr := ColorToAttr(FColors.Markdown.Marker);

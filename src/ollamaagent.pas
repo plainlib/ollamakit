@@ -52,6 +52,17 @@ type
   // Terminal reason reported by OnFinish
   TAgentFinishReason = (afrSuccess, afrMaxSteps, afrCancelled, afrError, afrModelNotSet);
 
+  // Statistics collected during one agent run
+  TAgentRunStats = record
+    TotalMs: QWord;
+    ToolCount: integer;
+    ToolMs: QWord;
+    ThinkingCount: integer;
+    ThinkingMs: QWord;
+    AnswerCount: integer;
+    AnswerMs: QWord;
+  end;
+
   TAgentRouteEvent = procedure(Sender: TObject; AOp: TAgentOperation; const APayload: string; var AAllow: boolean) of object;
   TAgentChunkEvent = procedure(Sender: TObject; const AText: string) of object;
   TAgentThinkingEvent = procedure(Sender: TObject; const AText: string) of object;
@@ -207,6 +218,8 @@ type
     FDone: boolean;
     FCancelled: boolean;
     FFinalAnswer: string;
+    FRunStats: TAgentRunStats;
+    FRunStartTick: QWord;
     // When True, the agent logs every step and event to stderr
     FLog: boolean;
     // When True, tool result previews are emitted through the log channel
@@ -385,6 +398,8 @@ type
 
     property Done: boolean read FDone;
     property FinalAnswer: string read FFinalAnswer;
+    // Statistics of the most recent agent run
+    property RunStats: TAgentRunStats read FRunStats;
     property ContextPrelude: string read FContextPrelude write FContextPrelude;
     property ExecShellInfo: string read FExecShellInfo write FExecShellInfo;
     property LoadAgentsMd: boolean read FLoadAgentsMd write FLoadAgentsMd default True;
@@ -1894,11 +1909,13 @@ type
     FToolName: string;
     FToolArgs: string;
     FResult: string;
+    FElapsedMs: QWord;
   protected
     procedure Execute; override;
   public
     constructor Create(AAgent: TCustomOllamaAgent; const AName, AArgs: string);
     property ToolResult: string read FResult;
+    property ElapsedMs: QWord read FElapsedMs;
   end;
 
 constructor TToolExecThread.Create(AAgent: TCustomOllamaAgent; const AName, AArgs: string);
@@ -1909,16 +1926,24 @@ begin
   FToolName := AName;
   FToolArgs := AArgs;
   FResult := '';
+  FElapsedMs := 0;
   Start;
 end;
 
 procedure TToolExecThread.Execute;
+var
+  StartTime: QWord;
 begin
+  StartTime := GetTickCount64;
   try
-    FResult := FAgent.DispatchTool(FToolName, FToolArgs);
-  except
-    on E: Exception do
-      FResult := '{"error": ' + JSONQuote(E.Message) + '}';
+    try
+      FResult := FAgent.DispatchTool(FToolName, FToolArgs);
+    except
+      on E: Exception do
+        FResult := '{"error": ' + JSONQuote(E.Message) + '}';
+    end;
+  finally
+    FElapsedMs := GetTickCount64 - StartTime;
   end;
 end;
 
@@ -2289,6 +2314,7 @@ var
   UserMessageAdded: boolean;
   ContextToolBytes, ContextThinkingBytes: integer;
   ContextMessages, ContextPercent: integer;
+  ChatStartTime, ChatElapsedMs: QWord;
 begin
   UserMessageAdded := False;
   Reason := afrError;
@@ -2515,6 +2541,7 @@ begin
           begin
             FCurrentContent := '';
             FCurrentThinking := '';
+            ChatStartTime := GetTickCount64;
             if FAgent.FStreaming then
               FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
                 @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg)
@@ -2546,6 +2573,7 @@ begin
             FAgent.LogLine(Format('Chat connection error, retrying (attempt %d of %d)', [Attempt + 1, CHAT_MAX_ATTEMPTS]));
             Sleep(500 * Attempt);
           end;
+          ChatElapsedMs := GetTickCount64 - ChatStartTime;
         finally
           FAgent.OllamaManager.RequestTimeout := SavedTimeout;
         end;
@@ -2655,6 +2683,13 @@ begin
               ToolCallsArr := TJSONArray(ToolCallsData);
           end;
 
+          // Count a reasoning cycle when the model returns thinking text or tool calls
+          if (FCurrentThinking <> string.Empty) or ((ToolCallsArr <> nil) and (ToolCallsArr.Count > 0)) then
+          begin
+            Inc(FAgent.FRunStats.ThinkingCount);
+            Inc(FAgent.FRunStats.ThinkingMs, ChatElapsedMs);
+          end;
+
           // Retry the request when the model returns an empty response, prompting it to try a different approach
           if (ToolCallsArr = nil) or (ToolCallsArr.Count = 0) then
           begin
@@ -2689,6 +2724,9 @@ begin
             end;
 
             // Content is already emitted by ChatStream or ChatWithTools callbacks
+            Inc(FAgent.FRunStats.AnswerCount);
+            Inc(FAgent.FRunStats.AnswerMs, ChatElapsedMs);
+
             FAgent.LogLine(Format('Finished: content_len=%d tool_calls=0', [Length(FinalContent)]));
             Reason := afrSuccess;
             Exit;
@@ -2772,7 +2810,12 @@ begin
                 Threads.Add(TToolExecThread.Create(FAgent, ToolNames[ToolIdx], ToolArgArr[ToolIdx]));
               end;
               for ToolIdx := 0 to Threads.Count - 1 do
+              begin
                 TToolExecThread(Threads[ToolIdx]).WaitFor;
+                Inc(FAgent.FRunStats.ToolCount);
+                Inc(FAgent.FRunStats.ToolMs, TToolExecThread(Threads[ToolIdx]).ElapsedMs);
+              end;
+
               // Collect results in original order
               CollectIdx := 0;
               for ToolIdx := 0 to ToolCount - 1 do
@@ -2819,7 +2862,10 @@ begin
                 Exit;
               end;
 
+              ChatStartTime := GetTickCount64;
               ToolResultArr[ToolIdx] := FAgent.DispatchTool(ToolNames[ToolIdx], ToolArgArr[ToolIdx]);
+              Inc(FAgent.FRunStats.ToolCount);
+              Inc(FAgent.FRunStats.ToolMs, GetTickCount64 - ChatStartTime);
             end;
           end;
 
@@ -2869,6 +2915,9 @@ begin
       end;
     end;
   finally
+    // Store the total duration of the agent run
+    FAgent.FRunStats.TotalMs := GetTickCount64 - FAgent.FRunStartTick;
+
     // Use the current partial response when the request was cancelled
     if Reason = afrCancelled then
       FinalContent := FCurrentContent
@@ -3170,6 +3219,7 @@ begin
   FDone := True;
   FCancelled := False;
   FFinalAnswer := '';
+  FRunStats := Default(TAgentRunStats);
   FLog := False;
   FLogToolResult := True;
   FOnLog := nil;
@@ -4040,6 +4090,8 @@ begin
   FDone := False;
   FCancelled := False;
   FFinalAnswer := '';
+  FRunStats := Default(TAgentRunStats);
+  FRunStartTick := GetTickCount64;
   FContextUsed := 0;
   // Only apply explicit override here, model query happens in worker thread
   if Assigned(FOllamaManager) and (FOllamaManager.NumCtx > 0) then
