@@ -2594,7 +2594,7 @@ begin
   // Detect drive switches before extracting the executable name
   if (DetectShellFamily(FShellExec) in [sfCmd, sfPowerShell]) and (Length(First) >= 2) and (First[2] = ':') and
     (First[1] in ['a'..'z']) and ((Length(First) = 2) or ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) and
-    not FileExists(CommandToken) then
+    not IsExternalCommand(CommandToken) then
   begin
     if HasMultipleLines then
       Exit(tikCommand);
