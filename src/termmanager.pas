@@ -177,6 +177,7 @@ type
     // When False only the label is printed, thinking text is suppressed
     FShowThinking: boolean;
     FShowAgentStats: boolean;
+    FAgentStatsFormat: string;
     // Label printed on its own line before a tool call, {name} and {args} placeholders
     FToolCallLabel: TCaption;
     // True when last written char was CR or LF, used to keep prompt on fresh line
@@ -426,6 +427,7 @@ type
     property ThinkingLabel: TCaption read FThinkingLabel write FThinkingLabel;
     property ShowThinking: boolean read FShowThinking write FShowThinking default True;
     property ShowAgentStats: boolean read FShowAgentStats write FShowAgentStats default True;
+    property AgentStatsFormat: string read FAgentStatsFormat write FAgentStatsFormat;
     property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
     property ColorOutput: boolean read FColorOutput write FColorOutput default True;
@@ -465,8 +467,10 @@ type
     property ThinkingLabel;
     // Show agent reasoning text; when False only ThinkingLabel is printed
     property ShowThinking;
-    // Show agent completion statistics after a successful run
+    // Completion statistics template; supports {duration}, {ops}, {tool_count}, {tool_duration}, {thinking_count}, {thinking_duration}, {answer_count}, {answer_duration}
     property ShowAgentStats;
+    // Completion statistics template with duration and operation placeholders
+    property AgentStatsFormat;
     // Line printed before each tool call, supports {name}, {args} and JSON field placeholders like {command}
     property ToolCallLabel;
     // Strip emoji and unsupported symbol ranges that plain console fonts cannot render
@@ -826,17 +830,20 @@ var
   Seconds: QWord;
   Minutes: QWord;
   Hours: QWord;
+  Fraction: QWord;
 begin
   Seconds := AMilliseconds div 1000;
+  Fraction := (AMilliseconds mod 1000) div 10;
   Minutes := Seconds div 60;
   Hours := Minutes div 60;
 
   if Hours > 0 then
-    Result := Format('%d:%02d:%02d', [Hours, Minutes mod 60, Seconds mod 60])
+    Result := Format('%s:%s:%s', [IntToStr(Hours).PadLeft(2, '0'), IntToStr(Minutes mod 60).PadLeft(2, '0'),
+      IntToStr(Seconds mod 60).PadLeft(2, '0')])
   else if Minutes > 0 then
-    Result := Format('%d:%02d', [Minutes, Seconds mod 60])
+    Result := Format('%s:%s', [IntToStr(Minutes).PadLeft(2, '0'), IntToStr(Seconds mod 60).PadLeft(2, '0')])
   else
-    Result := Format('%ds', [Seconds]);
+    Result := IntToStr(Seconds) + '.' + IntToStr(Fraction).PadLeft(2, '0') + 's';
 end;
 
 { TAgentShellHistory }
@@ -1056,6 +1063,8 @@ begin
   FThinkingLabel := '[Thinking]';
   FShowThinking := True;
   FShowAgentStats := True;
+  FAgentStatsFormat :=
+    '[DONE] {duration} | {ops} ops | Tools: {tool_count}/{tool_duration} | Thinking: {thinking_count}/{thinking_duration} | Answers: {answer_count}/{answer_duration}';
   FToolCallLabel := '[{name}: {command}]';
   FLastCharWasNewLine := True;
   FStripEmoji := True;
@@ -1848,9 +1857,15 @@ begin
         Stats := FAgent.RunStats;
         TotalOps := Stats.ToolCount + Stats.ThinkingCount + Stats.AnswerCount;
 
-        Summary := Format('[DONE] %s | %d ops | Tools: %d/%s | Thinking: %d/%s | Answers: %d/%s',
-          [FormatElapsed(Stats.TotalMs), TotalOps, Stats.ToolCount, FormatElapsed(Stats.ToolMs),
-          Stats.ThinkingCount, FormatElapsed(Stats.ThinkingMs), Stats.AnswerCount, FormatElapsed(Stats.AnswerMs)]);
+        Summary := FAgentStatsFormat;
+        Summary := StringReplace(Summary, '{duration}', FormatElapsed(Stats.TotalMs), [rfReplaceAll]);
+        Summary := StringReplace(Summary, '{ops}', IntToStr(TotalOps), [rfReplaceAll]);
+        Summary := StringReplace(Summary, '{tool_count}', IntToStr(Stats.ToolCount), [rfReplaceAll]);
+        Summary := StringReplace(Summary, '{tool_duration}', FormatElapsed(Stats.ToolMs), [rfReplaceAll]);
+        Summary := StringReplace(Summary, '{thinking_count}', IntToStr(Stats.ThinkingCount), [rfReplaceAll]);
+        Summary := StringReplace(Summary, '{thinking_duration}', FormatElapsed(Stats.ThinkingMs), [rfReplaceAll]);
+        Summary := StringReplace(Summary, '{answer_count}', IntToStr(Stats.AnswerCount), [rfReplaceAll]);
+        Summary := StringReplace(Summary, '{answer_duration}', FormatElapsed(Stats.AnswerMs), [rfReplaceAll]);
 
         SetColor(tcAgentDone);
         WriteText(Summary, False);
@@ -2969,6 +2984,15 @@ begin
     end;
     FShowAgentStats := BoolVal;
   end
+  else if N = 'agentstatsformat' then
+  begin
+    if V = string.Empty then
+    begin
+      DoOutput('error: term.agentstatsformat cannot be empty' + LineEnding, True);
+      Exit;
+    end;
+    FAgentStatsFormat := V;
+  end
   else if N = 'color' then
   begin
     Parts := TStringList.Create;
@@ -3190,6 +3214,8 @@ begin
     else
       Val := 'off';
   end
+  else if N = 'agentstatsformat' then
+    Val := FAgentStatsFormat
   else if N = 'commandtimeout' then
     Val := IntToStr(FCommandTimeout)
   else if N = 'maxcapturebytes' then
@@ -3234,6 +3260,7 @@ begin
     Row('term.shell', FShellExec);
     Row('term.showthinking', BoolToStr(FShowThinking, 'on', 'off'));
     Row('term.showagentstats', BoolToStr(FShowAgentStats, 'on', 'off'));
+    Row('term.agentstatsformat', FAgentStatsFormat);
     Row('term.commandtimeout', IntToStr(FCommandTimeout));
     Row('term.maxcapturebytes', IntToStr(FMaxCaptureBytes));
     Row('term.agentcommandtimeout', IntToStr(FAgentCommandTimeout));

@@ -457,6 +457,7 @@ begin
     Row('term.shell', 'executable, e.g. cmd.exe or pwsh.exe');
     Row('term.showthinking', 'on|off, show agent reasoning text');
     Row('term.showagentstats', 'on|off, show final agent run statistics');
+    Row('term.agentstatsformat', 'completion statistics template, supports placeholders');
     Row('term.commandtimeout', 'ms, user command timeout, 0 = none');
     Row('term.maxcapturebytes', 'captured output limit per command');
     Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
@@ -505,6 +506,8 @@ begin
     Row('', 'set chatprompt You are an expert Pascal developer');
     Row('', 'get chatprompt');
     Row('', 'get tools');
+    Row('', 'set term.agentstatsformat "[DONE] {duration} | {ops} ops"');
+    Row('', 'set term.agentstatsformat "{duration} - Tools: {tool_count}, Thinking: {thinking_count}, Answers: {answer_count}"');
     Row('', 'set term.color defaulttext white');
     Row('', 'set term.color thinkingtext gray');
     Row('', 'set term.color toolbadge background blue');
