@@ -2099,6 +2099,7 @@ type
     FUserText: string;
     FCurrentContent: string;
     FCurrentThinking: string;
+    FFirstContentTick: QWord;
     procedure HandleStreamChunk(const AContent: string; var ACancel: boolean);
     procedure HandleFullContent(const AContent: string; var ACancel: boolean);
     procedure HandleThinkingChunk(const AText: string; var ACancel: boolean);
@@ -2135,6 +2136,11 @@ begin
     ACancel := True;
     Exit;
   end;
+
+  // Record when the first answer content arrives
+  if FAgent.FStreaming and (FFirstContentTick = 0) then
+    FFirstContentTick := GetTickCount64;
+
   FCurrentContent := FCurrentContent + AContent;
   if FAgent.FStreaming then
     QueueChunk(AContent);
@@ -2315,6 +2321,7 @@ var
   ContextToolBytes, ContextThinkingBytes: integer;
   ContextMessages, ContextPercent: integer;
   ChatStartTime, ChatElapsedMs: QWord;
+  ChatThinkingMs, ChatAnswerMs: QWord;
 begin
   UserMessageAdded := False;
   Reason := afrError;
@@ -2541,6 +2548,7 @@ begin
           begin
             FCurrentContent := '';
             FCurrentThinking := '';
+            FFirstContentTick := 0;
             ChatStartTime := GetTickCount64;
             if FAgent.FStreaming then
               FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
@@ -2683,11 +2691,43 @@ begin
               ToolCallsArr := TJSONArray(ToolCallsData);
           end;
 
+          // Split model time between thinking and answer generation
+          ChatThinkingMs := 0;
+          ChatAnswerMs := 0;
+
+          if FAgent.FStreaming then
+          begin
+            if FCurrentContent <> string.Empty then
+            begin
+              if (FCurrentThinking <> string.Empty) and (FFirstContentTick > ChatStartTime) then
+                ChatThinkingMs := FFirstContentTick - ChatStartTime;
+
+              if ChatThinkingMs > ChatElapsedMs then
+                ChatThinkingMs := ChatElapsedMs;
+
+              ChatAnswerMs := ChatElapsedMs - ChatThinkingMs;
+            end
+            else if (FCurrentThinking <> string.Empty) or ((ToolCallsArr <> nil) and (ToolCallsArr.Count > 0)) then
+              ChatThinkingMs := ChatElapsedMs;
+          end
+          else
+          begin
+            // Non-streaming responses do not provide separate generation timings
+            if (ToolCallsArr <> nil) and (ToolCallsArr.Count > 0) then
+              ChatThinkingMs := ChatElapsedMs
+            else if ((MessageData <> nil) and (MessageData.JSONType = jtObject) and
+              (TJSONObject(MessageData).Get('content', string.Empty) <> string.Empty)) or
+              (FCurrentContent <> string.Empty) then
+              ChatAnswerMs := ChatElapsedMs
+            else if FCurrentThinking <> string.Empty then
+              ChatThinkingMs := ChatElapsedMs;
+          end;
+
           // Count a reasoning cycle when the model returns thinking text or tool calls
           if (FCurrentThinking <> string.Empty) or ((ToolCallsArr <> nil) and (ToolCallsArr.Count > 0)) then
           begin
             Inc(FAgent.FRunStats.ThinkingCount);
-            Inc(FAgent.FRunStats.ThinkingMs, ChatElapsedMs);
+            Inc(FAgent.FRunStats.ThinkingMs, ChatThinkingMs);
           end;
 
           // Retry the request when the model returns an empty response, prompting it to try a different approach
@@ -2725,7 +2765,7 @@ begin
 
             // Content is already emitted by ChatStream or ChatWithTools callbacks
             Inc(FAgent.FRunStats.AnswerCount);
-            Inc(FAgent.FRunStats.AnswerMs, ChatElapsedMs);
+            Inc(FAgent.FRunStats.AnswerMs, ChatAnswerMs);
 
             FAgent.LogLine(Format('Finished: content_len=%d tool_calls=0', [Length(FinalContent)]));
             Reason := afrSuccess;
