@@ -33,7 +33,7 @@ type
   TOllamaMenuSections = set of TOllamaMenuSection;
 
   { Event fired when the model list is refreshed }
-  TModelsRefreshedEvent = procedure(Sender: TObject; const Models: TStringList) of object;
+  TModelsRefreshedEvent = procedure(Sender: TObject; const OldModels, NewModels: TStringList) of object;
   { Event fired on any error, never raises }
   TOllamaErrorEvent = procedure(Sender: TObject; Kind: TOllamaErrorKind; const ModelName: string; const ErrorMsg: string) of object;
   { Event fired when pull progress changes (simplified: only start/finish) }
@@ -46,7 +46,8 @@ type
   TConnectedEvent = procedure(Sender: TObject) of object;
   // Occurs when a model start or stop operation completes.
   // Success indicates whether the operation completed successfully.
-  TModelOperationEvent = procedure(Sender: TObject; const ModelName: string; Success: boolean; const ErrorMsg: string) of object;
+  TModelOperationEvent = procedure(Sender: TObject; const ModelName: string; External: boolean; Success: boolean;
+    const ErrorMsg: string) of object;
 
   { Background operation kinds }
   TOllamaBgOp = (boPull, boStart, boStop, boRefresh);
@@ -141,8 +142,20 @@ type
     FLastPopupTick: QWord;
     FWasConnectedAtPopup: boolean;
 
-    // Popup menu handling
+    // Monitor
+    FMonitorTimer: TTimer;
+    FMonitorModelState: boolean;
+    FMonitorInterval: integer;
+    FMonitorInitialized: boolean;
+    FInternalModelChanges: TStringList;
     FPrevPopupHandler: TNotifyEvent;
+
+    procedure MonitorTimerTick(Sender: TObject);
+    procedure SetMonitorModelState(const Value: boolean);
+    procedure SetMonitorInterval(const Value: integer);
+    procedure ProcessModelStateChanges(const OldModels, NewModels: TStringList);
+
+    // Popup menu handling
     procedure DoPopup(Sender: TObject);
     procedure BuildPopupMenu;
     procedure ClearPopupMenu;
@@ -155,6 +168,7 @@ type
       ARequestTimeout: integer = 0): string;
     function RawDelete(const Endpoint, JsonBody: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
     function ParseModels(const JsonStr: string; ADetails: TStringList): TStringList;
+    function ValidateModelsJson(const JsonStr: string): boolean;
     function IsCloudModel(const ModelName: string): boolean;
     function BuildModelInfo(const ModelName: string): string;
 
@@ -276,7 +290,8 @@ type
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 30000;
     property PullTimeout: integer read FPullTimeout write FPullTimeout default 0;
     property MenuSections: TOllamaMenuSections read FMenuSections write SetMenuSections default [msPull, msServer, msModels, msConnect];
-
+    property MonitorModelState: boolean read FMonitorModelState write SetMonitorModelState default False;
+    property MonitorInterval: integer read FMonitorInterval write SetMonitorInterval default 2000;
     property OnModelsRefreshed: TModelsRefreshedEvent read FOnModelsRefreshed write FOnModelsRefreshed;
     property OnError: TOllamaErrorEvent read FOnError write FOnError;
     property OnPullProgress: TPullProgressEvent read FOnPullProgress write FOnPullProgress;
@@ -312,8 +327,6 @@ type
     property PullTimeout;
     // Sections of the popup menu shown to the user; clear a flag to hide it
     property MenuSections;
-    // Fired after the installed model list has been refreshed
-    property OnModelsRefreshed;
     // Fired for any API or connection error; never raises
     property OnError;
     // Fired when pull progress changes (currently only start and finish)
@@ -322,6 +335,12 @@ type
     property OnConnecting;
     // Fired after the model list has been successfully refreshed
     property OnConnected;
+    // Enables periodic monitoring of running model state
+    property MonitorModelState;
+    // Polling interval in milliseconds
+    property MonitorInterval;
+    // Fired after the installed model list has been refreshed
+    property OnModelsRefreshed;
     // Occurs when a model start operation completes.
     property OnModelStart;
     // Occurs when a model stop operation completes.
@@ -375,6 +394,7 @@ const
   TAG_SEPARATOR = 4;
   TAG_CONNECTION = 5;
   TAG_SERVER = 6;
+  MONITOR_RETRY_INTERVAL = 15000;
 
 function BytesToHuman(const B: int64): string;
 begin
@@ -618,6 +638,17 @@ begin
   FProgressTimer.Interval := 300;
   FProgressTimer.Enabled := False;
   FProgressTimer.OnTimer := @ProgressTimerTick;
+
+  FMonitorModelState := False;
+  FMonitorInterval := 2000;
+  FMonitorInitialized := False;
+  FInternalModelChanges := TStringList.Create;
+  FInternalModelChanges.NameValueSeparator := '=';
+
+  FMonitorTimer := TTimer.Create(nil);
+  FMonitorTimer.Enabled := False;
+  FMonitorTimer.Interval := FMonitorInterval;
+  FMonitorTimer.OnTimer := @MonitorTimerTick;
 end;
 
 destructor TCustomOllamaManager.Destroy;
@@ -648,6 +679,8 @@ begin
   FreeAndNil(FPullProgress);
   FreeAndNil(FStartSubItems);
   FreeAndNil(FLoadingSubItems);
+  FreeAndNil(FMonitorTimer);
+  FreeAndNil(FInternalModelChanges);
   inherited Destroy;
 end;
 
@@ -969,10 +1002,73 @@ begin
   TOllamaBgThread.Create(Self, boRefresh, '', FConnectGen);
 end;
 
+procedure TCustomOllamaManager.ProcessModelStateChanges(const OldModels, NewModels: TStringList);
+var
+  I, Idx: integer;
+  ModelName: string;
+begin
+  if not FMonitorModelState then
+    Exit;
+
+  // First refresh establishes the baseline without emitting events
+  if not FMonitorInitialized then
+  begin
+    FMonitorInitialized := True;
+    Exit;
+  end;
+
+  // Detect newly running models
+  for I := 0 to NewModels.Count - 1 do
+  begin
+    ModelName := NewModels[I];
+    if OldModels.IndexOf(ModelName) < 0 then
+    begin
+      // Internal operations already report their own completion event
+      Idx := FInternalModelChanges.IndexOfName(ModelName);
+      if Idx >= 0 then
+      begin
+        FInternalModelChanges.Delete(Idx);
+        Continue;
+      end;
+
+      if Assigned(FOnModelStart) then
+      try
+        FOnModelStart(Self, ModelName, True, True, string.Empty);
+      except
+        ; // Ignore user handler exceptions
+      end;
+    end;
+  end;
+
+  // Detect unloaded models
+  for I := 0 to OldModels.Count - 1 do
+  begin
+    ModelName := OldModels[I];
+    if NewModels.IndexOf(ModelName) < 0 then
+    begin
+      // Internal operations already report their own completion event
+      Idx := FInternalModelChanges.IndexOfName(ModelName);
+      if Idx >= 0 then
+      begin
+        FInternalModelChanges.Delete(Idx);
+        Continue;
+      end;
+
+      if Assigned(FOnModelStop) then
+      try
+        FOnModelStop(Self, ModelName, True, True, string.Empty);
+      except
+        ; // Ignore user handler exceptions
+      end;
+    end;
+  end;
+end;
+
 procedure TCustomOllamaManager.ProcessRefreshData(const TagsJson, PsJson: string; Kind: TOllamaErrorKind;
   const ErrorMsg: string; AGen: integer);
 var
   NewInstalled, NewRunning: TStringList;
+  OldInstalled, OldRunning: TStringList;
   ModelsChanged: boolean;
   I: integer;
 begin
@@ -988,7 +1084,28 @@ begin
   if Kind <> oekNone then
   begin
     FConnected := False;
+    FMonitorInitialized := False;
+
+    // Retry connection less frequently while the server is unavailable
+    if Assigned(FMonitorTimer) and FMonitorModelState and FActive then
+      FMonitorTimer.Interval := MONITOR_RETRY_INTERVAL;
+
     DoError(Kind, '', ErrorMsg);
+    if Assigned(FPopupMenu) then
+      BuildPopupMenu;
+    Exit;
+  end;
+
+  // Invalid responses must not be interpreted as an empty model list
+  if not ValidateModelsJson(TagsJson) or not ValidateModelsJson(PsJson) then
+  begin
+    FConnected := False;
+    FMonitorInitialized := False;
+
+    if Assigned(FMonitorTimer) and FMonitorModelState and FActive then
+      FMonitorTimer.Interval := MONITOR_RETRY_INTERVAL;
+
+    DoError(oekJson, '', 'Invalid model list response from Ollama');
     if Assigned(FPopupMenu) then
       BuildPopupMenu;
     Exit;
@@ -996,8 +1113,14 @@ begin
 
   NewInstalled := nil;
   NewRunning := nil;
+  OldInstalled := TStringList.Create;
+  OldRunning := TStringList.Create;
   ModelsChanged := False;
+
   try
+    OldInstalled.Assign(FInstalledModels);
+    OldRunning.Assign(FRunningModels);
+
     try
       NewInstalled := ParseModels(TagsJson, nil);
       NewRunning := ParseModels(PsJson, FRunningDetails);
@@ -1020,9 +1143,21 @@ begin
             Break;
           end;
 
+      // Detect running state changes before replacing the old lists
+      ProcessModelStateChanges(OldRunning, NewRunning);
+
       FInstalledModels.Assign(NewInstalled);
       FRunningModels.Assign(NewRunning);
       FConnected := True;
+
+      // Remove completed operation markers that produced no state change
+      for I := FInternalModelChanges.Count - 1 downto 0 do
+        if (FInternalModelChanges.ValueFromIndex[I] = 'StartDone') or (FInternalModelChanges.ValueFromIndex[I] = 'StopDone') then
+          FInternalModelChanges.Delete(I);
+
+      // Restore the normal polling interval after a successful connection
+      if Assigned(FMonitorTimer) and FMonitorModelState then
+        FMonitorTimer.Interval := FMonitorInterval;
 
       if Assigned(FOnConnected) then
       try
@@ -1033,17 +1168,20 @@ begin
 
       if Assigned(FOnModelsRefreshed) then
       try
-        FOnModelsRefreshed(Self, FInstalledModels);
+        FOnModelsRefreshed(Self, OldInstalled, FInstalledModels);
       except
         ; // Ignore user handler exceptions
       end;
     except
       // Defensive - should not normally happen
       FConnected := False;
+      FMonitorInitialized := False;
     end;
   finally
     NewInstalled.Free;
     NewRunning.Free;
+    OldInstalled.Free;
+    OldRunning.Free;
   end;
 
   // Rebuild the popup only when the connection state or model lists change
@@ -1077,6 +1215,21 @@ begin
 
   Success := Kind = oekNone;
 
+  // Keep successful operation markers until the next state refresh
+  Idx := FInternalModelChanges.IndexOfName(ModelName);
+  if Idx >= 0 then
+  begin
+    if Success then
+    begin
+      if AOp = boStart then
+        FInternalModelChanges.ValueFromIndex[Idx] := 'StartDone'
+      else if AOp = boStop then
+        FInternalModelChanges.ValueFromIndex[Idx] := 'StopDone';
+    end
+    else
+      FInternalModelChanges.Delete(Idx);
+  end;
+
   if Kind <> oekNone then
     DoError(Kind, ModelName, ErrorMsg);
 
@@ -1084,14 +1237,14 @@ begin
     boStart:
       if Assigned(FOnModelStart) then
       try
-        FOnModelStart(Self, ModelName, Success, ErrorMsg);
+        FOnModelStart(Self, ModelName, False, Success, ErrorMsg);
       except
         ; // Ignore user handler exceptions
       end;
     boStop:
       if Assigned(FOnModelStop) then
       try
-        FOnModelStop(Self, ModelName, Success, ErrorMsg);
+        FOnModelStop(Self, ModelName, False, Success, ErrorMsg);
       except
         ; // Ignore user handler exceptions
       end;
@@ -1136,11 +1289,18 @@ begin
     Exit;
   FBaseURL := NewURL;
   FConnected := False;
+  FMonitorInitialized := False;
+  FRunningModels.Clear;
+  FRunningDetails.Clear;
+  FInternalModelChanges.Clear;
 
   // Invalidate any in-flight connection to the previous address so that
   // its result is ignored and the next attempt targets the new address
   Inc(FConnectGen);
   FConnecting := False;
+
+  if Assigned(FMonitorTimer) and FMonitorModelState and FActive then
+    FMonitorTimer.Interval := MONITOR_RETRY_INTERVAL;
 
   if Assigned(FPopupMenu) and FAutoRefresh then
     BeginConnect;
@@ -1181,6 +1341,9 @@ begin
     Exit;
   FActive := Value;
 
+  if Assigned(FMonitorTimer) then
+    FMonitorTimer.Enabled := Value and FMonitorModelState;
+
   if Value then
     BeginConnect
   else
@@ -1189,6 +1352,7 @@ begin
     Inc(FConnectGen);
     FConnecting := False;
     FConnected := False;
+    FMonitorInitialized := False;
     if Assigned(FPopupMenu) then
       BuildPopupMenu;
   end;
@@ -1581,6 +1745,54 @@ begin
   finally
     Data.Free;
   end;
+end;
+
+function TCustomOllamaManager.ValidateModelsJson(const JsonStr: string): boolean;
+var
+  Data, ModelsData, ItemData: TJSONData;
+  Arr: TJSONArray;
+  Obj: TJSONObject;
+  I: integer;
+  ModelName: string;
+begin
+  Result := False;
+  Data := nil;
+
+  try
+    Data := GetJSON(JsonStr);
+
+    if (Data = nil) or (Data.JSONType <> jtObject) then
+      Exit;
+
+    ModelsData := TJSONObject(Data).Find('models');
+    if (not Assigned(ModelsData)) or (ModelsData.JSONType <> jtArray) then
+      Exit;
+
+    Arr := TJSONArray(ModelsData);
+
+    for I := 0 to Arr.Count - 1 do
+    begin
+      ItemData := Arr.Items[I];
+
+      if (ItemData = nil) or (ItemData.JSONType <> jtObject) then
+        Exit;
+
+      Obj := TJSONObject(ItemData);
+      ModelName := Obj.Get('name', '');
+
+      if ModelName = '' then
+        ModelName := Obj.Get('model', '');
+
+      if ModelName = '' then
+        Exit;
+    end;
+
+    Result := True;
+  except
+    Result := False;
+  end;
+
+  Data.Free;
 end;
 
 function TCustomOllamaManager.IsCloudModel(const ModelName: string): boolean;
@@ -2075,6 +2287,7 @@ begin
   if Assigned(FProgressTimer) and not FProgressTimer.Enabled then
     FProgressTimer.Enabled := True;
 
+  FInternalModelChanges.Values[ModelName] := 'Start';
   TOllamaBgThread.Create(Self, boStart, ModelName);
 end;
 
@@ -2085,6 +2298,8 @@ begin
   // Cloud models are not loaded locally, nothing to unload
   if IsCloudModel(ModelName) then
     Exit;
+
+  FInternalModelChanges.Values[ModelName] := 'Stop';
   TOllamaBgThread.Create(Self, boStop, ModelName);
 end;
 
@@ -2206,6 +2421,55 @@ begin
   Result := Kind = oekNone;
   if Kind <> oekNone then
     DoError(Kind, ModelName, ErrorMsg);
+end;
+
+procedure TCustomOllamaManager.SetMonitorModelState(const Value: boolean);
+begin
+  if FMonitorModelState = Value then
+    Exit;
+
+  FMonitorModelState := Value;
+
+  // Establish a fresh baseline after monitoring is enabled
+  FMonitorInitialized := False;
+
+  if Assigned(FMonitorTimer) then
+  begin
+    FMonitorTimer.Enabled := Value and FActive;
+    if Value then
+    begin
+      if FConnected then
+        FMonitorTimer.Interval := FMonitorInterval
+      else
+        FMonitorTimer.Interval := MONITOR_RETRY_INTERVAL;
+    end;
+  end;
+end;
+
+procedure TCustomOllamaManager.SetMonitorInterval(const Value: integer);
+begin
+  if Value < 500 then
+    FMonitorInterval := 500
+  else
+    FMonitorInterval := Value;
+
+  if Assigned(FMonitorTimer) then
+  begin
+    if FConnected then
+      FMonitorTimer.Interval := FMonitorInterval
+    else
+      FMonitorTimer.Interval := MONITOR_RETRY_INTERVAL;
+  end;
+end;
+
+procedure TCustomOllamaManager.MonitorTimerTick(Sender: TObject);
+begin
+  if FShutdown or not FMonitorModelState or not FActive then
+    Exit;
+
+  // Refresh only when no other connection attempt is in progress
+  if not FConnecting then
+    BeginConnect;
 end;
 
 type
@@ -2363,8 +2627,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2455,8 +2719,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin

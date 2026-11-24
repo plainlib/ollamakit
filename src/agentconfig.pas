@@ -17,7 +17,7 @@ uses
 function FormatShortHelp: string;
 
 // Returns full help text with all commands, settings, examples and shortcuts
-function FormatFullHelp: string;
+function FormatFullHelp(Agent: boolean; Term: boolean; Shortcuts: boolean): string;
 
 // Returns help text for Ollama server management commands
 function FormatOllamaHelp: string;
@@ -135,13 +135,13 @@ type
     Done: boolean;
     Success: boolean;
     ErrorMsg: string;
-    procedure OnModels(Sender: TObject; const AList: TStringList);
+    procedure OnModels(Sender: TObject; const OldModels, NewModels: TStringList);
     procedure OnError(Sender: TObject; Kind: TOllamaErrorKind; const ModelName, Msg: string);
   end;
 
-procedure TModelListCollector.OnModels(Sender: TObject; const AList: TStringList);
+procedure TModelListCollector.OnModels(Sender: TObject; const OldModels, NewModels: TStringList);
 begin
-  Models.Assign(AList);
+  Models.Assign(NewModels);
   Success := True;
   Done := True;
 end;
@@ -344,16 +344,22 @@ begin
   T := TStringList.Create;
   try
     Header('Commands');
-    Row('cd [path]', 'Change working directory');
-    Row('pwd', 'Show working directory');
-    Row('cls / clear', 'Clear current chat');
-    Row('new', 'Start a new chat');
-    Row('history', 'Show command history');
-    Row('set / get', 'Manage settings');
-    Row('config', 'Show current settings');
-    Row('models', 'List available models');
-    Row('ollama', 'Model management');
-    Row('exit / quit', 'Exit the console');
+    Row('cd [path]', 'change working directory');
+    Row('pwd', 'show working directory');
+    Row('cls / clear', 'clear the current chat');
+    Row('new', 'start a new chat');
+    Row('exit / quit', 'exit the console');
+    Row('set <name> <value>', 'change a property');
+    Row('get <name>', 'inspect a property');
+    Row('set chat <name>', 'switch to a chat by name');
+    Row('get chat', 'list all chats');
+    Row('set chatname <name>', 'rename the active chat');
+    Row('get chatname', 'show active chat name');
+    Row('set chatprompt <text>', 'set additional chat instructions');
+    Row('get chatprompt', 'show additional chat instructions');
+    Row('config', 'show current settings');
+    Row('models', 'list available models');
+    Row('history', 'show command history');
 
     Header('Shortcuts');
     Row('Ctrl+N', 'Start a new chat');
@@ -367,14 +373,17 @@ begin
     Row('PageUp/Down', 'Scroll output by page');
 
     Header('Type "help" for the full help.');
-    T.Add('Type "ollama help" for model management commands.');
+    Row('help agent', 'agent full help');
+    Row('help term', 'terminal full help');
+    Row('help shortcuts', 'shortcuts full help');
+    Row('ollama help', 'model management commands');
     Result := T.Text;
   finally
     T.Free;
   end;
 end;
 
-function FormatFullHelp: string;
+function FormatFullHelp(Agent: boolean; Term: boolean; Shortcuts: boolean): string;
 var
   T: TStringList;
 
@@ -399,166 +408,162 @@ var
 begin
   T := TStringList.Create;
   try
-    T.Add('Commands');
+    if Agent then
+    begin
+      Header('Ollama');
+      Row('baseurl', 'server URL, e.g. http://localhost:11434');
+      Row('keepalive', 'keep loaded, -1 forever, 0 unload');
+      Row('autorefresh', 'refresh model list on popup');
+      Row('connectiontimeout', 'connect timeout ms');
+      Row('manager.timeout', 'default request timeout ms');
+      Row('pulltimeout', 'pull timeout ms, 0 = none');
+      Row('modeltimeout', 'model load/unload timeout ms');
+      Row('context', 'context window in tokens, 0 = Ollama default');
+      Row('active', 'background refresh and connection');
 
-    Row('cd [path]', 'change working directory');
-    Row('pwd', 'show working directory');
-    Row('cls / clear', 'clear the current chat');
-    Row('new', 'start a new chat');
-    Row('exit / quit', 'exit the console');
-    Row('set <name> <value>', 'change a property');
-    Row('get <name>', 'inspect a property');
-    Row('set chat <name>', 'switch to a chat by name');
-    Row('get chat', 'list all chats');
-    Row('set chatname <name>', 'rename the active chat');
-    Row('get chatname', 'show active chat name');
-    Row('set chatprompt <text>', 'set additional chat instructions');
-    Row('get chatprompt', 'show additional chat instructions');
-    Row('config', 'show current settings');
-    Row('models', 'list available models');
-    Row('history', 'show command history');
+      Header('Agent');
+      Row('model', 'model name, e.g. flint:40b');
+      Row('systemprompt', 'message text or "from <file>"');
+      Row('maxsteps', 'iterations per run, 0 = unlimited');
+      Row('timeout', 'request timeout ms, 0 = manager');
+      Row('streaming', 'stream content in real time');
+      Row('tools', 'filetools exec git interactive finish web');
+      Row('rootpath', 'sandbox directory for file tools');
+      Row('keephistory', 'persist messages between runs');
+      Row('log', 'log every step to stderr');
+      Row('logtoolresult', 'log tool results');
+      Row('loadagentsmd', 'load AGENTS.md instructions');
+      Row('agentsfilename', 'instructions file name');
+      Row('allowaccesstosystem', 'allow access outside RootPath');
+      Row('blocksensitivefiles', 'block sensitive files');
 
-    Header('OllamaManager');
-    Row('baseurl', 'server URL, e.g. http://localhost:11434');
-    Row('keepalive', 'keep loaded, -1 forever, 0 unload');
-    Row('autorefresh', 'refresh model list on popup');
-    Row('connectiontimeout', 'connect timeout ms');
-    Row('manager.timeout', 'default request timeout ms');
-    Row('pulltimeout', 'pull timeout ms, 0 = none');
-    Row('modeltimeout', 'model load/unload timeout ms');
-    Row('context', 'context window in tokens, 0 = Ollama default');
-    Row('active', 'background refresh and connection');
+      Header('Web');
+      Row('web.searchurl', 'template, {query} placeholder');
+      Row('web.useragent', 'User-Agent header');
+      Row('web.timeout', 'request timeout ms');
+      Row('web.maxbytes', 'response body cap');
+      Row('web.striphtml', 'strip HTML tags');
+      Row('web.blocklocalhost', 'block localhost');
+      Row('web.blockprivateips', 'block private IPv4');
+      Row('web.allowedhosts', 'whitelist, "none" = any');
+    end;
+    if Term then
+    begin
+      Header('Terminal settings');
+      Row('term.path', 'working directory');
+      Row('term.shell', 'executable, e.g. cmd.exe or pwsh.exe');
+      Row('term.showthinking', 'on|off, show agent reasoning text');
+      Row('term.showagentstats', 'on|off, show final agent run statistics');
+      Row('term.agentstatsformat', 'completion statistics template, supports placeholders');
+      Row('term.commandtimeout', 'ms, user command timeout, 0 = none');
+      Row('term.maxcapturebytes', 'captured output limit per command');
+      Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
 
-    Header('Agent');
-    Row('model', 'model name, e.g. flint:40b');
-    Row('systemprompt', 'message text or "from <file>"');
-    Row('maxsteps', 'iterations per run, 0 = unlimited');
-    Row('timeout', 'request timeout ms, 0 = manager');
-    Row('streaming', 'stream content in real time');
-    Row('tools', 'filetools exec git interactive finish web');
-    Row('rootpath', 'sandbox directory for file tools');
-    Row('keephistory', 'persist messages between runs');
-    Row('log', 'log every step to stderr');
-    Row('logtoolresult', 'log tool results');
-    Row('loadagentsmd', 'load AGENTS.md instructions');
-    Row('agentsfilename', 'instructions file name');
-    Row('allowaccesstosystem', 'allow access outside RootPath');
-    Row('blocksensitivefiles', 'block sensitive files');
+      Header('Terminal colors');
+      Row('term.color', '<role> [foreground|background] <color>');
+      Row('get term.color', 'show the current color scheme');
+      Row('defaulttext', 'regular terminal output');
+      Row('thinkingtext', 'agent thinking text');
+      Row('welcomebadge', 'welcome banner');
+      Row('thinkingbadge', 'thinking label');
+      Row('toolbadge', 'tool call label');
+      Row('errorbadge', 'error messages');
+      Row('warnbadge', 'warning messages');
+      Row('agentdonebadge', 'successful agent completion statistics');
+      Row('promptinput', 'user prompt and input');
+      Row('log', 'agent log messages');
+      Row('markdown.marker', 'Markdown delimiters');
+      Row('markdown.bold', 'bold text');
+      Row('markdown.italic', 'italic text');
+      Row('markdown.strikethrough', 'strikethrough text');
+      Row('markdown.inlinecode', 'inline code');
+      Row('markdown.fencedcode', 'fenced code block text');
+      Row('markdown.highlight', 'highlighted text');
+      Row('markdown.heading', 'heading text');
+      Row('markdown.quote', 'blockquote text');
+      Row('markdown.listmarker', 'list markers');
+      Row('colors', 'black red green yellow blue magenta cyan gray');
+      Row('', 'darkgray lightred lightgreen lightyellow lightblue');
+      Row('', 'lightmagenta lightcyan white');
+      Row('', 'defaulttext and thinkingtext use a single color');
+      Row('', 'other roles support foreground and background');
+    end;
 
-    Header('Web');
-    Row('web.searchurl', 'template, {query} placeholder');
-    Row('web.useragent', 'User-Agent header');
-    Row('web.timeout', 'request timeout ms');
-    Row('web.maxbytes', 'response body cap');
-    Row('web.striphtml', 'strip HTML tags');
-    Row('web.blocklocalhost', 'block localhost');
-    Row('web.blockprivateips', 'block private IPv4');
-    Row('web.allowedhosts', 'whitelist, "none" = any');
+    if Agent or Term then
+    begin
+      Header('Values');
+      Row('boolean', 'on off true false yes no 1 0');
+      Row('list', 'comma separated, "none" clears');
+      Row('text', 'single line, or "from <file>"');
+      Row('runtime', 'context and active are not saved');
+    end;
 
-    Header('Terminal settings');
-    Row('term.path', 'working directory');
-    Row('term.shell', 'executable, e.g. cmd.exe or pwsh.exe');
-    Row('term.showthinking', 'on|off, show agent reasoning text');
-    Row('term.showagentstats', 'on|off, show final agent run statistics');
-    Row('term.agentstatsformat', 'completion statistics template, supports placeholders');
-    Row('term.commandtimeout', 'ms, user command timeout, 0 = none');
-    Row('term.maxcapturebytes', 'captured output limit per command');
-    Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
+    if Agent or Term then
+      Header('Examples');
+    if Agent then
+    begin
+      Row('', 'set baseurl http://192.168.1.10:11434');
+      Row('', 'set model qwen2.5:7b');
+      Row('', 'set tools filetools, exec');
+      Row('', 'set systemprompt from prompt.txt');
+      Row('', 'get chat');
+      Row('', 'set chat My project');
+      Row('', 'set chatname Main project');
+      Row('', 'get chatname');
+      Row('', 'set chatprompt You are an expert Pascal developer');
+      Row('', 'get chatprompt');
+      Row('', 'get tools');
+    end;
+    if Term then
+    begin
+      Row('', 'set term.agentstatsformat "[DONE] {duration} | {ops} ops"');
+      Row('', 'set term.agentstatsformat "{duration} - Tools: {tool_count}, Thinking: {thinking_count}, Answers: {answer_count}"');
+      Row('', 'set term.color defaulttext white');
+      Row('', 'set term.color thinkingtext gray');
+      Row('', 'set term.color toolbadge background blue');
+      Row('', 'set term.color errorbadge foreground white');
+      Row('', 'set term.color agentdonebadge background yellow');
+      Row('', 'set term.color agentdonebadge foreground black');
+      Row('', 'set term.color markdown.marker darkgray');
+      Row('', 'set term.color markdown.bold white');
+      Row('', 'set term.color markdown.inlinecode lightgreen');
+    end;
 
-    Header('Terminal colors');
-    Row('term.color', '<role> [foreground|background] <color>');
-    Row('get term.color', 'show the current color scheme');
-    Row('defaulttext', 'regular terminal output');
-    Row('thinkingtext', 'agent thinking text');
-    Row('welcomebadge', 'welcome banner');
-    Row('thinkingbadge', 'thinking label');
-    Row('toolbadge', 'tool call label');
-    Row('errorbadge', 'error messages');
-    Row('warnbadge', 'warning messages');
-    Row('agentdonebadge', 'successful agent completion statistics');
-    Row('promptinput', 'user prompt and input');
-    Row('log', 'agent log messages');
-    Row('markdown.marker', 'Markdown delimiters');
-    Row('markdown.bold', 'bold text');
-    Row('markdown.italic', 'italic text');
-    Row('markdown.strikethrough', 'strikethrough text');
-    Row('markdown.inlinecode', 'inline code');
-    Row('markdown.fencedcode', 'fenced code block text');
-    Row('markdown.highlight', 'highlighted text');
-    Row('markdown.heading', 'heading text');
-    Row('markdown.quote', 'blockquote text');
-    Row('markdown.listmarker', 'list markers');
-    Row('colors', 'black red green yellow blue magenta cyan gray');
-    Row('', 'darkgray lightred lightgreen lightyellow lightblue');
-    Row('', 'lightmagenta lightcyan white');
-    Row('', 'defaulttext and thinkingtext use a single color');
-    Row('', 'other roles support foreground and background');
+    if Shortcuts then
+    begin
+      Header('Keyboard shortcuts');
+      Row('Enter', 'submit input');
+      Row('Shift+Enter', 'insert a new line');
+      Row('Ctrl+Enter', 'insert a new line');
+      Row('Ctrl+N', 'start a new chat');
+      Row('Ctrl+Left/Right', 'switch between chats');
+      Row('Ctrl+Shift+Del', 'delete the active chat');
+      Row('Ctrl+Backspace', 'remove the last input and result');
+      Row('Ctrl+Up/Down', 'navigate command history');
+      Row('Ctrl+Shift+Up/Down', 'select first/last history entry');
+      Row('Ctrl+Home/End', 'move to input start/end');
+      Row('Alt+PageUp/Down', 'navigate between user messages');
+      Row('Shift+PageUp/Down', 'scroll output by one line');
+      Row('PageUp/PageDown', 'scroll output by page');
+      Row('Ctrl+Delete', 'delete the current history entry');
+      Row('Ctrl+A', 'select input or copy chat when empty');
+      Row('Ctrl+C', 'copy selection or cancel current input');
+      Row('Ctrl+V', 'paste from clipboard');
+      Row('Shift+Left/Right', 'select text');
+      Row('Left/Right', 'move cursor');
+      Row('Up/Down', 'move vertically or navigate history');
+      Row('Home/End', 'move to line start/end');
+      Row('Escape', 'clear current input');
+    end;
 
-    Header('Values');
-    Row('boolean', 'on off true false yes no 1 0');
-    Row('list', 'comma separated, "none" clears');
-    Row('text', 'single line, or "from <file>"');
-    Row('runtime', 'context and active are not saved');
-
-    Header('Examples');
-    Row('', 'set baseurl http://192.168.1.10:11434');
-    Row('', 'set model qwen2.5:7b');
-    Row('', 'set tools filetools, exec');
-    Row('', 'set systemprompt from prompt.txt');
-    Row('', 'get chat');
-    Row('', 'set chat My project');
-    Row('', 'set chatname Main project');
-    Row('', 'get chatname');
-    Row('', 'set chatprompt You are an expert Pascal developer');
-    Row('', 'get chatprompt');
-    Row('', 'get tools');
-    Row('', 'set term.agentstatsformat "[DONE] {duration} | {ops} ops"');
-    Row('', 'set term.agentstatsformat "{duration} - Tools: {tool_count}, Thinking: {thinking_count}, Answers: {answer_count}"');
-    Row('', 'set term.color defaulttext white');
-    Row('', 'set term.color thinkingtext gray');
-    Row('', 'set term.color toolbadge background blue');
-    Row('', 'set term.color errorbadge foreground white');
-    Row('', 'set term.color agentdonebadge background yellow');
-    Row('', 'set term.color agentdonebadge foreground black');
-    Row('', 'set term.color markdown.marker darkgray');
-    Row('', 'set term.color markdown.bold white');
-    Row('', 'set term.color markdown.inlinecode lightgreen');
-
-    Header('Context examples');
-    Row('ollama context', 'show current context window');
-    Row('ollama context 8192', 'set 8K tokens');
-    Row('ollama context 32768', 'set 32K tokens');
-    Row('ollama context 262144', 'set 256K tokens');
-    Row('ollama context 0', 'use Ollama default');
-    Row('', 'Values are specified in tokens, not thousands');
-
-    Header('Keyboard shortcuts');
-    Row('Enter', 'submit input');
-    Row('Shift+Enter', 'insert a new line');
-    Row('Ctrl+Enter', 'insert a new line');
-    Row('Ctrl+N', 'start a new chat');
-    Row('Ctrl+Left/Right', 'switch between chats');
-    Row('Ctrl+Shift+Del', 'delete the active chat');
-    Row('Ctrl+Backspace', 'remove the last input and result');
-    Row('Ctrl+Up/Down', 'navigate command history');
-    Row('Ctrl+Shift+Up/Down', 'select first/last history entry');
-    Row('Ctrl+Home/End', 'move to input start/end');
-    Row('Alt+PageUp/Down', 'navigate between user messages');
-    Row('Shift+PageUp/Down', 'scroll output by one line');
-    Row('PageUp/PageDown', 'scroll output by page');
-    Row('Ctrl+Delete', 'delete the current history entry');
-    Row('Ctrl+A', 'select input or copy chat when empty');
-    Row('Ctrl+C', 'copy selection or cancel current input');
-    Row('Ctrl+V', 'paste from clipboard');
-    Row('Shift+Left/Right', 'select text');
-    Row('Left/Right', 'move cursor');
-    Row('Up/Down', 'move vertically or navigate history');
-    Row('Home/End', 'move to line start/end');
-    Row('Escape', 'clear current input');
-
-    Header('Additional help');
+    Header('Type "help" for the full help.');
+    if not Agent then
+      Row('help agent', 'agent full help');
+    if not Term then
+      Row('help term', 'terminal full help');
+    if not Shortcuts then
+      Row('help shortcuts', 'shortcuts full help');
     Row('ollama help', 'model management commands');
-    Row('help', 'show full help');
     Row('h / ?', 'show short help');
 
     Result := T.Text;
@@ -616,6 +621,14 @@ begin
     Row('ollama context', 'show current context window');
     Row('ollama context <tokens>', 'set context window, 0 = default');
     Row('ollama help', 'this help');
+
+    Header('Context examples');
+    Row('ollama context', 'show current context window');
+    Row('ollama context 8192', 'set 8K tokens');
+    Row('ollama context 32768', 'set 32K tokens');
+    Row('ollama context 262144', 'set 256K tokens');
+    Row('ollama context 0', 'use Ollama default');
+    Row('', 'Values are specified in tokens, not thousands');
 
     T.Add('');
     T.Add('  Uses baseurl, never invokes the shell');

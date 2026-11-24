@@ -287,7 +287,7 @@ type
     // Assigns the shell command history
     procedure SetShellHistory(const AValue: TAgentShellHistory);
     // Handles short and full help commands
-    procedure HandleHelpCommand(AShort: boolean);
+    procedure HandleHelpCommand(AShort: boolean; Agent: boolean; Term: boolean; Shortcuts: boolean);
     // Handles set <name> <value>
     procedure HandleSetCommand(const AArg: string);
     // Handles get <name>
@@ -323,7 +323,7 @@ type
     // Handles displaying the Ollama version
     procedure HandleOllamaVersion;
     // Temporary event handlers used while a command is in flight
-    procedure HandleOllamaModelsRefreshed(Sender: TObject; const Models: TStringList);
+    procedure HandleOllamaModelsRefreshed(Sender: TObject; const OldModels, NewModels: TStringList);
     // Handles an Ollama operation error
     procedure HandleOllamaError(Sender: TObject; Kind: TOllamaErrorKind; const ModelName, Msg: string);
     // Handles model download progress updates
@@ -2812,8 +2812,14 @@ begin
     for I := 0 to FHistory.Count - 1 do
       DoOutput(Format('%4d  %s%s', [I + 1, FHistory[I], LineEnding]), False);
   end
+  else if (Cmd = 'help') and SameText(arg, 'agent') then
+    HandleHelpCommand(False, True, False, False)
+  else if (Cmd = 'help') and (SameText(arg, 'term') or SameText(arg, 'terminal')) then
+    HandleHelpCommand(False, False, True, False)
+  else if (Cmd = 'help') and (SameText(arg, 'shortcut') or SameText(arg, 'shortcuts')) then
+    HandleHelpCommand(False, False, False, True)
   else if (Cmd = 'help') or (Cmd = 'h') or (Cmd = '?') then
-    HandleHelpCommand(Cmd <> 'help')
+    HandleHelpCommand(Cmd <> 'help', True, True, True)
   else if Cmd = 'set' then
     HandleSetCommand(Arg)
   else if Cmd = 'get' then
@@ -2831,12 +2837,12 @@ begin
     DoOutput('Unknown builtin: ' + Cmd + LineEnding, True);
 end;
 
-procedure TCustomTermManager.HandleHelpCommand(AShort: boolean);
+procedure TCustomTermManager.HandleHelpCommand(AShort: boolean; Agent: boolean; Term: boolean; Shortcuts: boolean);
 begin
   if AShort then
     DoOutput(FormatShortHelp + LineEnding, False)
   else
-    DoOutput(FormatFullHelp + LineEnding, False);
+    DoOutput(FormatFullHelp(Agent, Term, Shortcuts) + LineEnding, False);
 end;
 
 procedure TCustomTermManager.HandleSetCommand(const AArg: string);
@@ -3449,12 +3455,12 @@ begin
   Result := True;
 end;
 
-procedure TCustomTermManager.HandleOllamaModelsRefreshed(Sender: TObject; const Models: TStringList);
+procedure TCustomTermManager.HandleOllamaModelsRefreshed(Sender: TObject; const OldModels, NewModels: TStringList);
 begin
   // Done when the awaited model is present or when no specific model was set
   if FOllamaWaitModel = '' then
     FOllamaOpDone := True
-  else if Models.IndexOf(FOllamaWaitModel) >= 0 then
+  else if NewModels.IndexOf(FOllamaWaitModel) >= 0 then
     FOllamaOpDone := True;
 end;
 
