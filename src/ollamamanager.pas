@@ -136,6 +136,7 @@ type
     FProgressTimer: TTimer;
     FConnecting: boolean;
     FConnected: boolean;
+    FModelsInitialized: boolean;
     FActive: boolean;
     FConnectGen: integer;
     FShutdown: boolean;
@@ -606,6 +607,7 @@ begin
   FMenuSections := [msPull, msServer, msModels, msConnect];
   FConnecting := False;
   FConnected := False;
+  FModelsInitialized := False;
   FActive := True;
   FConnectGen := 0;
   FShutdown := False;
@@ -1166,12 +1168,15 @@ begin
         ; // Ignore user handler exceptions
       end;
 
-      if Assigned(FOnModelsRefreshed) then
+      // Skip the initial model list because it establishes the baseline
+      if FModelsInitialized and Assigned(FOnModelsRefreshed) then
       try
         FOnModelsRefreshed(Self, OldInstalled, FInstalledModels);
       except
         ; // Ignore user handler exceptions
       end;
+
+      FModelsInitialized := True;
     except
       // Defensive - should not normally happen
       FConnected := False;
@@ -1289,6 +1294,7 @@ begin
     Exit;
   FBaseURL := NewURL;
   FConnected := False;
+  FModelsInitialized := False;
   FMonitorInitialized := False;
   FRunningModels.Clear;
   FRunningDetails.Clear;
@@ -2627,8 +2633,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2719,8 +2725,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
