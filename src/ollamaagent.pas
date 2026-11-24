@@ -123,6 +123,8 @@ type
     function GetLastOutputMark(out AMark: TTerminalOutputMark): boolean;
     procedure DeleteLastOutputMark;
     procedure SetOutputMarkScreenPosition(AIndex, ARow, ACol: integer);
+    // Returns True when the chat contains no user-visible or saved data
+    function IsEmpty: boolean;
 
     property OutputMarks: TTerminalOutputMarks read FOutputMarks;
     property ContextUsed: integer read FContextUsed write SetContextUsed;
@@ -1779,6 +1781,80 @@ begin
     Result := AData.AsString;
 end;
 
+// Returns True when terminal output contains visible text
+function TerminalOutputHasText(const AText: string): boolean;
+var
+  I: SizeInt;
+  C: byte;
+begin
+  Result := False;
+  I := 1;
+
+  while I <= Length(AText) do
+  begin
+    C := Ord(AText[I]);
+
+    // Skip internal color markers and their color values
+    if C = 2 then
+    begin
+      Inc(I, 2);
+      Continue;
+    end;
+
+    // Skip ANSI escape sequences
+    if C = 27 then
+    begin
+      Inc(I);
+      if I <= Length(AText) then
+      begin
+        if AText[I] = '[' then
+        begin
+          Inc(I);
+          while I <= Length(AText) do
+          begin
+            C := Ord(AText[I]);
+            Inc(I);
+            if (C >= $40) and (C <= $7E) then
+              Break;
+          end;
+        end
+        else if AText[I] = ']' then
+        begin
+          Inc(I);
+          while I <= Length(AText) do
+          begin
+            if AText[I] = #7 then
+            begin
+              Inc(I);
+              Break;
+            end;
+
+            if (AText[I] = #27) and (I < Length(AText)) and (AText[I + 1] = '\') then
+            begin
+              Inc(I, 2);
+              Break;
+            end;
+
+            Inc(I);
+          end;
+        end
+        else
+          Inc(I);
+      end;
+      Continue;
+    end;
+
+    // Ignore whitespace and non-printable control characters
+    if (C <= 32) or (C = 127) then
+    begin
+      Inc(I);
+      Continue;
+    end;
+
+    Result := True;
+    Exit;
+  end;
+end;
 
 { TAgentWebOptions }
 
@@ -3183,6 +3259,15 @@ begin
   FOutputMarks[AIndex].ScreenCol := ACol;
 end;
 
+function TAgentChat.IsEmpty: boolean;
+var
+  AHistory: string;
+begin
+  // Command AHistory and shell log do not make a chat non-empty
+  AHistory := Trim(FHistory);
+  Result := ((AHistory = string.Empty) or (AHistory = '[]')) and not TerminalOutputHasText(FTerminalOutput);
+end;
+
 procedure TAgentChat.SetName(const AValue: string);
 begin
   if FName = AValue then
@@ -3832,7 +3917,7 @@ end;
 
 function TCustomOllamaAgent.LoadChatsFromFiles(AFileNames: TStrings; const AStartupDirectory: string): boolean;
 var
-  I, ChatIndex, Delta: integer;
+  I, ChatIndex, Delta, PreviousChatCount: integer;
   ChatDirectory, LaunchDirectory, ChatName: string;
 begin
   Result := False;
@@ -3880,21 +3965,35 @@ begin
   end
   else
   begin
-    // Reuse the last chat if it is completely empty
+    // Replace the last chat if it is completely empty
+    ChatIndex := -1;
     if ChatCount > 0 then
     begin
       ChatIndex := ChatCount - 1;
-      if (Trim(Chats[ChatIndex].History) = string.Empty) and (Chats[ChatIndex].TerminalOutput = string.Empty) and
-        (Chats[ChatIndex].TerminalHistory.Count = 0) and (Chats[ChatIndex].ShellLog.Count = 0) then
+      if Chats[ChatIndex].IsEmpty then
       begin
         ChatName := ExtractFileName(ExcludeTrailingPathDelimiter(LaunchDirectory));
         if ChatName = string.Empty then
           ChatName := LaunchDirectory;
-        Chats[ChatIndex].Name := ChatName;
-        // Reassign the directory so the chat is found on the next launch
-        Chats[ChatIndex].WorkingDirectory := LaunchDirectory;
-        Chats[ChatIndex].MarkSessionActive;
-        RootPath := LaunchDirectory;
+
+        PreviousChatCount := ChatCount;
+
+        // Delete the empty chat and create a replacement
+        if DeleteActiveChat then
+        begin
+          if PreviousChatCount > 1 then
+            NewChat(ChatName);
+
+          if Assigned(FActiveChat) then
+          begin
+            FActiveChat.Name := ChatName;
+            FActiveChat.WorkingDirectory := LaunchDirectory;
+            FActiveChat.MarkSessionActive;
+            RootPath := LaunchDirectory;
+          end;
+
+          ChatIndex := ChatCount - 1;
+        end;
       end
       else
         ChatIndex := -1;

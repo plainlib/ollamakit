@@ -276,6 +276,8 @@ type
     procedure SetHistory(const AValue: TStringList);
     // Switches the active agent chat and restores its terminal state
     function SwitchActiveChat(ADelta: integer): boolean;
+    // Shows the welcome banner when the active chat is empty
+    procedure ShowWelcomeBanner;
     // Moves the active chat in the list
     function MoveActiveChat(ADelta: integer): boolean;
     // Appends terminal text to the active chat transcript
@@ -1281,7 +1283,27 @@ begin
     Path := FAgent.ActiveChat.WorkingDirectory;
 
   RestoreActiveChat;
+  ShowWelcomeBanner;
   Result := True;
+end;
+
+procedure TCustomTermManager.ShowWelcomeBanner;
+var
+  SuppressOutput: boolean;
+begin
+  if (FWelcome = string.Empty) or (Assigned(FAgent) and Assigned(FAgent.ActiveChat) and not FAgent.ActiveChat.IsEmpty) then
+    Exit;
+
+  // Keep welcome output out of the saved chat transcript
+  SuppressOutput := FSuppressChatOutput;
+  FSuppressChatOutput := True;
+  try
+    SetColor(tcWelcome);
+    DoOutput(FWelcome + LineEnding, False);
+    SetColor(tcDefault);
+  finally
+    FSuppressChatOutput := SuppressOutput;
+  end;
 end;
 
 function TCustomTermManager.MoveActiveChat(ADelta: integer): boolean;
@@ -4828,6 +4850,7 @@ var
   WaitShown: boolean;
   StartTick: QWord;
   Mark: TTerminalOutputMark;
+  SuppressWelcomeOutput: boolean;
   {$IFDEF WINDOWS}
   InHandle: THandle;
   InMode: DWORD = 0;
@@ -4851,17 +4874,7 @@ begin
     SetConsoleMode(InHandle, InMode and not (ENABLE_ECHO_INPUT or ENABLE_LINE_INPUT or ENABLE_PROCESSED_INPUT));
   {$ENDIF}
 
-  // Show the welcome banner only when the active chat is completely empty
-  if FWelcome <> '' then
-  begin
-    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) or ((FAgent.ActiveChat.History = string.Empty) and
-      (FAgent.ActiveChat.TerminalOutput = string.Empty)) then
-    begin
-      SetColor(tcWelcome);
-      DoOutput(FWelcome + LineEnding, False);
-      SetColor(tcDefault);
-    end;
-  end;
+  ShowWelcomeBanner;
 
   // Start with explicit default color so prompt and banner match scheme
   SetColor(tcDefault);
@@ -6292,6 +6305,7 @@ begin
           if FAgent.DeleteActiveChat then
           begin
             RestoreActiveChat;
+            ShowWelcomeBanner;
             UpdateConsoleTitle;
           end;
         end;
