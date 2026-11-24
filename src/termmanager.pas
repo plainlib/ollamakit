@@ -178,7 +178,7 @@ type
     FToolCallLabel: TCaption; // Label printed on its own line before a tool call, {name} and {args} placeholders
     FLastCharWasNewLine: boolean; // True when last written char was CR or LF, used to keep prompt on fresh line
     FStripEmoji: boolean; // Remove emoji and symbol chars that console fonts cannot render
-    FNormalizeText: boolean; // Normalize text for terminal output
+    FStripSpecialChars: boolean; // Normalize text for terminal output
     FColorOutput: boolean; // Colorize badges and thinking text when console supports attributes
     FColors: TTermColorScheme; // Semantic color palette for output
     FDefaultModelLabel: TCaption; // Label used in the {info} badge when no model is selected
@@ -408,7 +408,7 @@ type
     property AgentStatsFormat: string read FAgentStatsFormat write FAgentStatsFormat;
     property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
-    property NormalizeText: boolean read FNormalizeText write FNormalizeText default True;
+    property StripSpecialChars: boolean read FStripSpecialChars write FStripSpecialChars default True;
     property ColorOutput: boolean read FColorOutput write FColorOutput default True;
     property Colors: TTermColorScheme read FColors write SetColors;
     property DefaultModelLabel: TCaption read FDefaultModelLabel write FDefaultModelLabel;
@@ -455,7 +455,7 @@ type
     // Strip emoji and unsupported symbol ranges that plain console fonts cannot render
     property StripEmoji;
     // Normalize text for terminal output
-    property NormalizeText;
+    property StripSpecialChars;
     // Colorize badges and thinking text when console supports attributes
     property ColorOutput;
     // Semantic color palette for output, expand to customize each role
@@ -1093,7 +1093,7 @@ begin
   FToolCallLabel := '[{name}: {command}]';
   FLastCharWasNewLine := True;
   FStripEmoji := True;
-  FNormalizeText := True;
+  FStripSpecialChars := True;
   FColorOutput := True;
   FColors := TTermColorScheme.Create;
   FDefaultModelLabel := 'plainconsole';
@@ -2237,7 +2237,7 @@ begin
     if FStripEmoji then
       Sanitized := StripEmojiChars(Sanitized);
 
-    if FNormalizeText then
+    if FStripSpecialChars then
       Sanitized := Sanitized.NormalizeTerminalText;
   except
     // Text processing may fail on malformed UTF-8, fall back to raw text
