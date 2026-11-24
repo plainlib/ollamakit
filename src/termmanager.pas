@@ -178,6 +178,7 @@ type
     FToolCallLabel: TCaption; // Label printed on its own line before a tool call, {name} and {args} placeholders
     FLastCharWasNewLine: boolean; // True when last written char was CR or LF, used to keep prompt on fresh line
     FStripEmoji: boolean; // Remove emoji and symbol chars that console fonts cannot render
+    FNormalizeText: boolean; // Normalize text for terminal output
     FColorOutput: boolean; // Colorize badges and thinking text when console supports attributes
     FColors: TTermColorScheme; // Semantic color palette for output
     FDefaultModelLabel: TCaption; // Label used in the {info} badge when no model is selected
@@ -407,6 +408,7 @@ type
     property AgentStatsFormat: string read FAgentStatsFormat write FAgentStatsFormat;
     property ToolCallLabel: TCaption read FToolCallLabel write FToolCallLabel;
     property StripEmoji: boolean read FStripEmoji write FStripEmoji default True;
+    property NormalizeText: boolean read FNormalizeText write FNormalizeText default True;
     property ColorOutput: boolean read FColorOutput write FColorOutput default True;
     property Colors: TTermColorScheme read FColors write SetColors;
     property DefaultModelLabel: TCaption read FDefaultModelLabel write FDefaultModelLabel;
@@ -452,6 +454,8 @@ type
     property ToolCallLabel;
     // Strip emoji and unsupported symbol ranges that plain console fonts cannot render
     property StripEmoji;
+    // Normalize text for terminal output
+    property NormalizeText;
     // Colorize badges and thinking text when console supports attributes
     property ColorOutput;
     // Semantic color palette for output, expand to customize each role
@@ -693,6 +697,28 @@ begin
   Result := True;
 end;
 
+// Checks whether a Unicode code point represents an emoji
+function IsEmojiCodePoint(const ACode: cardinal): boolean;
+begin
+  Result :=
+    // Emoticons, pictographs, transport and supplemental symbols
+    ((ACode >= $1F000) and (ACode <= $1FAFF)) or ((ACode >= $1FC00) and (ACode <= $1FFFD)) or
+
+    // Regional indicator symbols used by flags
+    ((ACode >= $1F1E6) and (ACode <= $1F1FF)) or
+
+    // Emoji presentation symbols in the miscellaneous symbol blocks
+    (((ACode >= $231A) and (ACode <= $231B)) or ((ACode >= $23E9) and (ACode <= $23EC)) or (ACode = $23F0) or
+    (ACode = $23F3) or ((ACode >= $25FD) and (ACode <= $25FE)) or ((ACode >= $2614) and (ACode <= $2615)) or
+    ((ACode >= $2648) and (ACode <= $2653)) or (ACode = $267F) or (ACode = $2693) or (ACode = $26A1) or
+    ((ACode >= $26AA) and (ACode <= $26AB)) or ((ACode >= $26BD) and (ACode <= $26BE)) or
+    ((ACode >= $26C4) and (ACode <= $26C5)) or (ACode = $26CE) or (ACode = $26D4) or (ACode = $26EA) or
+    ((ACode >= $26F2) and (ACode <= $26F3)) or (ACode = $26F5) or (ACode = $26FA) or (ACode = $26FD) or
+    (ACode = $2705) or ((ACode >= $270A) and (ACode <= $270B)) or (ACode = $2728) or (ACode = $274C) or
+    (ACode = $274E) or ((ACode >= $2753) and (ACode <= $2755)) or (ACode = $2757) or ((ACode >= $2795) and (ACode <= $2797)) or
+    (ACode = $27B0) or (ACode = $27BF) or ((ACode >= $2B1B) and (ACode <= $2B1C)) or (ACode = $2B50) or (ACode = $2B55));
+end;
+
 // Removes emoji and symbol ranges that plain console fonts cannot render
 function StripEmojiChars(const AText: string): string;
 var
@@ -703,25 +729,46 @@ begin
   Wide := UTF8Decode(AText);
   Filtered := '';
   SetLength(Filtered, Length(Wide));
+  I := 1;
   J := 0;
-  for I := 1 to Length(Wide) do
+
+  while I <= Length(Wide) do
   begin
     Code := Ord(Wide[I]);
-    if (Code >= $D800) and (Code <= $DFFF) then
+
+    // Decode UTF-16 surrogate pairs into a Unicode code point
+    if (Code >= $D800) and (Code <= $DBFF) and (I < Length(Wide)) and (Ord(Wide[I + 1]) >= $DC00) and (Ord(Wide[I + 1]) <= $DFFF) then
+    begin
+      Code := $10000 + ((Code - $D800) shl 10) + (Ord(Wide[I + 1]) - $DC00);
+
+      if not IsEmojiCodePoint(Code) then
+      begin
+        Inc(J);
+        Filtered[J] := Wide[I];
+        Inc(J);
+        Filtered[J] := Wide[I + 1];
+      end;
+
+      Inc(I, 2);
       Continue;
-    if (Code >= $2300) and (Code <= $23FF) then
+    end;
+
+    // Remove emoji variation selector and keycap combining mark
+    if (Code = $FE0F) or (Code = $20E3) then
+    begin
+      Inc(I);
       Continue;
-    if (Code >= $2600) and (Code <= $27BF) then
-      Continue;
-    if (Code >= $2B00) and (Code <= $2BFF) then
-      Continue;
-    if Code = $200D then
-      Continue;
-    if (Code >= $FE00) and (Code <= $FE0F) then
-      Continue;
-    Inc(J);
-    Filtered[J] := Wide[I];
+    end;
+
+    if not IsEmojiCodePoint(Code) then
+    begin
+      Inc(J);
+      Filtered[J] := Wide[I];
+    end;
+
+    Inc(I);
   end;
+
   SetLength(Filtered, J);
   Result := UTF8Encode(Filtered);
 end;
@@ -1046,6 +1093,7 @@ begin
   FToolCallLabel := '[{name}: {command}]';
   FLastCharWasNewLine := True;
   FStripEmoji := True;
+  FNormalizeText := True;
   FColorOutput := True;
   FColors := TTermColorScheme.Create;
   FDefaultModelLabel := 'plainconsole';
@@ -2184,12 +2232,15 @@ begin
   if AText = '' then
     Exit;
   try
+    Sanitized := AText;
+
     if FStripEmoji then
-      Sanitized := StripEmojiChars(AText).NormalizeTerminalText
-    else
-      Sanitized := AText;
+      Sanitized := StripEmojiChars(Sanitized);
+
+    if FNormalizeText then
+      Sanitized := Sanitized.NormalizeTerminalText;
   except
-    // Strip may fail on malformed UTF-8, fall back to raw text
+    // Text processing may fail on malformed UTF-8, fall back to raw text
     Sanitized := AText;
   end;
 
@@ -2208,12 +2259,12 @@ begin
   try
     if AIsStderr then
     begin
-      Write(ErrOutput, AText);
+      Write(ErrOutput, Sanitized);
       Flush(ErrOutput);
     end
     else
     begin
-      Write(Output, AText);
+      Write(Output, Sanitized);
       Flush(Output);
     end;
   except
