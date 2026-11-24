@@ -6030,11 +6030,14 @@ var
   Patch: string = '';
   FileContent: string = '';
   PatchPath: string = '';
+  PatchMovePath: string = '';
+  MovePathFull: string = '';
   ExpectedPath: string = '';
   PatchLine: string = '';
   ErrorMsg: string = '';
   TmpText: string = '';
   OrigLineBreak: string = #10;
+  PatchOperation: string = '';
   Lines: TStringList = nil;
   PatchLines: TStringList = nil;
   NewLines: TStringList = nil;
@@ -6047,6 +6050,8 @@ var
   NoNewlineAtEOF: boolean = False;
   ResultNoNewlineAtEOF: boolean = False;
   IsHybridPatch: boolean = False;
+  HasMove: boolean = False;
+  IsPureMove: boolean = False;
 
   function DetectLineBreak(const S: string): string;
   begin
@@ -6066,6 +6071,16 @@ var
       Result := StringReplace(Result, #10, #13#10, [rfReplaceAll])
     else if TargetBreak = #13 then
       Result := StringReplace(Result, #10, #13, [rfReplaceAll]);
+  end;
+
+  // Compares paths using platform-specific case rules.
+  function SamePath(const A, B: string): boolean;
+  begin
+    {$IFDEF MSWINDOWS}
+    Result := SameText(A, B);
+    {$ELSE}
+    Result := SameStr(A, B);
+    {$ENDIF}
   end;
 
   // Removes one trailing line break if present.
@@ -6097,19 +6112,23 @@ var
     end;
   end;
 
-  // Extracts the target path and detects the patch format.
+  // Extracts the target path and operation from the patch header.
   function ExtractCodexPatchPath(const APatch: string; out APath: string; out AIsCodexPatch: boolean;
-    out AIsHybridPatch: boolean): boolean;
+    out AIsHybridPatch: boolean; out AOperation: string; out AMovePath: string): boolean;
   var
     TempLines: TStringList = nil;
     LI: integer = 0;
     LineText: string = '';
     OldPath: string = '';
     NewPath: string = '';
-    HasUpdate: boolean = False;
+    MoveToPath: string = '';
+    HasOperation: boolean = False;
+    HasMoveTo: boolean = False;
   begin
     Result := False;
     APath := string.Empty;
+    AMovePath := string.Empty;
+    AOperation := string.Empty;
     AIsCodexPatch := False;
     AIsHybridPatch := False;
 
@@ -6122,7 +6141,6 @@ var
         LineText := Trim(TempLines[LI]);
         if LineText = string.Empty then
           Continue;
-
         AIsCodexPatch := LineText = '*** Begin Patch';
         Break;
       end;
@@ -6134,13 +6152,45 @@ var
       begin
         LineText := Trim(TempLines[LI]);
 
-        if Copy(LineText, 1, Length('*** Update File: ')) = '*** Update File: ' then
+        if (Copy(LineText, 1, Length('*** Update File: ')) = '*** Update File: ') or
+          (Copy(LineText, 1, Length('*** Add File: ')) = '*** Add File: ') or
+          (Copy(LineText, 1, Length('*** Delete File: ')) = '*** Delete File: ') then
         begin
-          if HasUpdate then
+          if HasOperation then
             Exit;
 
-          APath := Trim(Copy(LineText, Length('*** Update File: ') + 1, MaxInt));
-          HasUpdate := True;
+          HasOperation := True;
+
+          if Copy(LineText, 1, Length('*** Update File: ')) = '*** Update File: ' then
+          begin
+            AOperation := 'update';
+            APath := Trim(Copy(LineText, Length('*** Update File: ') + 1, MaxInt));
+          end
+          else if Copy(LineText, 1, Length('*** Add File: ')) = '*** Add File: ' then
+          begin
+            AOperation := 'add';
+            APath := Trim(Copy(LineText, Length('*** Add File: ') + 1, MaxInt));
+          end
+          else
+          begin
+            AOperation := 'delete';
+            APath := Trim(Copy(LineText, Length('*** Delete File: ') + 1, MaxInt));
+          end;
+        end
+        else if Copy(LineText, 1, Length('*** Move to: ')) = '*** Move to: ' then
+        begin
+          // Move is only valid together with Update File.
+          if not HasOperation or (AOperation <> 'update') then
+            Exit;
+
+          if HasMoveTo then
+            Exit;
+
+          MoveToPath := Trim(Copy(LineText, Length('*** Move to: ') + 1, MaxInt));
+          if MoveToPath = string.Empty then
+            Exit;
+
+          HasMoveTo := True;
         end
         else if Copy(LineText, 1, 4) = '--- ' then
           OldPath := Trim(Copy(LineText, 5, MaxInt))
@@ -6148,8 +6198,11 @@ var
           NewPath := Trim(Copy(LineText, 5, MaxInt));
       end;
 
-      if HasUpdate then
+      if HasOperation then
+      begin
+        AMovePath := MoveToPath;
         Exit(APath <> string.Empty);
+      end;
 
       // Accept unified diff file headers inside a Codex patch.
       if (OldPath <> string.Empty) and (NewPath <> string.Empty) then
@@ -6164,6 +6217,7 @@ var
           Exit;
 
         APath := NewPath;
+        AOperation := 'update';
         AIsHybridPatch := True;
         Result := APath <> string.Empty;
       end;
@@ -6182,9 +6236,13 @@ var
     Anchor: string = '';
     LineText: string = '';
     HeaderPath: string = '';
+    MoveToHeaderPath: string = '';
     HasBegin: boolean = False;
     HasEnd: boolean = False;
     HasUpdate: boolean = False;
+    HasAdd: boolean = False;
+    HasDelete: boolean = False;
+    HasMoveTo: boolean = False;
     InHunk: boolean = False;
 
     function ApplyHunk: boolean;
@@ -6305,27 +6363,55 @@ var
 
       if Copy(LineText, 1, Length('*** Add File: ')) = '*** Add File: ' then
       begin
-        AError := 'Add File is not supported';
-        Exit;
+        if HasUpdate or HasAdd or HasDelete then
+        begin
+          AError := 'only one file operation is supported';
+          Exit;
+        end;
+
+        HeaderPath := Trim(Copy(LineText, Length('*** Add File: ') + 1, MaxInt));
+        PatchPath := StringReplace(NormalizeToolPath(HeaderPath), '\', '/', [rfReplaceAll]);
+        ExpectedPath := StringReplace(NormalizeToolPath(RelPath), '\', '/', [rfReplaceAll]);
+
+        if not SameText(PatchPath, ExpectedPath) then
+        begin
+          AError := 'Add File path does not match the path argument';
+          Exit;
+        end;
+
+        HasAdd := True;
+        Inc(LI);
+        Continue;
       end;
 
       if Copy(LineText, 1, Length('*** Delete File: ')) = '*** Delete File: ' then
       begin
-        AError := 'Delete File is not supported';
-        Exit;
-      end;
+        if HasUpdate or HasAdd or HasDelete then
+        begin
+          AError := 'only one file operation is supported';
+          Exit;
+        end;
 
-      if Copy(LineText, 1, Length('*** Move to: ')) = '*** Move to: ' then
-      begin
-        AError := 'Move to is not supported';
-        Exit;
+        HeaderPath := Trim(Copy(LineText, Length('*** Delete File: ') + 1, MaxInt));
+        PatchPath := StringReplace(NormalizeToolPath(HeaderPath), '\', '/', [rfReplaceAll]);
+        ExpectedPath := StringReplace(NormalizeToolPath(RelPath), '\', '/', [rfReplaceAll]);
+
+        if not SameText(PatchPath, ExpectedPath) then
+        begin
+          AError := 'Delete File path does not match the path argument';
+          Exit;
+        end;
+
+        HasDelete := True;
+        Inc(LI);
+        Continue;
       end;
 
       if Copy(LineText, 1, Length('*** Update File: ')) = '*** Update File: ' then
       begin
-        if HasUpdate then
+        if HasUpdate or HasAdd or HasDelete then
         begin
-          AError := 'only one Update File section is supported';
+          AError := 'only one file operation is supported';
           Exit;
         end;
 
@@ -6344,6 +6430,36 @@ var
         Continue;
       end;
 
+      if Copy(LineText, 1, Length('*** Move to: ')) = '*** Move to: ' then
+      begin
+        if not HasUpdate then
+        begin
+          AError := 'Move to requires Update File section';
+          Exit;
+        end;
+
+        if HasMoveTo then
+        begin
+          AError := 'duplicate Move to marker';
+          Exit;
+        end;
+
+        // Re-extract the destination and verify agreement with the header.
+        MoveToHeaderPath := StringReplace(NormalizeToolPath(Trim(Copy(LineText, Length('*** Move to: ') + 1, MaxInt))),
+          '\', '/', [rfReplaceAll]);
+
+        if (PatchMovePath = '') or (not SameText(MoveToHeaderPath, StringReplace(
+          NormalizeToolPath(PatchMovePath), '\', '/', [rfReplaceAll]))) then
+        begin
+          AError := 'Move to marker is inconsistent with the patch header';
+          Exit;
+        end;
+
+        HasMoveTo := True;
+        Inc(LI);
+        Continue;
+      end;
+
       if Trim(LineText) = '*** End Patch' then
       begin
         if not ApplyHunk then
@@ -6355,6 +6471,12 @@ var
 
       if Trim(LineText) = '*** End of File' then
       begin
+        if HasAdd or HasDelete then
+        begin
+          AError := 'End of File marker is not valid for this operation';
+          Exit;
+        end;
+
         if not ApplyHunk then
           Exit;
 
@@ -6364,6 +6486,36 @@ var
           Exit;
         end;
 
+        Inc(LI);
+        Continue;
+      end;
+
+      if HasDelete then
+      begin
+        AError := 'Delete File must not contain patch content';
+        Exit;
+      end;
+
+      if HasAdd then
+      begin
+        if InHunk then
+        begin
+          AError := 'invalid Add File content line at patch line ' + IntToStr(LI + 1);
+          Exit;
+        end;
+
+        // Reject unknown '*** ' markers so typos do not leak into content.
+        if (Length(LineText) >= 4) and (Copy(LineText, 1, 4) = '*** ') then
+        begin
+          AError := 'unknown marker at patch line ' + IntToStr(LI + 1) + ': ' + Copy(LineText, 1, 40);
+          Exit;
+        end;
+
+        // Add File content is always additive; strip an optional '+' prefix.
+        if (Length(LineText) > 0) and (LineText[1] = '+') then
+          NewLines.Add(Copy(LineText, 2, MaxInt))
+        else
+          NewLines.Add(LineText);
         Inc(LI);
         Continue;
       end;
@@ -6416,9 +6568,9 @@ var
       Exit;
     end;
 
-    if not HasUpdate then
+    if not (HasUpdate or HasAdd or HasDelete) then
     begin
-      AError := 'missing Update File section';
+      AError := 'missing file operation';
       Exit;
     end;
 
@@ -6432,7 +6584,8 @@ var
       end;
     end;
 
-    if HunkCount = 0 then
+    // Update requires hunks unless a pure Move is requested.
+    if HasUpdate and (HunkCount = 0) and not HasMoveTo then
     begin
       AError := 'no patch hunks found';
       Exit;
@@ -6471,7 +6624,8 @@ var
         (Copy(PatchLine, 1, 15) = 'new file mode ') or (Copy(PatchLine, 1, 19) = 'deleted file mode ') or
         (Copy(PatchLine, 1, 16) = 'similarity index ') or (Copy(PatchLine, 1, 9) = 'old mode ') or
         (Copy(PatchLine, 1, 9) = 'new mode ') or (Copy(PatchLine, 1, 10) = 'rename from ') or
-        (Copy(PatchLine, 1, 8) = 'rename to ') or (Copy(PatchLine, 1, 8) = 'copy from ') or (Copy(PatchLine, 1, 6) = 'copy to ') then
+        (Copy(PatchLine, 1, 8) = 'rename to ') or (Copy(PatchLine, 1, 8) = 'copy from ') or
+        (Copy(PatchLine, 1, 6) = 'copy to ') then
       begin
         Inc(LI);
         Continue;
@@ -6629,10 +6783,10 @@ begin
     Exit;
   end;
 
-  // Resolve the target path from the patch header when path is omitted.
-  if not ExtractCodexPatchPath(Patch, PatchPath, IsCodexPatch, IsHybridPatch) then
+  // Resolve the target path, operation and optional Move destination.
+  if not ExtractCodexPatchPath(Patch, PatchPath, IsCodexPatch, IsHybridPatch, PatchOperation, PatchMovePath) then
   begin
-    Result := '{"error": "invalid or missing Update File path"}';
+    Result := '{"error": "invalid or missing file operation path"}';
     Exit;
   end;
 
@@ -6654,26 +6808,138 @@ begin
     Exit;
   end;
 
-  if not FileExists(FullPath) then
+  if DirectoryExists(FullPath) then
   begin
-    Result := BuildFileNotFoundError(FullPath, RelPath);
+    Result := '{"error": "path is a directory"}';
     Exit;
   end;
 
-  if IsBinaryFile(FullPath) then
+  // Validate the Move destination when present.
+  HasMove := False;
+  IsPureMove := False;
+  if PatchMovePath <> '' then
   begin
-    Result := '{"error": "binary file detected, cannot edit binary files"}';
+    if PatchOperation <> 'update' then
+    begin
+      Result := '{"error": "Move to requires Update File"}';
+      Exit;
+    end;
+
+    MovePathFull := SafePath(PatchMovePath);
+    if MovePathFull = '' then
+    begin
+      Result := SafePathError;
+      Exit;
+    end;
+
+    if SamePath(MovePathFull, FullPath) then
+    begin
+      Result := '{"error": "move destination must differ from source"}';
+      Exit;
+    end;
+
+    if DirectoryExists(MovePathFull) then
+    begin
+      Result := '{"error": "move destination is a directory"}';
+      Exit;
+    end;
+
+    if FileExists(MovePathFull) then
+    begin
+      Result := '{"error": "move destination already exists"}';
+      Exit;
+    end;
+
+    HasMove := True;
+
+    // Detect pure Move (no hunks) to allow binary source files.
+    TmpText := NormalizeLineBreaks(Patch, #10);
+    IsPureMove := Pos(#10'@@', #10 + TmpText) = 0;
+  end;
+
+  // Validate the target file according to the requested operation.
+  if PatchOperation = 'add' then
+  begin
+    if FileExists(FullPath) then
+    begin
+      Result := '{"error": "file already exists"}';
+      Exit;
+    end;
+  end
+  else
+  begin
+    if not FileExists(FullPath) then
+    begin
+      Result := BuildFileNotFoundError(FullPath, RelPath);
+      Exit;
+    end;
+
+    if (PatchOperation <> 'delete') and (not IsPureMove) and IsBinaryFile(FullPath) then
+    begin
+      Result := '{"error": "binary file detected, cannot edit binary files"}';
+      Exit;
+    end;
+  end;
+
+  // Delete File does not require reading or parsing file contents.
+  if PatchOperation = 'delete' then
+  begin
+    if not IsCodexPatch then
+    begin
+      Result := '{"error": "Delete File requires a Codex patch"}';
+      Exit;
+    end;
+
+    Lines := TStringList.Create;
+    PatchLines := TStringList.Create;
+    NewLines := TStringList.Create;
+    OldBlock := TStringList.Create;
+    NewBlock := TStringList.Create;
+    Regex := TRegExpr.Create;
+    try
+      PatchLines.Text := NormalizeLineBreaks(Patch, #10);
+      if not ApplyCodexPatch(ErrorMsg) then
+      begin
+        Result := '{"error": ' + JSONQuote(ErrorMsg) + '}';
+        Exit;
+      end;
+
+      if not DeleteFile(FullPath) then
+      begin
+        Result := '{"error": "delete failed, file may be locked"}';
+        Exit;
+      end;
+
+      Result := '{"ok": true, "deleted": true}';
+    finally
+      Regex.Free;
+      NewBlock.Free;
+      OldBlock.Free;
+      NewLines.Free;
+      PatchLines.Free;
+      Lines.Free;
+    end;
     Exit;
   end;
 
-  if not ReadTextFileSafe(FullPath, FileContent) then
+  // Read the source only when its content will actually be modified.
+  if (PatchOperation = 'update') and not IsPureMove then
   begin
-    Result := '{"error": "cannot read file"}';
-    Exit;
-  end;
+    if not ReadTextFileSafe(FullPath, FileContent) then
+    begin
+      Result := '{"error": "cannot read file"}';
+      Exit;
+    end;
 
-  OrigLineBreak := DetectLineBreak(FileContent);
-  NoNewlineAtEOF := not HasTrailingNewline(FileContent);
+    OrigLineBreak := DetectLineBreak(FileContent);
+    NoNewlineAtEOF := not HasTrailingNewline(FileContent);
+  end
+  else
+  begin
+    FileContent := string.Empty;
+    OrigLineBreak := #10;
+    NoNewlineAtEOF := False;
+  end;
 
   Lines := TStringList.Create;
   PatchLines := TStringList.Create;
@@ -6734,13 +7000,81 @@ begin
       Exit;
     end;
 
+    // Recheck the target before creating a new file.
+    if (PatchOperation = 'add') and FileExists(FullPath) then
+    begin
+      Result := '{"error": "file already exists"}';
+      Exit;
+    end;
+
+    if PatchOperation = 'add' then
+    begin
+      if not ForceDirectories(ExtractFileDir(FullPath)) then
+      begin
+        Result := '{"error": "cannot create parent directory"}';
+        Exit;
+      end;
+    end;
+
+    // Handle Move to destination.
+    if HasMove then
+    begin
+      if not ForceDirectories(ExtractFileDir(MovePathFull)) then
+      begin
+        Result := '{"error": "cannot create move destination directory"}';
+        Exit;
+      end;
+
+      if FileExists(MovePathFull) then
+      begin
+        Result := '{"error": "move destination already exists"}';
+        Exit;
+      end;
+
+      // Pure Move: rename without rewriting file content.
+      if IsPureMove then
+      begin
+        if not RenameFile(FullPath, MovePathFull) then
+        begin
+          Result := '{"error": "cannot move file"}';
+          Exit;
+        end;
+
+        Result := '{"ok": true, "moved": true, "hunks_applied": 0}';
+        Exit;
+      end;
+
+      // Move with content update: write destination, then remove source.
+      if not WriteTextFileSafe(MovePathFull, TmpText) then
+      begin
+        Result := '{"error": "cannot write move destination"}';
+        Exit;
+      end;
+
+      if not DeleteFile(FullPath) then
+      begin
+        // Roll back the destination on failed source deletion.
+        if DeleteFile(MovePathFull) then
+          Result := '{"error": "cannot delete source after move; destination rolled back"}'
+        else
+          Result := '{"error": "cannot delete source after move; both files remain"}';
+        Exit;
+      end;
+
+      Result := '{"ok": true, "moved": true, "hunks_applied": ' + IntToStr(HunkCount) + '}';
+      Exit;
+    end;
+
     if not WriteTextFileSafe(FullPath, TmpText) then
     begin
       Result := '{"error": "cannot write file"}';
       Exit;
     end;
 
-    Result := '{"ok": true, "hunks_applied": ' + IntToStr(HunkCount) + '}';
+    if PatchOperation = 'add' then
+      Result := '{"ok": true, "added": true}'
+    else
+      Result := '{"ok": true, "hunks_applied": ' + IntToStr(HunkCount) + '}';
   finally
     Regex.Free;
     NewBlock.Free;
