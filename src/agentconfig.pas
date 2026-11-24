@@ -408,7 +408,10 @@ begin
     Row('exit / quit', 'exit the console');
     Row('set <name> <value>', 'change a property');
     Row('get <name>', 'inspect a property');
-    Row('set chat <name>', 'rename the active chat');
+    Row('set chat <name>', 'switch to a chat by name');
+    Row('get chat', 'list all chats');
+    Row('set chatname <name>', 'rename the active chat');
+    Row('get chatname', 'show active chat name');
     Row('set chatprompt <text>', 'set additional chat instructions');
     Row('get chatprompt', 'show additional chat instructions');
     Row('config', 'show current settings');
@@ -502,7 +505,10 @@ begin
     Row('', 'set model qwen2.5:7b');
     Row('', 'set tools filetools, exec');
     Row('', 'set systemprompt from prompt.txt');
+    Row('', 'get chat');
     Row('', 'set chat My project');
+    Row('', 'set chatname Main project');
+    Row('', 'get chatname');
     Row('', 'set chatprompt You are an expert Pascal developer');
     Row('', 'get chatprompt');
     Row('', 'get tools');

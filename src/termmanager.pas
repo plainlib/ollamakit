@@ -2841,7 +2841,7 @@ end;
 
 procedure TCustomTermManager.HandleSetCommand(const AArg: string);
 var
-  P: integer;
+  P, Q: integer;
   PropName, PropValue, ErrMsg: string;
 begin
   if Trim(AArg) = '' then
@@ -2885,8 +2885,62 @@ begin
     if (Length(PropValue) >= 2) and (PropValue[1] = '"') and (PropValue[Length(PropValue)] = '"') then
       PropValue := Copy(PropValue, 2, Length(PropValue) - 2);
 
+    P := -1;
+    for Q := 0 to FAgent.ChatCount - 1 do
+      if SameText(FAgent.Chats[Q].Name, PropValue) then
+      begin
+        P := Q;
+        Break;
+      end;
+
+    if P < 0 then
+    begin
+      DoOutput('error: chat not found: ' + PropValue + LineEnding, True);
+      Exit;
+    end;
+
+    if FAgent.Chats[P] <> FAgent.ActiveChat then
+    begin
+      Q := 0;
+      while (Q < FAgent.ChatCount) and (FAgent.Chats[Q] <> FAgent.ActiveChat) do
+        Inc(Q);
+
+      if (Q >= FAgent.ChatCount) then
+      begin
+        DoOutput('error: cannot switch chat' + LineEnding, True);
+        Exit;
+      end;
+
+      // Report the switch in the current chat before changing it
+      DoOutput('chat = ' + FAgent.Chats[P].Name + LineEnding, False);
+
+      if not SwitchActiveChat(P - Q) then
+      begin
+        DoOutput('error: cannot switch chat' + LineEnding, True);
+        Exit;
+      end;
+    end;
+  end
+  else if LowerCase(PropName) = 'chatname' then
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    begin
+      DoOutput('error: agent is not attached' + LineEnding, True);
+      Exit;
+    end;
+
+    // Strip surrounding quotes from the chat name
+    if (Length(PropValue) >= 2) and (PropValue[1] = '"') and (PropValue[Length(PropValue)] = '"') then
+      PropValue := Copy(PropValue, 2, Length(PropValue) - 2);
+
+    if PropValue = string.Empty then
+    begin
+      DoOutput('usage: set chatname <name>' + LineEnding, True);
+      Exit;
+    end;
+
     FAgent.ActiveChat.Name := PropValue;
-    DoOutput('chat = ' + PropValue + LineEnding, False);
+    DoOutput('chatname = ' + PropValue + LineEnding, False);
   end
   else if LowerCase(PropName) = 'chatprompt' then
   begin
@@ -2915,6 +2969,7 @@ end;
 procedure TCustomTermManager.HandleGetCommand(const AArg: string);
 var
   Value, ErrMsg: string;
+  P: integer;
 begin
   if Trim(AArg) = '' then
   begin
@@ -2922,6 +2977,45 @@ begin
     DoOutput('use "help" for property lists' + LineEnding, True);
     Exit;
   end;
+  if (LowerCase(Trim(AArg)) = 'chat') or (LowerCase(Trim(AArg)) = 'chats') then
+  begin
+    if not Assigned(FAgent) then
+    begin
+      DoOutput('error: agent is not attached' + LineEnding, True);
+      Exit;
+    end;
+
+    if FAgent.ChatCount = 0 then
+    begin
+      DoOutput('No chats' + LineEnding, False);
+      Exit;
+    end;
+
+    DoOutput('Chats:' + LineEnding, False);
+    for P := 0 to FAgent.ChatCount - 1 do
+    begin
+      if FAgent.Chats[P] = FAgent.ActiveChat then
+        Value := '* '
+      else
+        Value := '  ';
+
+      DoOutput(Value + FAgent.Chats[P].Name + LineEnding, False);
+    end;
+    Exit;
+  end;
+
+  if LowerCase(Trim(AArg)) = 'chatname' then
+  begin
+    if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
+    begin
+      DoOutput('error: agent is not attached' + LineEnding, True);
+      Exit;
+    end;
+
+    DoOutput('chatname = ' + FAgent.ActiveChat.Name + LineEnding, False);
+    Exit;
+  end;
+
   if LowerCase(Trim(AArg)) = 'chatprompt' then
   begin
     if not Assigned(FAgent) or not Assigned(FAgent.ActiveChat) then
@@ -4850,7 +4944,6 @@ var
   WaitShown: boolean;
   StartTick: QWord;
   Mark: TTerminalOutputMark;
-  SuppressWelcomeOutput: boolean;
   {$IFDEF WINDOWS}
   InHandle: THandle;
   InMode: DWORD = 0;
