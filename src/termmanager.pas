@@ -1896,7 +1896,12 @@ begin
       end;
     end;
     afrCancelled:
-      WriteLine('^C', True);
+    begin
+      SetColor(tcWarnBadge);
+      WriteText('[Cancelled by user]', True);
+      SetColor(tcDefault);
+      WriteLine('', True);
+    end;
     afrMaxSteps:
     begin
       SetColor(tcWarnBadge);
@@ -5130,7 +5135,7 @@ begin
                 if not CancelledShown and CheckAndConsumeCancel then
                 begin
                   FAgent.Cancel;
-                  WriteLine('^C (cancelling...)', True);
+                  WriteLine('[cancelling...]', True);
                   CancelledShown := True;
                 end;
               end;
@@ -5494,55 +5499,20 @@ begin
   end;
 end;
 
-// Consumes Esc or Ctrl+C from any position in the input queue
+// Consumes Esc or Ctrl+C without removing pending keyboard input
 function CheckAndConsumeCancel: boolean;
 var
-  Handle: THandle;
-  Events: array of INPUT_RECORD = nil;
-  NumEvents: DWORD = 0;
-  NumRead: DWORD = 0;
-  I, CancelIdx: integer;
-
-// Returns True when event is Esc or Ctrl+C keydown
-  function IsCancelEvent(const AR: INPUT_RECORD): boolean;
-  begin
-    Result := False;
-    if AR.EventType <> KEY_EVENT then
-      Exit;
-    if not AR.Event.KeyEvent.bKeyDown then
-      Exit;
-    if AR.Event.KeyEvent.wVirtualKeyCode = VK_ESCAPE then
-      Exit(True);
-    if (AR.Event.KeyEvent.wVirtualKeyCode = VK_C) and ((AR.Event.KeyEvent.dwControlKeyState and
-      (LEFT_CTRL_PRESSED or RIGHT_CTRL_PRESSED)) <> 0) then
-      Exit(True);
-  end;
-
+  EscPressed, CtrlPressed, CPressed: boolean;
 begin
   Result := False;
-  Handle := GetStdHandle(STD_INPUT_HANDLE);
-  if not GetNumberOfConsoleInputEvents(Handle, NumEvents) then
-    Exit;
-  if NumEvents = 0 then
-    Exit;
-  SetLength(Events, NumEvents);
-  NumRead := 0;
-  // Peek all pending events without consuming them
-  if not PeekConsoleInput(Handle, Events[0], NumEvents, NumRead) then
-    Exit;
-  // Search for a cancel key anywhere in the queue
-  CancelIdx := -1;
-  for I := 0 to NumRead - 1 do
-    if IsCancelEvent(Events[I]) then
-    begin
-      CancelIdx := I;
-      Break;
-    end;
-  if CancelIdx < 0 then
-    Exit;
-  // Consume all events up to and including the cancel key
-  ReadConsoleInput(Handle, Events[0], CancelIdx + 1, NumRead);
-  Result := True;
+
+  // Detect Esc and Ctrl+C without touching the console input queue
+  EscPressed := (GetAsyncKeyState(VK_ESCAPE) and $0001) <> 0;
+  CtrlPressed := (GetAsyncKeyState(VK_LCONTROL) and $8000 <> 0) or
+    (GetAsyncKeyState(VK_RCONTROL) and $8000 <> 0);
+  CPressed := (GetAsyncKeyState(Ord('C')) and $0001) <> 0;
+
+  Result := EscPressed or (CtrlPressed and CPressed);
 end;
 
 // Hides console cursor, used to suppress flicker during redraw
