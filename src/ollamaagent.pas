@@ -222,16 +222,11 @@ type
     FFinalAnswer: string;
     FRunStats: TAgentRunStats;
     FRunStartTick: QWord;
-    // When True, the agent logs every step and event to stderr
-    FLog: boolean;
-    // When True, tool result previews are emitted through the log channel
-    FLogToolResult: boolean;
-    // Host handler for log lines, nil falls back to stderr
-    FOnLog: TAgentLogEvent;
-    // Prompt plus generated tokens reported by the last step
-    FContextUsed: integer;
-    // Configured context window size in tokens, 0 when unknown
-    FContextTotal: integer;
+    FLog: boolean; // When True, the agent logs every step and event to stderr
+    FLogToolResult: boolean; // When True, tool result previews are emitted through the log channel
+    FOnLog: TAgentLogEvent; // Host handler for log lines, nil falls back to stderr
+    FContextUsed: integer; // Prompt plus generated tokens reported by the last step
+    FContextTotal: integer; // Configured context window size in tokens, 0 when unknown
     FOnContextUsage: TAgentContextUsageEvent;
     FOnRoute: TAgentRouteEvent;
     FOnChunk: TAgentChunkEvent;
@@ -241,20 +236,13 @@ type
     FOnExecCommand: TAgentExecCommandEvent;
     FOnAskUser: TAgentAskUserEvent;
     FOnFinish: TAgentFinishEvent;
-    // Optional context prepended to the next user message, cleared after use
-    FContextPrelude: string;
-    // Cached capabilities per model name, "1" means tools supported
-    FCapabilitiesCache: TStringList;
-    // Shell executable that runs exec_command, empty falls back to platform default
-    FExecShellInfo: string;
-    // Load workspace root AGENTS.md into the system prompt
-    FLoadAgentsMd: boolean;
-    // File name for project instruction files, standard is AGENTS.md
-    FAgentsFileName: string;
-    // Allow file tools to reach any path on the system, disable to sandbox to RootPath
-    FAllowAccessToSystem: boolean;
-    // Reject access to well-known secret files like .ssh/, .env, *.key
-    FBlockSensitiveFiles: boolean;
+    FContextPrelude: string; // Optional context prepended to the next user message, cleared after use
+    FCapabilitiesCache: TStringList; // Cached capabilities per model name, "1" means tools supported
+    FExecShellInfo: string; // Shell executable that runs exec_command, empty falls back to platform default
+    FLoadAgentsMd: boolean; // Load workspace root AGENTS.md into the system prompt
+    FAgentsFileName: string; // File name for project instruction files, standard is AGENTS.md
+    FAllowAccessToSystem: boolean; // Allow file tools to reach any path on the system, disable to sandbox to RootPath
+    FBlockSensitiveFiles: boolean; // Reject access to well-known secret files like .ssh/, .env, *.key
     FToolPathAliases: TStringList;
     procedure SetToolPathAliases(const AValue: TStringList);
     procedure SetOllamaManager(const AValue: TOllamaManager);
@@ -400,7 +388,6 @@ type
 
     property Done: boolean read FDone;
     property FinalAnswer: string read FFinalAnswer;
-    // Statistics of the most recent agent run
     property RunStats: TAgentRunStats read FRunStats;
     property ContextPrelude: string read FContextPrelude write FContextPrelude;
     property ExecShellInfo: string read FExecShellInfo write FExecShellInfo;

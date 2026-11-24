@@ -170,45 +170,31 @@ type
     FPath: string;
     FPrompt: string;
     FStartupPrompt: string;
-
     FWelcome: TCaption;
-    // Label printed before agent thinking block, followed by a newline
-    FThinkingLabel: TCaption;
-    // When False only the label is printed, thinking text is suppressed
-    FShowThinking: boolean;
+    FThinkingLabel: TCaption; // Label printed before agent thinking block, followed by a newline
+    FShowThinking: boolean; // When False only the label is printed, thinking text is suppressed
     FShowAgentStats: boolean;
     FAgentStatsFormat: string;
-    // Label printed on its own line before a tool call, {name} and {args} placeholders
-    FToolCallLabel: TCaption;
-    // True when last written char was CR or LF, used to keep prompt on fresh line
-    FLastCharWasNewLine: boolean;
-    // Remove emoji and symbol chars that console fonts cannot render
-    FStripEmoji: boolean;
-    // Colorize badges and thinking text when console supports attributes
-    FColorOutput: boolean;
-    // Semantic color palette for output
-    FColors: TTermColorScheme;
-    // Label used in the {info} badge when no model is selected
-    FDefaultModelLabel: TCaption;
+    FToolCallLabel: TCaption; // Label printed on its own line before a tool call, {name} and {args} placeholders
+    FLastCharWasNewLine: boolean; // True when last written char was CR or LF, used to keep prompt on fresh line
+    FStripEmoji: boolean; // Remove emoji and symbol chars that console fonts cannot render
+    FColorOutput: boolean; // Colorize badges and thinking text when console supports attributes
+    FColors: TTermColorScheme; // Semantic color palette for output
+    FDefaultModelLabel: TCaption; // Label used in the {info} badge when no model is selected
     FBuiltinCommands: TStringList;
     FHistory: TStringList;
     FHistoryMax: integer;
     FShellExec: string;
     FCommandTimeout: integer;
-    // Maximum captured bytes from agent exec_command, truncated with notice
-    FMaxCaptureBytes: integer;
-    // Timeout in milliseconds for agent exec_command, zero means no limit
-    FAgentCommandTimeout: integer;
+    FMaxCaptureBytes: integer; // Maximum captured bytes from agent exec_command, truncated with notice
+    FAgentCommandTimeout: integer; // Timeout in milliseconds for agent exec_command, zero means no limit
     FUsePrefixes: boolean;
     FSearchPath: boolean;
     FRunning: boolean;
     FLastExitCode: integer;
-    // Attached agent used to answer agent-classified input
-    FAgent: TCustomOllamaAgent;
-    // Prevents restored output from being recorded again
-    FRestoringChat: boolean;
-    // Previous agent handlers, restored when agent is detached
-    FPrevAgentOnChunk: TAgentChunkEvent;
+    FAgent: TCustomOllamaAgent; // Attached agent used to answer agent-classified input
+    FRestoringChat: boolean; // Prevents restored output from being recorded again
+    FPrevAgentOnChunk: TAgentChunkEvent; // Previous agent handlers, restored when agent is detached
     FPrevAgentOnLog: TAgentLogEvent;
     FPrevAgentOnContextUsage: TAgentContextUsageEvent;
     FPrevAgentOnThinking: TAgentThinkingEvent;
@@ -217,24 +203,15 @@ type
     FPrevAgentOnFinish: TAgentFinishEvent;
     FPrevAgentOnExecCommand: TAgentExecCommandEvent;
     FPrevAgentOnAskUser: TAgentAskUserEvent;
-    // True while writing agent thinking before the first content chunk
-    FInThinking: boolean;
-    // Set to True when the model produced its first chunk of any kind
-    FFirstChunkSeen: boolean;
-    // Set to True when the model called the finish tool
-    FFinishToolCalled: boolean;
-    // Shown when the agent is slow but the server is reachable
-    FWaitSlowHint: TCaption;
-    // Shown when the agent is slow and the server is unreachable
-    FWaitServerDownHint: TCaption;
-    // Delay in ms before checking server reachability, zero disables the check
-    FWaitCheckDelayMs: integer;
-    // Shell history sharing options for the agent context prelude
-    FShellHistory: TAgentShellHistory;
-    // Log entries encoded as "C\x01cmd\x01output" or "E\x01cmd\x01output"
-    FShellLog: TStringList;
-    // True while collecting output of the current command
-    FCapturing: boolean;
+    FInThinking: boolean; // True while writing agent thinking before the first content chunk
+    FFirstChunkSeen: boolean; // Set to True when the model produced its first chunk of any kind
+    FFinishToolCalled: boolean; // Set to True when the model called the finish tool
+    FWaitSlowHint: TCaption; // Shown when the agent is slow but the server is reachable
+    FWaitServerDownHint: TCaption; // Shown when the agent is slow and the server is unreachable
+    FWaitCheckDelayMs: integer; // Delay in ms before checking server reachability, zero disables the check
+    FShellHistory: TAgentShellHistory; // Shell history sharing options for the agent context prelude
+    FShellLog: TStringList; // Log entries encoded as "C\x01cmd\x01output" or "E\x01cmd\x01output"
+    FCapturing: boolean; // True while collecting output of the current command
     FCaptureCommand: string;
     FCaptureOutput: string;
     FCaptureError: boolean;
@@ -261,10 +238,8 @@ type
     FDefaultConsoleAttr: Word;
     FDefaultConsoleAttrCaptured: boolean;
     {$ENDIF}
-    // Holds an incomplete Markdown line between streamed chunks
-    FMarkdownPending: string;
-    // True while the response is inside a fenced code block
-    FMarkdownFencedCode: boolean;
+    FMarkdownPending: string; // Holds an incomplete Markdown line between streamed chunks
+    FMarkdownFencedCode: boolean; // True while the response is inside a fenced code block
     FMarkdownFenceChar: char;
     // Updates the native terminal window title with the current directory
     procedure UpdateConsoleTitle;
@@ -539,6 +514,7 @@ type
 procedure ClearScreen; forward;
 function CheckAndConsumeCancel: boolean; forward;
 {$IFDEF WINDOWS}
+procedure ClearCancelKeyState; forward;
 procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString); forward;
 {$ENDIF}
 
@@ -1889,6 +1865,7 @@ begin
         Summary := StringReplace(Summary, '{answer_count}', IntToStr(Stats.AnswerCount), [rfReplaceAll]);
         Summary := StringReplace(Summary, '{answer_duration}', FormatElapsed(Stats.AnswerMs), [rfReplaceAll]);
 
+        WriteLine('', False);
         SetColor(tcAgentDone);
         WriteText(Summary, False);
         SetColor(tcDefault);
@@ -2208,15 +2185,13 @@ begin
     Exit;
   try
     if FStripEmoji then
-      Sanitized := StripEmojiChars(AText)
+      Sanitized := StripEmojiChars(AText).NormalizeTerminalText
     else
       Sanitized := AText;
   except
     // Strip may fail on malformed UTF-8, fall back to raw text
     Sanitized := AText;
   end;
-
-  Sanitized := Sanitized.NormalizeTerminalText;
 
   AppendChatOutput(Sanitized);
   Utf8 := UTF8Encode(Sanitized);
@@ -5113,6 +5088,7 @@ begin
             FAgent.OnContextUsage := @HandleAgentContextUsage;
             try
               FFirstChunkSeen := False;
+              ClearCancelKeyState;
               FAgent.RunAsync(Payload);
               // Pump events and watch for Esc so user can cancel
               StartTick := GetTickCount64;
@@ -5396,6 +5372,15 @@ begin
   {$ENDIF}
 
   SetColor(tcDefault);
+end;
+
+// Clears pending cancellation key states before starting a monitored operation
+procedure ClearCancelKeyState;
+begin
+  GetAsyncKeyState(VK_ESCAPE);
+  GetAsyncKeyState(Ord('C'));
+  GetAsyncKeyState(VK_LCONTROL);
+  GetAsyncKeyState(VK_RCONTROL);
 end;
 
 // Writes UTF-8 bytes directly to handle bypassing codepage conversion
