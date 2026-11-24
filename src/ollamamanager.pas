@@ -11,8 +11,8 @@ unit OllamaManager;
 interface
 
 uses
-  Classes, SysUtils, Forms, Controls, Menus, Dialogs, ExtCtrls, fpjson, jsonparser,
-  Network, StringHelper, httpsend, blcksock, Clipbrd;
+  Classes, SysUtils, Forms, Controls, Menus, Clipbrd, DateUtils, Dialogs, ExtCtrls, fpjson, jsonparser,
+  Network, StringHelper, httpsend, blcksock;
 
 type
   { Error kind reported by TOllamaErrorEvent }
@@ -29,7 +29,7 @@ type
     );
 
   { Toggleable sections of the popup menu }
-  TOllamaMenuSection = (msPull, msServer, msModels, msConnect);
+  TOllamaMenuSection = (msPull, msKeepAlive, msServer, msModels, msConnect);
   TOllamaMenuSections = set of TOllamaMenuSection;
 
   { Event fired when the model list is refreshed }
@@ -124,6 +124,7 @@ type
 
     // Internal state
     FInstalledModels: TStringList;
+    FInstalledDetails: TStringList; // Name=Full JSON object from /api/tags
     FRunningModels: TStringList;
     FRunningDetails: TStringList;   // Name=Full JSON object from /api/ps
     FLoadingModels: TStringList;
@@ -195,6 +196,7 @@ type
     procedure MenuReconnectClick(Sender: TObject);
     procedure MenuConnectClick(Sender: TObject);
     procedure MenuDisconnectClick(Sender: TObject);
+    procedure MenuKeepAliveClick(Sender: TObject);
 
     // Timer
     procedure ProgressTimerTick(Sender: TObject);
@@ -209,7 +211,6 @@ type
     function PullModelStream(const AModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean;
     // Applies pull progress from worker thread, must run on the main thread
     procedure UpdatePullProgress(const AModelName: string; APct: integer);
-
   protected
     procedure Loaded; override;
     procedure Notification(AComponent: TComponent; Operation: TOperation); override;
@@ -290,7 +291,8 @@ type
     property ConnectionTimeout: integer read FConnectionTimeout write FConnectionTimeout default 5000;
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 30000;
     property PullTimeout: integer read FPullTimeout write FPullTimeout default 0;
-    property MenuSections: TOllamaMenuSections read FMenuSections write SetMenuSections default [msPull, msServer, msModels, msConnect];
+    property MenuSections: TOllamaMenuSections read FMenuSections write SetMenuSections default
+      [msPull, msKeepAlive, msServer, msModels, msConnect];
     property MonitorModelState: boolean read FMonitorModelState write SetMonitorModelState default False;
     property MonitorInterval: integer read FMonitorInterval write SetMonitorInterval default 2000;
     property OnModelsRefreshed: TModelsRefreshedEvent read FOnModelsRefreshed write FOnModelsRefreshed;
@@ -387,6 +389,12 @@ resourcestring
   rsDisconnectedStatus = 'Server unavailable (click to retry)';
   rsConnectMenu = 'Connect';
   rsDisconnectMenu = 'Disconnect';
+  rsInfoModelSize = 'Model size: %s';
+  rsKeepAliveMenu = 'Keep Alive';
+  rsKeepAliveForever = 'Forever';
+  rsKeepAlive1Hour = '1 hour';
+  rsKeepAlive2Hours = '2 hours';
+  rsKeepAlive3Hours = '3 hours';
 
 const
   TAG_PULL = 1;
@@ -395,6 +403,7 @@ const
   TAG_SEPARATOR = 4;
   TAG_CONNECTION = 5;
   TAG_SERVER = 6;
+  TAG_KEEPALIVE = 7;
   MONITOR_RETRY_INTERVAL = 15000;
 
 function BytesToHuman(const B: int64): string;
@@ -604,7 +613,7 @@ begin
   FRequestTimeout := 30000;
   FModelTimeout := 300000;
   FPullTimeout := 0;
-  FMenuSections := [msPull, msServer, msModels, msConnect];
+  FMenuSections := [msPull, msKeepAlive, msServer, msModels, msConnect];
   FConnecting := False;
   FConnected := False;
   FModelsInitialized := False;
@@ -615,8 +624,11 @@ begin
   FWasConnectedAtPopup := False;
 
   FInstalledModels := TStringList.Create;
+  FInstalledDetails := TStringList.Create;
   FRunningModels := TStringList.Create;
   FRunningDetails := TStringList.Create;
+
+  FInstalledDetails.NameValueSeparator := '=';
   FLoadingModels := TStringList.Create;
   FStartingModels := TStringList.Create;
   FStartingProgress := TStringList.Create;
@@ -673,6 +685,7 @@ begin
 
   FActiveThreads.Free;
   FreeAndNil(FInstalledModels);
+  FreeAndNil(FInstalledDetails);
   FreeAndNil(FRunningModels);
   FreeAndNil(FRunningDetails);
   FreeAndNil(FLoadingModels);
@@ -1124,7 +1137,7 @@ begin
     OldRunning.Assign(FRunningModels);
 
     try
-      NewInstalled := ParseModels(TagsJson, nil);
+      NewInstalled := ParseModels(TagsJson, FInstalledDetails);
       NewRunning := ParseModels(PsJson, FRunningDetails);
 
       ModelsChanged := (FInstalledModels.Count <> NewInstalled.Count) or (FRunningModels.Count <> NewRunning.Count);
@@ -1253,6 +1266,8 @@ begin
       except
         ; // Ignore user handler exceptions
       end;
+    else
+      ;
   end;
 
   BeginConnect;
@@ -1407,7 +1422,7 @@ begin
   begin
     Item := FPopupMenu.Items[I];
     if (Item.Tag = TAG_PULL) or (Item.Tag = TAG_SERVER) or (Item.Tag = TAG_MODEL) or (Item.Tag = TAG_LOADING) or
-      (Item.Tag = TAG_SEPARATOR) or (Item.Tag = TAG_CONNECTION) then
+      (Item.Tag = TAG_SEPARATOR) or (Item.Tag = TAG_CONNECTION) or (Item.Tag = TAG_KEEPALIVE) then
       FPopupMenu.Items.Delete(I);
   end;
 end;
@@ -1444,6 +1459,44 @@ begin
       FPopupMenu.Items.Insert(InsertPos, ModelItem);
       Inc(InsertPos);
       HasContentAbove := True;
+    end;
+
+    // Keep Alive settings
+    if FConnected and (msKeepAlive in FMenuSections) then
+    begin
+      ModelItem := TMenuItem.Create(FPopupMenu);
+      ModelItem.Caption := rsKeepAliveMenu;
+      ModelItem.Tag := TAG_KEEPALIVE;
+      FPopupMenu.Items.Insert(InsertPos, ModelItem);
+      Inc(InsertPos);
+
+      SubItem := TMenuItem.Create(ModelItem);
+      SubItem.Caption := rsKeepAliveForever;
+      SubItem.Tag := -1;
+      SubItem.Checked := FKeepAlive = -1;
+      SubItem.OnClick := @MenuKeepAliveClick;
+      ModelItem.Add(SubItem);
+
+      SubItem := TMenuItem.Create(ModelItem);
+      SubItem.Caption := rsKeepAlive1Hour;
+      SubItem.Tag := 3600;
+      SubItem.Checked := FKeepAlive = 3600;
+      SubItem.OnClick := @MenuKeepAliveClick;
+      ModelItem.Add(SubItem);
+
+      SubItem := TMenuItem.Create(ModelItem);
+      SubItem.Caption := rsKeepAlive2Hours;
+      SubItem.Tag := 7200;
+      SubItem.Checked := FKeepAlive = 7200;
+      SubItem.OnClick := @MenuKeepAliveClick;
+      ModelItem.Add(SubItem);
+
+      SubItem := TMenuItem.Create(ModelItem);
+      SubItem.Caption := rsKeepAlive3Hours;
+      SubItem.Tag := 10800;
+      SubItem.Checked := FKeepAlive = 10800;
+      SubItem.OnClick := @MenuKeepAliveClick;
+      ModelItem.Add(SubItem);
     end;
 
     if FConnected then
@@ -1814,6 +1867,10 @@ var
   Details: TJSONObject;
   PsObj: TJSONObject;
   Idx, VRAMPct: integer;
+  ModelSize: int64;
+  ModelData: TJSONData;
+  FractionPos, TimeZonePos, I: integer;
+  DisplayExpiresAt: string;
   Kind: TOllamaErrorKind;
   ErrMsg: string;
   Family, ParamSize, Quant, Fmt, ModifiedAt, ExpiresAt: string;
@@ -1826,6 +1883,24 @@ begin
     if IsCloudModel(ModelName) then
       SL.Add(rsInfoCloudModel);
     SL.Add('');
+
+    // Display model size from the cached /api/tags response
+    Idx := FInstalledDetails.IndexOfName(ModelName);
+    if Idx >= 0 then
+    begin
+      ModelData := nil;
+      try
+        ModelData := GetJSON(FInstalledDetails.ValueFromIndex[Idx]);
+        if ModelData.JSONType = jtObject then
+        begin
+          ModelSize := TJSONObject(ModelData).Get('size', int64(0));
+          if ModelSize > 0 then
+            SL.Add(Format(rsInfoModelSize, [BytesToHuman(ModelSize)]));
+        end;
+      finally
+        ModelData.Free;
+      end;
+    end;
 
     // Fetch metadata from /api/show
     ShowJson := ApiPost('/api/show', Format('{"name":"%s"}', [ModelName]), Kind, ErrMsg);
@@ -1902,7 +1977,30 @@ begin
             if CtxLen > 0 then
               SL.Add(Format(rsInfoContextLength, [CtxLen]));
             if ExpiresAt <> '' then
-              SL.Add(Format(rsInfoUnloadsAt, [ExpiresAt]));
+            begin
+              // Limit fractional seconds to milliseconds for FPC compatibility
+              DisplayExpiresAt := ExpiresAt;
+              FractionPos := Pos('.', DisplayExpiresAt);
+              if FractionPos > 0 then
+              begin
+                TimeZonePos := Length(DisplayExpiresAt) + 1;
+                for I := FractionPos + 1 to Length(DisplayExpiresAt) do
+                  if (DisplayExpiresAt[I] = '+') or (DisplayExpiresAt[I] = '-') or (DisplayExpiresAt[I] = 'Z') then
+                  begin
+                    TimeZonePos := I;
+                    Break;
+                  end;
+
+                if TimeZonePos - FractionPos - 1 > 3 then
+                  DisplayExpiresAt :=
+                    Copy(DisplayExpiresAt, 1, FractionPos + 3) + Copy(DisplayExpiresAt, TimeZonePos, MaxInt);
+              end;
+
+              if Copy(ExpiresAt, 1, 4) = '2319' then
+                SL.Add(Format(rsInfoUnloadsAt, [rsKeepAliveForever]))
+              else
+                SL.Add(Format(rsInfoUnloadsAt, [DateTimeToStr(ISO8601ToDate(DisplayExpiresAt, False))]));
+            end;
             Found := True;
           end;
         except
@@ -2235,6 +2333,15 @@ end;
 procedure TCustomOllamaManager.MenuDisconnectClick(Sender: TObject);
 begin
   SetActive(False);
+end;
+
+procedure TCustomOllamaManager.MenuKeepAliveClick(Sender: TObject);
+var
+  Item: TMenuItem;
+begin
+  Item := TMenuItem(Sender);
+  FKeepAlive := Item.Tag;
+  BuildPopupMenu;
 end;
 
 procedure TCustomOllamaManager.PullModel(const ModelName: string);
