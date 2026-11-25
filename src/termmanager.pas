@@ -5542,6 +5542,13 @@ var
 begin
   Result := False;
 
+  // Ignore cancellation keys while another window is active
+  if GetForegroundWindow <> GetConsoleWindow then
+  begin
+    ClearCancelKeyState;
+    Exit;
+  end;
+
   // Detect Esc and Ctrl+C without touching the console input queue
   EscPressed := (GetAsyncKeyState(VK_ESCAPE) and $0001) <> 0;
   CtrlPressed := (GetAsyncKeyState(VK_LCONTROL) and $8000 <> 0) or
