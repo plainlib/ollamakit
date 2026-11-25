@@ -3912,7 +3912,9 @@ begin
   Result := False;
   Rec:=Default(INPUT_RECORD);
 
-  Write('Delete chat "' + AChatName + '"? [y/N]: ');
+  SetColor(tcWarnBadge);
+  DoOutput(LineEnding + 'Delete chat "' + AChatName + '"? [y/N]: ', False);
+  SetColor(tcDefault);
   Flush(Output);
 
   Handle := GetStdHandle(STD_INPUT_HANDLE);
@@ -5577,6 +5579,7 @@ var
   N: DWORD = 0;
   Line, PromptText: rawbytestring;
   CursorPos, HistIndex, PromptRow, PromptCol: integer;
+  WasAtStart: boolean;
   ScreenInfo: TConsoleScreenBufferInfo;
   C: widechar;
   Wide: unicodestring;
@@ -6495,242 +6498,264 @@ begin
 
     case Rec.Event.KeyEvent.wVirtualKeyCode of
       VK_RETURN:
-      begin
-        IsModifier := ShiftPressed or CtrlPressed;
-        HasMore := False;
-        if not IsModifier then
         begin
-          while PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) do
+          IsModifier := ShiftPressed or CtrlPressed;
+          HasMore := False;
+          if not IsModifier then
           begin
-            if (NextRec.EventType = KEY_EVENT) and NextRec.Event.KeyEvent.bKeyDown then
+            while PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) do
             begin
-              HasMore := True;
-              Break;
+              if (NextRec.EventType = KEY_EVENT) and NextRec.Event.KeyEvent.bKeyDown then
+              begin
+                HasMore := True;
+                Break;
+              end;
+              if not ReadConsoleInput(Handle, NextRec, 1, N) then
+                Break;
             end;
-            if not ReadConsoleInput(Handle, NextRec, 1, N) then
-              Break;
+          end
+          else
+          begin
+            if PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) then
+              if (NextRec.EventType = KEY_EVENT) and (NextRec.Event.KeyEvent.wVirtualKeyCode = VK_RETURN) and
+                (not NextRec.Event.KeyEvent.bKeyDown) then
+                ReadConsoleInput(Handle, NextRec, 1, N);
           end;
-        end
-        else
-        begin
-          if PeekConsoleInput(Handle, NextRec, 1, N) and (N > 0) then
-            if (NextRec.EventType = KEY_EVENT) and (NextRec.Event.KeyEvent.wVirtualKeyCode = VK_RETURN) and
-              (not NextRec.Event.KeyEvent.bKeyDown) then
-              ReadConsoleInput(Handle, NextRec, 1, N);
+          if IsModifier or HasMore then
+          begin
+            // Replace selection and insert the line ending at the cursor
+            if HasSelection then
+            begin
+              Delete(Line, SelStart + 1, SelEnd - SelStart);
+              CursorPos := SelStart;
+              ClearSelection;
+            end;
+
+            Insert(LineEnding, Line, CursorPos + 1);
+            Inc(CursorPos, Length(LineEnding));
+          end
+          else
+          begin
+            // Move below all visual rows occupied by the input
+            ConGotoXY(1, PromptRow + LastRedrawRows);
+            ForceConsoleRedraw;
+            FLastCharWasNewLine := True;
+            Break;
+          end;
         end;
-        if IsModifier or HasMore then
+      VK_BACK:
         begin
-          // Replace selection and insert the line ending at the cursor
+          // Remove the previous input and its result with Ctrl+Backspace
+          if CtrlPressed and RemoveLastInput then
+          begin
+            if not FLastInputScreenCleared then
+              RestoreActiveChat
+            else
+              ScrollOutput(2);
+
+            ResetInput;
+            Continue;
+          end;
+
           if HasSelection then
           begin
             Delete(Line, SelStart + 1, SelEnd - SelStart);
             CursorPos := SelStart;
             ClearSelection;
-          end;
-
-          Insert(LineEnding, Line, CursorPos + 1);
-          Inc(CursorPos, Length(LineEnding));
-        end
-        else
-        begin
-          // Move below all visual rows occupied by the input
-          ConGotoXY(1, PromptRow + LastRedrawRows);
-          ForceConsoleRedraw;
-          FLastCharWasNewLine := True;
-          Break;
-        end;
-      end;
-      VK_BACK:
-      begin
-        // Remove the previous input and its result with Ctrl+Backspace
-        if CtrlPressed and RemoveLastInput then
-        begin
-          if not FLastInputScreenCleared then
-            RestoreActiveChat
-          else
-            ScrollOutput(2);
-
-          ResetInput;
-          Continue;
-        end;
-
-        if HasSelection then
-        begin
-          Delete(Line, SelStart + 1, SelEnd - SelStart);
-          CursorPos := SelStart;
-          ClearSelection;
-        end
-        else if CursorPos > 0 then
-        begin
-          if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
-          begin
-            Dec(CursorPos, 2);
-            Delete(Line, CursorPos + 1, 2);
           end
-          else
+          else if CursorPos > 0 then
           begin
-            CursorPos := Utf8PrevPos(Line, CursorPos);
-            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+            if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
+            begin
+              Dec(CursorPos, 2);
+              Delete(Line, CursorPos + 1, 2);
+            end
+            else
+            begin
+              CursorPos := Utf8PrevPos(Line, CursorPos);
+              Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
+            end;
           end;
         end;
-      end;
       VK_DELETE:
-      begin
-        if HasSelection then
         begin
-          Delete(Line, SelStart + 1, SelEnd - SelStart);
-          CursorPos := SelStart;
-          ClearSelection;
-        end
-        else if CtrlPressed and (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
-        begin
-          FHistory.Delete(HistIndex);
-
-          // Synchronize the active chat terminal history
-          if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+          if HasSelection then
           begin
-            FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
-            FAgent.ActiveChat.MarkSessionActive;
+            Delete(Line, SelStart + 1, SelEnd - SelStart);
+            CursorPos := SelStart;
+            ClearSelection;
+          end
+          else if CtrlPressed and (HistIndex >= 0) and (HistIndex < FHistory.Count) and (Line = FHistory[HistIndex]) then
+          begin
+            FHistory.Delete(HistIndex);
+
+            // Synchronize the active chat terminal history
+            if Assigned(FAgent) and Assigned(FAgent.ActiveChat) then
+            begin
+              FAgent.ActiveChat.TerminalHistory.Assign(FHistory);
+              FAgent.ActiveChat.MarkSessionActive;
+            end;
+
+            if HistIndex > 0 then
+              Dec(HistIndex);
+            if FHistory.Count = 0 then
+            begin
+              Line := '';
+              CursorPos := 0;
+              HistIndex := 0;
+            end
+            else
+            begin
+              if HistIndex >= FHistory.Count then
+                HistIndex := FHistory.Count - 1;
+              Line := FHistory[HistIndex];
+              SetCodePage(Line, CP_UTF8, False);
+              CursorPos := Length(Line);
+            end;
+          end
+          else if CursorPos < Length(Line) then
+          begin
+            if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and (Line[CursorPos + 2] = #10) then
+              Delete(Line, CursorPos + 1, 2)
+            else
+              Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
           end;
-
-          if HistIndex > 0 then
-            Dec(HistIndex);
-          if FHistory.Count = 0 then
+        end;
+      VK_LEFT:
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          if CursorPos > 0 then
           begin
-            Line := '';
-            CursorPos := 0;
-            HistIndex := 0;
+            if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
+              Dec(CursorPos, 2)
+            else
+              CursorPos := Utf8PrevPos(Line, CursorPos);
+          end;
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      VK_RIGHT:
+        begin
+          if ShiftPressed and not HasSelection then
+            SelAnchor := CursorPos
+          else if not ShiftPressed then
+            ClearSelection;
+          // Utf8NextPos returns 1-based next char start, subtract 1 for byte count
+          if CursorPos < Length(Line) then
+          begin
+            if (CursorPos + 2 <= Length(Line)) and (Line[CursorPos + 1] = #13) and (Line[CursorPos + 2] = #10) then
+              Inc(CursorPos, 2)
+            else
+              CursorPos := Utf8NextPos(Line, CursorPos + 1) - 1;
+          end;
+          if ShiftPressed then
+            UpdateSelection;
+        end;
+      VK_PRIOR:
+        begin
+          if AltPressed and not CtrlPressed then
+            NavigateMessage(-1)
+          else if ShiftPressed and not CtrlPressed then
+            ScrollOutput(-3)
+          else
+            ScrollOutput(-1);
+          Continue;
+        end;
+      VK_NEXT:
+        begin
+          if AltPressed and not CtrlPressed then
+            NavigateMessage(1)
+          else if ShiftPressed and not CtrlPressed then
+            ScrollOutput(3)
+          else
+            ScrollOutput(1);
+          Continue;
+        end;
+      VK_HOME:
+        begin
+          if CtrlPressed then
+            PositionInputCursor(False)
+          else if Line = string.Empty then
+          begin
+            ScrollOutput(-2);
+            Continue;
           end
           else
           begin
-            if HistIndex >= FHistory.Count then
-              HistIndex := FHistory.Count - 1;
-            Line := FHistory[HistIndex];
-            SetCodePage(Line, CP_UTF8, False);
-            CursorPos := Length(Line);
+            if ShiftPressed and not HasSelection then
+              SelAnchor := CursorPos
+            else if not ShiftPressed then
+              ClearSelection;
+            // Jump to start of the current logical line, not the buffer
+            CursorPos := FindLineStart(CursorPos);
+            if ShiftPressed then
+              UpdateSelection;
           end;
-        end
-        else if CursorPos < Length(Line) then
-        begin
-          if (Line[CursorPos + 1] = #13) and (CursorPos + 1 < Length(Line)) and (Line[CursorPos + 2] = #10) then
-            Delete(Line, CursorPos + 1, 2)
-          else
-            Delete(Line, CursorPos + 1, Utf8NextPos(Line, CursorPos + 1) - CursorPos - 1);
         end;
-      end;
-      VK_LEFT:
-      begin
-        if ShiftPressed and not HasSelection then
-          SelAnchor := CursorPos
-        else if not ShiftPressed then
-          ClearSelection;
-        if CursorPos > 0 then
-        begin
-          if (CursorPos >= 2) and (Line[CursorPos] = #10) and (Line[CursorPos - 1] = #13) then
-            Dec(CursorPos, 2)
-          else
-            CursorPos := Utf8PrevPos(Line, CursorPos);
-        end;
-        if ShiftPressed then
-          UpdateSelection;
-      end;
-      VK_RIGHT:
-      begin
-        if ShiftPressed and not HasSelection then
-          SelAnchor := CursorPos
-        else if not ShiftPressed then
-          ClearSelection;
-        // Utf8NextPos returns 1-based next char start, subtract 1 for byte count
-        if CursorPos < Length(Line) then
-        begin
-          if (CursorPos + 2 <= Length(Line)) and (Line[CursorPos + 1] = #13) and (Line[CursorPos + 2] = #10) then
-            Inc(CursorPos, 2)
-          else
-            CursorPos := Utf8NextPos(Line, CursorPos + 1) - 1;
-        end;
-        if ShiftPressed then
-          UpdateSelection;
-      end;
-      VK_PRIOR:
-      begin
-        if AltPressed and not CtrlPressed then
-          NavigateMessage(-1)
-        else if ShiftPressed and not CtrlPressed then
-          ScrollOutput(-3)
-        else
-          ScrollOutput(-1);
-        Continue;
-      end;
-      VK_NEXT:
-      begin
-        if AltPressed and not CtrlPressed then
-          NavigateMessage(1)
-        else if ShiftPressed and not CtrlPressed then
-          ScrollOutput(3)
-        else
-          ScrollOutput(1);
-        Continue;
-      end;
-      VK_HOME:
-      begin
-        if CtrlPressed then
-          PositionInputCursor(False)
-        else if Line = string.Empty then
-        begin
-          ScrollOutput(-2);
-          Continue;
-        end
-        else
-        begin
-          if ShiftPressed and not HasSelection then
-            SelAnchor := CursorPos
-          else if not ShiftPressed then
-            ClearSelection;
-          // Jump to start of the current logical line, not the buffer
-          CursorPos := FindLineStart(CursorPos);
-          if ShiftPressed then
-            UpdateSelection;
-        end;
-      end;
       VK_END:
-      begin
-        if CtrlPressed then
-          PositionInputCursor(True)
-        else if Line = string.Empty then
         begin
-          ScrollOutput(2);
-          Continue;
-        end
-        else
-        begin
-          if ShiftPressed and not HasSelection then
-            SelAnchor := CursorPos
-          else if not ShiftPressed then
-            ClearSelection;
-          // Jump to end of the current logical line, not the buffer
-          CursorPos := FindLineEnd(CursorPos);
-          if ShiftPressed then
-            UpdateSelection;
+          if CtrlPressed then
+            PositionInputCursor(True)
+          else if Line = string.Empty then
+          begin
+            ScrollOutput(2);
+            Continue;
+          end
+          else
+          begin
+            if ShiftPressed and not HasSelection then
+              SelAnchor := CursorPos
+            else if not ShiftPressed then
+              ClearSelection;
+            // Jump to end of the current logical line, not the buffer
+            CursorPos := FindLineEnd(CursorPos);
+            if ShiftPressed then
+              UpdateSelection;
+          end;
         end;
-      end;
       VK_UP:
         if CtrlPressed and ShiftPressed then
         begin
           if FHistory.Count > 0 then
           begin
+            WasAtStart := (Line <> string.Empty) and (CursorPos = 0);
+
+            // Preserve edited history entry before jumping to the beginning
+            if (HistIndex >= 0) and (HistIndex < FHistory.Count) and
+              (Line <> FHistory[HistIndex]) then
+              AddToHistory(Line);
+
             HistIndex := 0;
             Line := FHistory[HistIndex];
             SetCodePage(Line, CP_UTF8, False);
-            PositionInputCursor(False);
+
+            if WasAtStart then
+              PositionInputCursor(False)
+            else
+              CursorPos := Length(Line);
           end;
         end
         else if CtrlPressed then
         begin
+          WasAtStart := (Line <> string.Empty) and (CursorPos = 0);
+
           if HistIndex = FHistory.Count then
           begin
-            if Line <> '' then
+            if Line <> string.Empty then
               AddToHistory(Line);
             HistIndex := FHistory.Count - 1;
+          end
+          else if (HistIndex >= 0) and (HistIndex < FHistory.Count) and
+            (Line <> FHistory[HistIndex]) then
+          begin
+            // Add edited entry as the newest history item
+            AddToHistory(Line);
+            HistIndex := FHistory.Count - 1;
+            if HistIndex > 0 then
+              Dec(HistIndex);
           end
           else if HistIndex > 0 then
             Dec(HistIndex);
@@ -6739,7 +6764,11 @@ begin
           begin
             Line := FHistory[HistIndex];
             SetCodePage(Line, CP_UTF8, False);
-            PositionInputCursor(False);
+
+            if WasAtStart then
+              PositionInputCursor(False)
+            else
+              CursorPos := Length(Line);
           end;
         end
         else
@@ -6750,28 +6779,46 @@ begin
             HasMore := MoveCursorWrapped(-1)
           else
             HasMore := MoveCursorVertical(-1);
+
           if not HasMore then
           begin
+            WasAtStart := (Line <> string.Empty) and (CursorPos = 0);
+
             if HistIndex = FHistory.Count then
             begin
               // Save current live input so it can be recovered via VK_DOWN
-              if Line <> '' then
+              if Line <> string.Empty then
               begin
                 AddToHistory(Line);
                 HistIndex := FHistory.Count - 2;
               end
               else
                 HistIndex := FHistory.Count - 1;
+
               if HistIndex < 0 then
                 HistIndex := 0;
             end
+            else if (HistIndex >= 0) and (HistIndex < FHistory.Count) and
+              (Line <> FHistory[HistIndex]) then
+            begin
+              // Add edited entry as the newest history item
+              AddToHistory(Line);
+              HistIndex := FHistory.Count - 1;
+              if HistIndex > 0 then
+                Dec(HistIndex);
+            end
             else if HistIndex > 0 then
               Dec(HistIndex);
+
             if (HistIndex >= 0) and (HistIndex < FHistory.Count) then
             begin
               Line := FHistory[HistIndex];
               SetCodePage(Line, CP_UTF8, False);
-              PositionInputCursor(False);
+
+              if WasAtStart then
+                PositionInputCursor(False)
+              else
+                CursorPos := Length(Line);
             end;
           end;
         end;
@@ -6780,7 +6827,16 @@ begin
         begin
           if FHistory.Count > 0 then
           begin
-            HistIndex := FHistory.Count - 1;
+            // Preserve edited entry and stay on it
+            if (HistIndex >= 0) and (HistIndex < FHistory.Count) and
+              (Line <> FHistory[HistIndex]) then
+            begin
+              AddToHistory(Line);
+              HistIndex := FHistory.Count - 1;
+            end
+            else
+              HistIndex := FHistory.Count - 1;
+
             Line := FHistory[HistIndex];
             SetCodePage(Line, CP_UTF8, False);
             PositionInputCursor(True);
@@ -6788,7 +6844,17 @@ begin
         end
         else if CtrlPressed then
         begin
-          if HistIndex < FHistory.Count - 1 then
+          // Preserve edited entry and stay on it
+          if (HistIndex >= 0) and (HistIndex < FHistory.Count) and
+            (Line <> FHistory[HistIndex]) then
+          begin
+            AddToHistory(Line);
+            HistIndex := FHistory.Count - 1;
+            Line := FHistory[HistIndex];
+            SetCodePage(Line, CP_UTF8, False);
+            CursorPos := Length(Line);
+          end
+          else if HistIndex < FHistory.Count - 1 then
           begin
             Inc(HistIndex);
             Line := FHistory[HistIndex];
@@ -6798,7 +6864,7 @@ begin
           else if HistIndex = FHistory.Count - 1 then
           begin
             HistIndex := FHistory.Count;
-            Line := '';
+            Line := string.Empty;
             CursorPos := 0;
           end;
         end
@@ -6810,9 +6876,20 @@ begin
             HasMore := MoveCursorWrapped(1)
           else
             HasMore := MoveCursorVertical(1);
+
           if not HasMore then
           begin
-            if HistIndex < FHistory.Count - 1 then
+            // Preserve edited entry and stay on it
+            if (HistIndex >= 0) and (HistIndex < FHistory.Count) and
+              (Line <> FHistory[HistIndex]) then
+            begin
+              AddToHistory(Line);
+              HistIndex := FHistory.Count - 1;
+              Line := FHistory[HistIndex];
+              SetCodePage(Line, CP_UTF8, False);
+              PositionInputCursor(True);
+            end
+            else if HistIndex < FHistory.Count - 1 then
             begin
               Inc(HistIndex);
               Line := FHistory[HistIndex];
@@ -6822,17 +6899,17 @@ begin
             else if HistIndex = FHistory.Count - 1 then
             begin
               HistIndex := FHistory.Count;
-              Line := '';
+              Line := string.Empty;
               CursorPos := 0;
             end;
           end;
         end;
       VK_ESCAPE:
-      begin
-        Line := '';
-        CursorPos := 0;
-        ClearSelection;
-      end;
+        begin
+          Line := '';
+          CursorPos := 0;
+          ClearSelection;
+        end;
       VK_N:
         if CtrlPressed then
         begin
