@@ -6106,6 +6106,126 @@ var
     Result := True;
   end;
 
+    // Moves cursor between visual lines, including explicit and automatic wrapping
+  function MoveCursorVisual(ADelta: integer): boolean;
+  type
+    TVisualRow = record
+      StartPos: integer;
+      EndPos: integer;
+      StartCol: integer;
+    end;
+    TVisualRows = array of TVisualRow;
+  var
+    Info: TConsoleScreenBufferInfo;
+    Rows: TVisualRows;
+    I, NextPos, Width, Col, RowIndex, CurrentCol: integer;
+    TargetCol, TargetPos, TargetCharCount, CharCount: integer;
+    RowCount: integer;
+  begin
+    Result := False;
+    if (Length(Line) = 0) or (ADelta = 0) then
+      Exit;
+
+    Rows := Default(TVisualRows);
+    Info := Default(TConsoleScreenBufferInfo);
+    if not GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+      Exit;
+
+    Width := Info.dwSize.X;
+    if Width <= 0 then
+      Exit;
+
+    // Build visual rows using UTF-8 character boundaries
+    SetLength(Rows, 1);
+    Rows[0].StartPos := 0;
+    Rows[0].EndPos := Length(Line);
+    Rows[0].StartCol := PromptCol;
+    RowCount := 1;
+    Col := PromptCol;
+    I := 1;
+
+    while I <= Length(Line) do
+    begin
+      // Handle explicit line endings
+      if Line[I] in [#10, #13] then
+      begin
+        Rows[RowCount - 1].EndPos := I - 1;
+
+        if (Line[I] = #13) and (I < Length(Line)) and (Line[I + 1] = #10) then
+          Inc(I, 2)
+        else
+          Inc(I);
+
+        SetLength(Rows, RowCount + 1);
+        Rows[RowCount].StartPos := I - 1;
+        Rows[RowCount].EndPos := Length(Line);
+        Rows[RowCount].StartCol := 0;
+        Inc(RowCount);
+        Col := 0;
+        Continue;
+      end;
+
+      NextPos := Utf8NextPos(Line, I);
+      Col := Col + 1;
+
+      // Start a new visual row when the console width is reached
+      if Col >= Width then
+      begin
+        Rows[RowCount - 1].EndPos := NextPos - 1;
+
+        SetLength(Rows, RowCount + 1);
+        Rows[RowCount].StartPos := NextPos - 1;
+        Rows[RowCount].EndPos := Length(Line);
+        Rows[RowCount].StartCol := 0;
+        Inc(RowCount);
+        Col := 0;
+      end;
+
+      I := NextPos;
+    end;
+
+    // Find the visual row containing the cursor
+    RowIndex := -1;
+    for I := 0 to RowCount - 1 do
+      if (CursorPos >= Rows[I].StartPos) and
+        (CursorPos <= Rows[I].EndPos) then
+        RowIndex := I;
+
+    if RowIndex < 0 then
+      Exit;
+
+    TargetCharCount := RowIndex + ADelta;
+    if (TargetCharCount < 0) or (TargetCharCount >= RowCount) then
+      Exit;
+
+    // Preserve the current visual column
+    CurrentCol := Rows[RowIndex].StartCol +
+      Utf8CharCount(Copy(Line, Rows[RowIndex].StartPos + 1,
+      CursorPos - Rows[RowIndex].StartPos));
+
+    TargetCol := CurrentCol - Rows[TargetCharCount].StartCol;
+    if TargetCol < 0 then
+      TargetCol := 0;
+
+    // Find the corresponding UTF-8 byte position in the target row
+    TargetPos := Rows[TargetCharCount].StartPos;
+    CharCount := 0;
+
+    while (CharCount < TargetCol) and
+      (TargetPos < Rows[TargetCharCount].EndPos) do
+    begin
+      NextPos := Utf8NextPos(Line, TargetPos + 1);
+      if NextPos - 1 > Rows[TargetCharCount].EndPos then
+        Break;
+
+      TargetPos := NextPos - 1;
+      Inc(CharCount);
+    end;
+
+    CursorPos := TargetPos;
+    Result := True;
+  end;
+
   // Inserts a UTF-8 char at the cursor, replacing the selection when active
   procedure InsertTypedChar(const AUtf8: rawbytestring);
   var
@@ -6782,11 +6902,8 @@ begin
         else
         begin
           ClearSelection;
-          // Move within visual or logical lines first, fall back to history at top
-          if Pos(LineEnding, Line) = 0 then
-            HasMore := MoveCursorWrapped(-1)
-          else
-            HasMore := MoveCursorVertical(-1);
+          // Move within visual lines first, fall back to history at top
+          HasMore := MoveCursorVisual(-1);
 
           if not HasMore then
           begin
@@ -6879,11 +6996,8 @@ begin
         else
         begin
           ClearSelection;
-          // Move within visual or logical lines first, fall back to history at bottom
-          if Pos(LineEnding, Line) = 0 then
-            HasMore := MoveCursorWrapped(1)
-          else
-            HasMore := MoveCursorVertical(1);
+          // Move within visual lines first, fall back to history at bottom
+          HasMore := MoveCursorVisual(1);
 
           if not HasMore then
           begin
