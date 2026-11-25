@@ -4670,6 +4670,10 @@ begin
       Process.Options := [poUsePipes, poNoConsole];
 
     Process.CurrentDirectory := GetEffectivePath;
+    {$IFDEF WINDOWS}
+    if not IsInteractive then
+      ClearCancelKeyState;
+    {$ENDIF}
     Process.Execute;
     StartTime := Now;
 
