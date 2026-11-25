@@ -209,6 +209,7 @@ type
     FRequestTimeout: integer;
     FFeatures: TAgentFeatures;
     FStreaming: boolean;
+    FThinkMode: TOllamaThinkMode;
     FRootPath: string;
     FTools: TAgentTools;
     FWebOptions: TAgentWebOptions;
@@ -411,6 +412,7 @@ type
     property RequestTimeout: integer read FRequestTimeout write FRequestTimeout default 0;
     property EnabledTools: TAgentFeatures read FFeatures write FFeatures default [afFileTools];
     property Streaming: boolean read FStreaming write FStreaming default True;
+    property ThinkMode: TOllamaThinkMode read FThinkMode write FThinkMode default otmDefault;
     property RootPath: string read GetRootPath write SetRootPath;
     property ToolPathAliases: TStringList read FToolPathAliases write SetToolPathAliases;
     property Tools: TAgentTools read FTools write SetTools;
@@ -445,6 +447,8 @@ type
     property RequestTimeout;
     // Enable streaming of content and thinking chunks in real time
     property Streaming;
+    // Controls model thinking behavior
+    property ThinkMode;
     // Tool groups enabled for this agent, empty means chat only
     property EnabledTools;
     // Sandbox directory for file tools, empty means process cwd
@@ -2615,10 +2619,10 @@ begin
             ChatStartTime := GetTickCount64;
             if FAgent.FStreaming then
               FinalJson := FAgent.OllamaManager.ChatStream(FAgent.ModelName, MessagesJson, ToolsJson,
-                @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg)
+                @HandleStreamChunk, @HandleThinkingChunk, Kind, ErrMsg, FAgent.FThinkMode)
             else
               FinalJson := FAgent.OllamaManager.ChatWithTools(FAgent.ModelName, MessagesJson, ToolsJson,
-                @HandleFullContent, @HandleThinkingChunk, Kind, ErrMsg);
+                @HandleFullContent, @HandleThinkingChunk, Kind, ErrMsg, FAgent.FThinkMode);
 
             if (Kind = oekNone) or FAgent.FCancelled or (Kind = oekCancelled) then
               Break;
@@ -3338,6 +3342,7 @@ begin
   FRequestTimeout := 0;
   FFeatures := [afFileTools];
   FStreaming := True;
+  FThinkMode := otmDefault;
   FRootPath := '';
   FKeepHistory := False;
   FHistory := '';

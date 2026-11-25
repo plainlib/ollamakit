@@ -37,7 +37,8 @@ function FormatModelsList(AAgent: TCustomOllamaAgent; out AError: string): strin
 implementation
 
 type
-  TAgentPropertyKind = (apkString, apkInteger, apkBoolean, apkFeatureSet, apkText, apkHostList);
+  // Supported agent property types
+  TAgentPropertyKind = (apkString, apkInteger, apkBoolean, apkFeatureSet, apkText, apkHostList, apkThinkMode);
 
   TAgentPropertyInfo = record
     Name: string;
@@ -58,7 +59,7 @@ const
     'file,files', 'execcommand,shell,command', '', 'ask', '', 'webtools'
     );
 
-  PROPERTIES: array[0..30] of TAgentPropertyInfo = (
+  PROPERTIES: array[0..31] of TAgentPropertyInfo = (
     // OllamaManager settings, saved
     (Name: 'baseurl'; Aliases: 'url,ollama.url'; Kind: apkString;
     Description: 'Ollama server URL (example: http://localhost:11434)'; Runtime: False),
@@ -90,6 +91,8 @@ const
     Description: 'Per-request timeout in ms, 0 means use manager default'; Runtime: False),
     (Name: 'streaming'; Aliases: ''; Kind: apkBoolean;
     Description: 'Stream content and thinking in real time'; Runtime: False),
+    (Name: 'think'; Aliases: 'thinkmode'; Kind: apkThinkMode;
+    Description: 'Model thinking mode: default, on, off, low, medium, high'; Runtime: False),
     (Name: 'tools'; Aliases: 'enabledtools'; Kind: apkFeatureSet;
     Description: 'Comma separated: filetools, exec, git, interactive, finish, web, all, none'; Runtime: False),
     (Name: 'rootpath'; Aliases: 'root'; Kind: apkString;
@@ -212,6 +215,44 @@ begin
     Result := 'on'
   else
     Result := 'off';
+end;
+
+// Converts thinking mode to its configuration value
+function ThinkModeToStr(AValue: TOllamaThinkMode): string;
+begin
+  case AValue of
+    otmOn: Result := 'on';
+    otmOff: Result := 'off';
+    otmLow: Result := 'low';
+    otmMedium: Result := 'medium';
+    otmHigh: Result := 'high';
+    else
+      Result := 'default';
+  end;
+end;
+
+// Parses a configuration value into a thinking mode
+function ParseThinkMode(const AValue: string; out AResult: TOllamaThinkMode): boolean;
+var
+  V: string;
+begin
+  V := LowerCase(Trim(AValue));
+  Result := True;
+
+  if V = 'default' then
+    AResult := otmDefault
+  else if V = 'on' then
+    AResult := otmOn
+  else if V = 'off' then
+    AResult := otmOff
+  else if V = 'low' then
+    AResult := otmLow
+  else if V = 'medium' then
+    AResult := otmMedium
+  else if V = 'high' then
+    AResult := otmHigh
+  else
+    Result := False;
 end;
 
 // Resolves a short tool name or alias to a feature, False when unknown
@@ -427,6 +468,7 @@ begin
       Row('maxsteps', 'iterations per run, 0 = unlimited');
       Row('timeout', 'request timeout ms, 0 = manager');
       Row('streaming', 'stream content in real time');
+      Row('think', 'default|on|off|low|medium|high');
       Row('tools', 'filetools exec git interactive finish web');
       Row('rootpath', 'sandbox directory for file tools');
       Row('keephistory', 'persist messages between runs');
@@ -699,6 +741,7 @@ begin
     else
       Add('timeout', IntToStr(AAgent.RequestTimeout));
     Add('streaming', BoolToStrValue(AAgent.Streaming));
+    Add('think', ThinkModeToStr(AAgent.ThinkMode));
     Add('tools', FormatFeatures(AAgent.EnabledTools));
     Add('keephistory', BoolToStrValue(AAgent.KeepHistory));
     Add('log', BoolToStrValue(AAgent.Log));
@@ -788,6 +831,8 @@ begin
     AValue := IntToStr(AAgent.RequestTimeout)
   else if Canonical = 'streaming' then
     AValue := BoolToStrValue(AAgent.Streaming)
+  else if Canonical = 'think' then
+    AValue := ThinkModeToStr(AAgent.ThinkMode) + ' (available: default, on, off, low, medium, high)'
   else if Canonical = 'tools' then
     AValue := FormatFeatures(AAgent.EnabledTools)
   else if Canonical = 'rootpath' then
@@ -841,6 +886,7 @@ var
   P, IntVal: integer;
   BoolVal: boolean;
   FeatVal: TAgentFeatures;
+  ThinkModeVal: TOllamaThinkMode;
   HostParts: TStringList;
 begin
   Result := False;
@@ -1028,6 +1074,15 @@ begin
       Exit;
     end;
     AAgent.Streaming := BoolVal;
+  end
+  else if Canonical = 'think' then
+  begin
+    if not ParseThinkMode(Value, ThinkModeVal) then
+    begin
+      AError := 'think must be default, on, off, low, medium or high';
+      Exit;
+    end;
+    AAgent.ThinkMode := ThinkModeVal;
   end
   else if Canonical = 'tools' then
   begin

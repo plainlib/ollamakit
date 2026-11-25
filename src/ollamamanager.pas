@@ -15,6 +15,16 @@ uses
   Network, StringHelper, httpsend, blcksock;
 
 type
+  { Model thinking modes supported by the Ollama API }
+  TOllamaThinkMode = (
+    otmDefault,
+    otmOn,
+    otmOff,
+    otmLow,
+    otmMedium,
+    otmHigh
+    );
+
   { Error kind reported by TOllamaErrorEvent }
   TOllamaErrorKind = (
     oekNone,          // no error
@@ -101,6 +111,8 @@ type
     FKeepAlive: integer;
     // num_ctx value sent with requests, 0 means use Ollama default
     FNumCtx: integer;
+    // Model thinking mode sent with requests
+    FThinkMode: TOllamaThinkMode;
     // Prompt tokens reported by the last completed request
     FLastPromptEvalCount: integer;
     // Generated tokens reported by the last completed request
@@ -178,6 +190,8 @@ type
     function GetLastUsageTotal: integer;
     // Builds optional "options" JSON fragment for num_ctx
     function BuildOptionsJson: string;
+    // Builds optional thinking JSON fragment
+    function BuildThinkJson(AThinkMode: TOllamaThinkMode): string;
     // Error reporting helper
     procedure DoError(Kind: TOllamaErrorKind; const ModelName, Msg: string);
 
@@ -240,9 +254,15 @@ type
     // Streaming chat with separate content and thinking callbacks
     function ChatStream(const ModelName, MessagesJson, ToolsJson: string; AOnContent, AOnThinking: TOllamaStreamCallback;
       out AKind: TOllamaErrorKind; out AErrorMsg: string): string; overload;
+    // Streaming chat with an explicit thinking mode
+    function ChatStream(const ModelName, MessagesJson, ToolsJson: string; AOnContent, AOnThinking: TOllamaStreamCallback;
+      out AKind: TOllamaErrorKind; out AErrorMsg: string; AThinkMode: TOllamaThinkMode): string; overload;
     // Non-streaming chat with tools, emits thinking and content once each
     function ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; AOnContent, AOnThinking: TOllamaStreamCallback;
       out AKind: TOllamaErrorKind; out AErrorMsg: string): string; overload;
+    // Non-streaming chat with an explicit thinking mode
+    function ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; AOnContent, AOnThinking: TOllamaStreamCallback;
+      out AKind: TOllamaErrorKind; out AErrorMsg: string; AThinkMode: TOllamaThinkMode): string; overload;
     // Non-streaming chat with tools, returns tool_calls only
     function ChatWithTools(const ModelName, MessagesJson, ToolsJson: string; out AKind: TOllamaErrorKind;
       out AErrorMsg: string): string; overload;
@@ -283,6 +303,7 @@ type
     property IsConnecting: boolean read FConnecting;
     property KeepAlive: integer read FKeepAlive write FKeepAlive default -1;
     property NumCtx: integer read FNumCtx write FNumCtx default 0;
+    property ThinkMode: TOllamaThinkMode read FThinkMode write FThinkMode default otmDefault;
     property LastPromptEvalCount: integer read FLastPromptEvalCount;
     property LastEvalCount: integer read FLastEvalCount;
     property LastUsageTotal: integer read GetLastUsageTotal;
@@ -605,6 +626,7 @@ begin
   FBaseURL := 'http://localhost:11434';
   FKeepAlive := -1;
   FNumCtx := 0;
+  FThinkMode := otmDefault;
   FLastPromptEvalCount := 0;
   FLastEvalCount := 0;
   FLastRequestStats := string.Empty;
@@ -709,7 +731,25 @@ begin
   if FNumCtx > 0 then
     Result := Format(',"options":{"num_ctx":%d}', [FNumCtx])
   else
-    Result := '';
+    Result := string.Empty;
+end;
+
+function TCustomOllamaManager.BuildThinkJson(AThinkMode: TOllamaThinkMode): string;
+begin
+  case AThinkMode of
+    otmOn:
+      Result := ',"think":true';
+    otmOff:
+      Result := ',"think":false';
+    otmLow:
+      Result := ',"think":"low"';
+    otmMedium:
+      Result := ',"think":"medium"';
+    otmHigh:
+      Result := ',"think":"high"';
+    else
+      Result := string.Empty;
+  end;
 end;
 
 procedure TCustomOllamaManager.ResetUsage;
@@ -2422,8 +2462,8 @@ var
   Kind: TOllamaErrorKind;
   ErrMsg: string;
 begin
-  JsonBody := Format('{"model":"%s","prompt":"%s","keep_alive":%d,"stream":false%s}',
-    [ModelName, Prompt.EscapeText, FKeepAlive, BuildOptionsJson]);
+  JsonBody := Format('{"model":"%s","prompt":"%s","keep_alive":%d,"stream":false%s%s}',
+    [ModelName, Prompt.EscapeText, FKeepAlive, BuildOptionsJson, BuildThinkJson(FThinkMode)]);
   Result := ApiPost('/api/generate', JsonBody, Kind, ErrMsg);
   if Kind <> oekNone then
   begin
@@ -2438,8 +2478,8 @@ var
   Kind: TOllamaErrorKind;
   ErrMsg: string;
 begin
-  JsonBody := Format('{"model":"%s","messages":[{"role":"user","content":"%s"}],"keep_alive":%d,"stream":false%s}',
-    [ModelName, UserMessage.EscapeText, FKeepAlive, BuildOptionsJson]);
+  JsonBody := Format('{"model":"%s","messages":[{"role":"user","content":"%s"}],"keep_alive":%d,"stream":false%s%s}',
+    [ModelName, UserMessage.EscapeText, FKeepAlive, BuildOptionsJson, BuildThinkJson(FThinkMode)]);
   Result := ApiPost('/api/chat', JsonBody, Kind, ErrMsg);
   if Kind <> oekNone then
   begin
@@ -2720,6 +2760,13 @@ end;
 
 function TCustomOllamaManager.ChatStream(const ModelName, MessagesJson, ToolsJson: string;
   AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
+begin
+  Result := ChatStream(ModelName, MessagesJson, ToolsJson, AOnContent, AOnThinking, AKind, AErrorMsg, FThinkMode);
+end;
+
+function TCustomOllamaManager.ChatStream(const ModelName, MessagesJson, ToolsJson: string;
+  AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string;
+  AThinkMode: TOllamaThinkMode): string;
 var
   JsonBody, ErrFromNetwork, Url, UpperError: string;
   Tm: TTimeout;
@@ -2737,11 +2784,11 @@ begin
   end;
 
   if ToolsJson <> '' then
-    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
-      [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
+    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s%s,"stream":true}',
+      [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":true}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2822,8 +2869,17 @@ begin
   Result := ChatWithTools(ModelName, MessagesJson, ToolsJson, nil, nil, AKind, AErrorMsg);
 end;
 
+// Uses the manager default thinking mode
 function TCustomOllamaManager.ChatWithTools(const ModelName, MessagesJson, ToolsJson: string;
   AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string): string;
+begin
+  Result := ChatWithTools(ModelName, MessagesJson, ToolsJson, AOnContent, AOnThinking, AKind, AErrorMsg, FThinkMode);
+end;
+
+// Sends chat with tools using the specified thinking mode
+function TCustomOllamaManager.ChatWithTools(const ModelName, MessagesJson, ToolsJson: string;
+  AOnContent, AOnThinking: TOllamaStreamCallback; out AKind: TOllamaErrorKind; out AErrorMsg: string;
+  AThinkMode: TOllamaThinkMode): string;
 var
   JsonBody, ContentStr, ThinkingStr: string;
   Data, MsgData: TJSONData;
@@ -2839,11 +2895,11 @@ begin
     Exit;
   end;
   if ToolsJson <> '' then
-    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
-      [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
+    JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s%s,"stream":false}',
+      [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":false}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
