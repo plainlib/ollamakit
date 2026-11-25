@@ -2,6 +2,12 @@
 
 **OllamaKit** is a set of Lazarus / Free Pascal visual components for building desktop applications around [Ollama](https://ollama.com) — a local and remote large language model (LLM) server.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Build with: Lazarus](https://img.shields.io/badge/Build_with-Lazarus-blueviolet)](https://www.lazarus-ide.org/)
+[![Platform: Windows Linux](https://img.shields.io/badge/Platform-Windows_Linux-yellow)](#)
+
+![sample](img/sample.png)
+
 The package provides reusable building blocks that together deliver the following capabilities:
 
 - an **asynchronous Ollama API client** with REST support and Server-Sent-Events (SSE) streaming,
@@ -120,33 +126,61 @@ Namespace / class names: `OllamaManager`, `TOllamaManager`, `TCustomOllamaManage
 
 **Purpose:** asynchronous Ollama API client that hides the HTTP transport behind a background worker thread and provides the model lifecycle management, streaming chat and generate requests, typed error handling and server state queries.
 
-- `RefreshModels` — triggers a background refresh of the model lists.
-- `PullModel(const ModelName: string)` — starts an asynchronous model pull.
-- `DeleteModel(const ModelName: string)` — deletes a model.
-- `StartModel(const ModelName: string)` / `StopModel(const ModelName: string)` — start / stop a loaded model.
-- `Connect` / `Disconnect` — enable / disable connection attempts.
-- `Generate(const ModelName, Prompt: string): string` — non-streaming generate.
-- `Chat(const ModelName, UserMessage: string): string` — non-streaming chat.
-- `ChatStream(...)` (two overloads) — streaming chat with a single content callback, or with separate content and thinking callbacks; returns the final chunk or reports an error.
-- `ChatWithTools(...)` (two overloads) — streaming or non-streaming chat with tools support; emits thinking and content.
-- `ShowModel(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): string` — fetches model metadata JSON.
-- `GetVersion(out Kind: TOllamaErrorKind; out ErrorMsg: string): string` — returns the server version.
-- `CopyModel(const Source, Destination: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean` — copies a model.
-- `CreateModel(const ModelName, ModelfileContent: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean` — creates a model from a Modelfile.
-- `LoadModelSync(const ModelName: string; out Kind: TOllamaErrorKind; out ErrorMsg: string): boolean` / `UnloadModelSync(...)` — synchronous load / unload.
-- `ResetUsage`, `GetLastUsageTotal`, `GetModelContextLength`, `GetRunningModelJson`, `CheckServerReachableQuick`, `BgFinished`, `UnregisterThread`.
+**Properties:**
 
+| Property | Type | Description |
+|---|---|---|
+| `BaseURL` | `string` | Base address of the Ollama server, e.g. `http://localhost:11434`. |
+| `PopupMenu` | `TPopupMenu` | Popup menu that receives the model management items; may be nil. |
+| `KeepAlive` | `Integer` | `keep_alive` value sent with start requests; `-1` means no time limit. |
+| `NumCtx` | `Integer` | `num_ctx` value sent with requests, `0` means use Ollama default. |
+| `Active` | `Boolean` | Master switch; when False no connection attempts are made and the menu is empty. |
+| `AutoRefresh` | `Boolean` | When True, the model list is refreshed before each menu popup. |
+| `ConnectionTimeout` | `Integer` | Connection timeout in milliseconds, applied while establishing the connection. |
+| `ModelTimeout` | `Integer` | Maximum time in milliseconds to wait for a model start or stop operation. |
+| `RequestTimeout` | `Integer` | Timeout in milliseconds for regular API requests. |
+| `PullTimeout` | `Integer` | Per-chunk timeout in milliseconds during pull, `0` means use `RequestTimeout`. |
+| `MenuSections` | `TOllamaMenuSections` | Sections of the popup menu shown to the user; clear a flag to hide it. |
+| `MonitorModelState` | `Boolean` | Enables periodic monitoring of running model state. |
+| `MonitorInterval` | `Integer` | Polling interval in milliseconds. |
 
+**Methods:**
+
+| Method | Description |
+|---|---|
+| `RefreshModels` | Triggers a background refresh of the model lists. |
+| `PullModel` | Starts an asynchronous model pull. |
+| `DeleteModel` | Deletes a model. |
+| `StartModel` / `StopModel` | Start / stop a loaded model. |
+| `Connect` / `Disconnect` | Enable / disable connection attempts. |
+| `Generate` | Non-streaming generate. |
+| `Chat` | Non-streaming chat. |
+| `ChatStream` | Streaming chat with SSE or plain JSON; returns the final chunk or reports an error. |
+| `ChatWithTools` | Streaming or non-streaming chat with tools support; emits thinking and content. |
+| `ShowModel` | Fetches model metadata JSON. |
+| `GetVersion` | Returns the server version. |
+| `CopyModel` | Copies a model. |
+| `CreateModel` | Creates a model from a Modelfile. |
+| `LoadModelSync` / `UnloadModelSync` | Synchronous load / unload. |
+| `ResetUsage` | Resets usage counters. |
+| `GetLastUsageTotal` | Returns the last usage total. |
+| `GetModelContextLength` | Returns the context length of a loaded model. |
+| `GetRunningModelJson` | Returns cached /api/ps JSON for a running model. |
+| `CheckServerReachableQuick` | Quick TCP-only reachability check. |
+| `BgFinished` | Called by the background thread via Synchronize. |
+| `UnregisterThread` | Unregisters a background thread. |
 
 **Events:**
 
-- `OnModelsRefreshed(Sender, OldModels, NewModels: TStringList)`.
-- `OnError(Sender, Kind: TOllamaErrorKind, ModelName, ErrorMsg: string)`.
-- `OnPullProgress(Sender, ModelName: string, Percent: integer)`.
-- `OnConnecting(Sender)` / `OnConnected(Sender)`.
-- `OnModelStart(Sender, ModelName, External, Success, ErrorMsg)` / `OnModelStop(...)`.
-
-**Types:** `TOllamaErrorKind` (`oekNone`, `oekUnknown`, `oekConnection`, `oekTimeout`, `oekHttpClient`, `oekHttpServer`, `oekJson`, `oekNotFound`, `oekCancelled`), `TOllamaMenuSection(s)`, `TOllamaBgOp` (`boPull`, `boStart`, `boStop`, `boRefresh`).
+| Event | Description |
+|---|---|
+| `OnModelsRefreshed` | Fired after the installed model list has been refreshed. |
+| `OnError` | Fired for any API or connection error; never raises. |
+| `OnPullProgress` | Fired when pull progress changes (currently only start and finish). |
+| `OnConnecting` | Fired before a background connection or refresh attempt begins. |
+| `OnConnected` | Fired after the model list has been successfully refreshed. |
+| `OnModelStart` | Occurs when a model start operation completes; `Success` indicates whether the operation completed successfully. |
+| `OnModelStop` | Occurs when a model stop operation completes; `Success` indicates whether the operation completed successfully. |
 
 ---
 
@@ -156,34 +190,84 @@ Namespace / class names: `OllamaAgent`, `TCustomOllamaAgent`, `TOllamaAgent`.
 
 **Purpose:** LLM agent that runs a tool-calling loop on top of `TOllamaManager`. The agent builds the system prompt, manages conversation history and context usage, streams responses and executes tool calls until the finish condition, step limit, cancellation or an error occurs.
 
-**Core loop (`TOllamaAgentThread`):**
+**Properties:**
 
-1. Validates that an `OllamaManager` and a `ModelName` are assigned.
-2. Checks tool support for the model (`ModelSupportsTools`).
-3. Builds the system prompt via `BuildSystemPrompt` (platform, workspace root, AGENTS.md, enabled tools, environment facts).
-4. Prepends history and the user message, with optional context prelude.
-5. Streams the chat via `OllamaManager.ChatStream` / `ChatWithTools`.
-6. Parses `tool_calls` and executes them (parallel batch for safe tools, sequential otherwise).
-7. Repeats until `finish`, `MaxSteps`, cancellation or error.
+| Property | Type | Description |
+|---|---|---|
+| `OllamaManager` | `TOllamaManager` | Ollama API client used for chat requests. |
+| `ModelName` | `string` | Model name passed to Ollama, e.g. `qwen2.5-coder:7b`. |
+| `SystemPrompt` | `string` | System message sent before the conversation. |
+| `MaxSteps` | `Integer` | Maximum number of agent iterations, zero means unlimited. |
+| `RequestTimeout` | `Integer` | Per-request timeout in ms, 0 means use `OllamaManager` default. |
+| `Streaming` | `Boolean` | Enable streaming of content and thinking chunks in real time. |
+| `EnabledTools` | `TAgentFeatures` | Tool groups enabled for this agent, empty means chat only. |
+| `RootPath` | `string` | Sandbox directory for file tools, empty means process cwd. |
+| `ToolPathAliases` | `TStringList` | Virtual path aliases resolved relative to `RootPath`. |
+| `Tools` | `TAgentTools` | Collection of user-defined tools. |
+| `WebOptions` | `TAgentWebOptions` | Web tools configuration, expand to adjust search URL, timeout, whitelist. |
+| `KeepHistory` | `Boolean` | When True, messages persist between `RunAsync` calls. |
+| `LoadAgentsMd` | `Boolean` | Load workspace root `AGENTS.md` into the system prompt. |
+| `AgentsFileName` | `string` | Instruction file name, looked up in the root and in subdirectories. |
+| `AllowAccessToSystem` | `Boolean` | When False, file tools are sandboxed to `RootPath`, absolute paths are rejected. |
+| `BlockSensitiveFiles` | `Boolean` | Deny access to well-known secret files like `.ssh/`, `.env`, `*.key`, `id_rsa`. |
+| `Log` | `Boolean` | When True, the agent logs every step and event to stderr. |
+| `LogToolResult` | `Boolean` | Emit tool result previews through the log channel, truncated to 500 chars. |
+| `OnLog` | `TAgentLogEvent` | Receives every log line, host may color or redirect it. |
+| `OnContextUsage` | `TAgentContextUsageEvent` | Fired with current context usage counters. |
+| `OnRoute` | `TAgentRouteEvent` | Fired before chat step and each tool call, host may reject. |
+| `OnChunk` | `TAgentChunkEvent` | Fired for every streamed text chunk from the model. |
+| `OnThinking` | `TAgentThinkingEvent` | Fired for every thinking chunk from the model. |
+| `OnToolCall` | `TAgentToolCallEvent` | Fired when the LLM requests a tool, after host approval. |
+| `OnToolResult` | `TAgentToolResultEvent` | Fired with the tool result before it is sent back to the model. |
+| `OnExecCommand` | `TAgentExecCommandEvent` | Fired for exec_command tool, host executes and returns the output. |
+| `OnAskUser` | `TAgentAskUserEvent` | Fired for ask_user tool, host shows the question and returns the answer. |
+| `OnFinish` | `TAgentFinishEvent` | Fired once when the run terminates for any reason. |
 
-**Features (`TAgentFeature`):**
+**Methods:**
 
-- `afFileTools` — built-in file tools (read, write, edit, insert, replace, patch, delete, move, copy, list, glob, grep, info, read lines/preview, open, agents md),
-- `afExecCommand` — shell execution via host hook,
-- `afGit` — git tools executed through the host hook,
-- `afInteractive` — ask-user tool,
-- `afFinish` — finish tool,
-- `afWebTools` — web fetch / search tools.
+| Method | Description |
+|---|---|
+| `RunAsync` | Runs the agent asynchronously with the given text. |
+| `Run` | Runs the agent and returns the final answer. |
+| `Cancel` | Cancels the active run. |
+| `ClearHistory` | Clears the conversation history. |
+| `RemoveLastExchange` | Removes the last user message and all following messages. |
+| `NewChat` | Creates and activates a new chat. |
+| `SwitchChat` | Switches to the adjacent chat, negative values select older chats. |
+| `MoveActiveChat` | Moves the active chat in the chat list without switching it. |
+| `DeleteActiveChat` | Deletes the active chat and activates the next available chat. |
+| `ClearChats` | Deletes all chats without creating a new one. |
+| `SaveChatsToFile` | Saves all chats to a JSON file. |
+| `LoadChatsFromFile` | Loads all chats from a JSON file. |
+| `SaveChatToFile` | Saves the specified chat to a separate JSON file. |
+| `LoadChatFromFile` | Loads a chat from a separate JSON file and activates it. |
+| `BuildSystemPrompt` | Builds the system prompt using the current runtime capabilities. |
+| `RefreshContextInfo` | Resolves model context window size and updates context counters. |
+| `ResetUsage` | Resets usage counters in the manager and the agent. |
+| `DispatchTool` | Dispatches one tool call, called by the worker thread. |
+| `BuildUnknownToolError` | Builds an actionable error listing available tools and hints. |
+| `ModelSupportsTools` | Returns False when the model definitely lacks tool support. |
+| `SummarizeMessages` | Compresses a JSON array of messages into a short summary string. |
+| `BuildToolsSchemaJson` | Builds JSON schema array with all available tools. |
+| `BuildToolsNames` | Returns comma-separated list of tool names for diagnostics. |
+| `LogLine` | Writes a diagnostic line to stderr when Log is enabled. |
+| `DoLog` | Emits a log line through OnLog or stderr, no Log flag check. |
+| `EmitToolResult` | Emits a truncated tool result preview when LogToolResult is enabled. |
 
-**Chats:** `TAgentChat` holds ID, name, working directory, history JSON, chat prompt, terminal history, shell log, terminal output, context counters, output marks and session state.
+**Events:**
 
-**Tools:** `TAgentTools` is a `TCollection` of `TAgentTool` (`Name`, `Description`, `ParametersJson`, `OnExecute`) plus `TAgentWebOptions` (`SearchUrl`, `UserAgent`, `RequestTimeout`, `MaxResponseBytes`, `StripHtml`, `BlockLocalhost`, `BlockPrivateIPs`, `AllowedHosts`).
-
-**Properties:** `OllamaManager`, `ModelName`, `SystemPrompt`, `MaxSteps`, `RequestTimeout`, `EnabledTools`, `Streaming`, `RootPath`, `ToolPathAliases`, `Tools`, `WebOptions`, `KeepHistory`, `LoadAgentsMd`, `AgentsFileName`, `AllowAccessToSystem`, `BlockSensitiveFiles`, `Log`, `LogToolResult`, context properties (`ContextUsed`, `ContextTotal`, `ContextPercent`, `ContextUsedKb`, `ContextTotalKb`).
-
-**Events:** `OnLog`, `OnContextUsage`, `OnRoute`, `OnChunk`, `OnThinking`, `OnToolCall`, `OnToolResult`, `OnExecCommand`, `OnAskUser`, `OnFinish`.
-
-**Public API:** `RunAsync(const AText: string)`, `Run(const AText: string): string`, `Cancel`, `ClearHistory`, `RemoveLastExchange`, chat management (`NewChat`, `SwitchChat`, `MoveActiveChat`, `DeleteActiveChat`, `ClearChats`, `SaveChatsToFile`, `LoadChatsFromFile(s)`, `SaveChatToFile`, `LoadChatFromFile`), `BuildSystemPrompt`, `RefreshContextInfo`, `ResetUsage`.
+| Event | Description |
+|---|---|
+| `OnLog` | Receives every log line, host may color or redirect it. |
+| `OnContextUsage` | Fired with current context usage counters. |
+| `OnRoute` | Fired before chat step and each tool call, host may reject. |
+| `OnChunk` | Fired for every streamed text chunk from the model. |
+| `OnThinking` | Fired for every thinking chunk from the model. |
+| `OnToolCall` | Fired when the LLM requests a tool, after host approval. |
+| `OnToolResult` | Fired with the tool result before it is sent back to the model. |
+| `OnExecCommand` | Fired for exec_command tool, host executes and returns the output. |
+| `OnAskUser` | Fired for ask_user tool, host shows the question and returns the answer. |
+| `OnFinish` | Fired once when the run terminates for any reason. |
 
 ---
 
@@ -193,18 +277,77 @@ Namespace / class names: `TermManager`, `TCustomTermManager`, `TTermManager`.
 
 **Purpose:** interactive terminal component that hosts shell commands and agent-driven sessions. It classifies user input, renders shell and agent output, handles built-in commands and drives agent runs through temporary event handlers.
 
-**Functions / methods:**
+**Properties:**
 
-- `Run` / `Stop` — start / stop the interactive loop.
-- `ExecuteCommandCapture(const ACommand: string; out AExitCode: integer; ATimeoutMs: integer = -1): string` — shell execution with output capture.
-- `WriteText(const AText: string; AIsStderr: boolean = False)` / `WriteLine(...)` — console output primitives.
-- `FormatTermConfig` / `RestoreActiveChat` / `ReadLine` / `AddToHistory` / `IsExternalCommand` / `PumpOutput` / `HandleBuiltin` / `ExecuteCommand` / `ClassifyLine` / `DoRoute` / `DoOutput` / `DoAgentExecute` / `DoExit` / `CloseThinking` / `ProcessMarkdownChunk` / `ProcessMarkdownLine` / `RecordShellOperation` / `BuildShellContext` / `IsMetaCommand` / `IsChatControlCommand` / `HandleAgentExecCommand` / `HandleAgentAskUser`.
+| Property | Type | Description |
+|---|---|---|
+| `Path` | `string` | Working directory for shell commands and agent file tools, empty uses process cwd. |
+| `Prompt` | `string` | Prompt template, supports `{path}`, `{model}`, `{chat}`, `{chatindex}`, context and usage placeholders. |
+| `StartupPrompt` | `string` | Multi-line banner printed once before the first prompt. |
+| `ThinkingLabel` | `string` | Line printed before agent reasoning block, for example `[Thinking]`. |
+| `ShowThinking` | `Boolean` | Show agent reasoning text; when False only ThinkingLabel is printed. |
+| `ShowAgentStats` | `Boolean` | Completion statistics template; supports `{duration}`, `{ops}`, `{tool_count}`, `{tool_duration}`, `{thinking_count}`, `{thinking_duration}`, `{answer_count}`, `{answer_duration}`. |
+| `AgentStatsFormat` | `string` | Completion statistics template with duration and operation placeholders. |
+| `ToolCallLabel` | `string` | Line printed before each tool call, supports `{name}`, `{args}` and JSON field placeholders like `{command}`. |
+| `StripEmoji` | `Boolean` | Strip emoji and unsupported symbol ranges that plain console fonts cannot render. |
+| `StripSpecialChars` | `Boolean` | Normalize text for terminal output. |
+| `ColorOutput` | `Boolean` | Colorize badges and thinking text when console supports attributes. |
+| `Colors` | `TTermColorScheme` | Semantic color palette for output, expand to customize each role. |
+| `DefaultModelLabel` | `string` | Label shown in the `{info}` badge when no model is selected. |
+| `WaitSlowHint` | `string` | Hint shown when the agent waits longer than a second with reachable server. |
+| `WaitServerDownHint` | `string` | Hint shown when the agent waits longer than a second with unreachable server. |
+| `WaitCheckDelayMs` | `Integer` | Delay in ms before checking server reachability, `0` disables the check. |
+| `BuiltinCommands` | `TStringList` | Commands executed internally without invoking the shell, extend to add your own. |
+| `HistoryMax` | `Integer` | Maximum number of input lines kept in history, oldest are dropped first. |
+| `ShellExec` | `string` | Shell executable used to run external commands and agent exec_command, defaults to cmd.exe. |
+| `CommandTimeout` | `Integer` | Timeout in milliseconds for user-typed external commands, zero means no limit. |
+| `MaxCaptureBytes` | `Integer` | Cap on bytes captured from agent exec_command, excess is truncated with a notice. |
+| `AgentCommandTimeout` | `Integer` | Timeout in milliseconds for agent exec_command, zero means no limit, default 30 seconds. |
+| `UsePrefixes` | `Boolean` | Enable `!` and `?` prefixes to force command or agent routing respectively. |
+| `ShellHistory` | `TAgentShellHistory` | Pass recent shell commands to the agent, expand to adjust log limits. |
+| `SearchPath` | `Boolean` | Also detect PATH executables and known shell builtins when classifying input. |
+| `OnRoute` | `TTermRouteEvent` | Fires before routing each input, host can approve, reject or reclassify it. |
+| `OnOutput` | `TTermOutputEvent` | Fires for every chunk of command output, useful for logging or filtering. |
+| `OnAgentExecute` | `TTermAgentEvent` | Fires when input is classified as agent text and no Agent is attached. |
+| `OnExit` | `TTermExitEvent` | Fires when the interactive loop terminates, receives last command exit code. |
+| `Agent` | `TCustomOllamaAgent` | Agent component that handles agent-classified input, leave empty to disable. |
 
-**Properties:** `Path`, `Prompt`, `StartupPrompt`, `Welcome`, `ThinkingLabel`, `ShowThinking`, `ShowAgentStats`, `AgentStatsFormat`, `ToolCallLabel`, `StripEmoji`, `StripSpecialChars`, `ColorOutput`, `Colors`, `DefaultModelLabel`, `WaitSlowHint`, `WaitServerDownHint`, `WaitCheckDelayMs`, `BuiltinCommands`, `HistoryMax`, `ShellExec`, `CommandTimeout`, `MaxCaptureBytes`, `AgentCommandTimeout`, `UsePrefixes`, `ShellHistory`, `SearchPath`, `LastExitCode`, `History`, `Running`, `OnRoute`, `OnOutput`, `OnAgentExecute`, `OnExit`, `Agent`.
+**Methods:**
 
-**Agent event handlers:** `HandleAgentChunk`, `HandleAgentThinking`, `HandleAgentToolCall`, `HandleAgentToolResult`, `HandleAgentFinish`, `HandleAgentLog`, `HandleAgentContextUsage`, `HandleAgentExecCommand`, `HandleAgentAskUser`, `CloseThinking`.
+| Method | Description |
+|---|---|
+| `Run` | Starts the interactive loop and blocks until exit. |
+| `Stop` | Requests the loop to stop after current iteration. |
+| `ExecuteCommandCapture` | Runs shell command capturing output as UTF-8, returns combined stdout and stderr. |
+| `WriteText` | Writes raw text without line ending, flushes for streaming output. |
+| `WriteLine` | Writes text followed by a line ending, flushes immediately. |
+| `FormatTermConfig` | Returns multi-line current values of term properties. |
+| `RestoreActiveChat` | Restores terminal buffers and output of the active chat. |
+| `HandleBuiltin` | Handles built-in commands. |
+| `ExecuteCommand` | Runs external shell command. |
+| `ClassifyLine` | Classifies input line. |
+| `DoRoute` | Routes input. |
+| `DoOutput` | Outputs text. |
+| `DoAgentExecute` | Executes agent input. |
+| `DoExit` | Exits. |
+| `CloseThinking` | Closes thinking block. |
+| `ProcessMarkdownChunk` | Processes markdown chunk. |
+| `ProcessMarkdownLine` | Processes markdown line. |
+| `RecordShellOperation` | Records shell operation. |
+| `BuildShellContext` | Builds shell context. |
+| `IsMetaCommand` | Checks meta command. |
+| `IsChatControlCommand` | Checks chat control command. |
+| `HandleAgentExecCommand` | Handles agent exec command. |
+| `HandleAgentAskUser` | Handles agent ask user. |
 
-**Input flow:** `Run` loop reads a line, classifies it (`tikEmpty`, `tikBuiltin`, `tikCommand`, `tikAgent`), routes it (`DoRoute`) and dispatches accordingly. Agent commands are forwarded to `TOllamaAgent.RunAsync` with temporary event-handler installation and cancellation support.
+**Events:**
+
+| Event | Description |
+|---|---|
+| `OnRoute` | Fires before routing each input, host can approve, reject or reclassify it. |
+| `OnOutput` | Fires for every chunk of command output, useful for logging or filtering. |
+| `OnAgentExecute` | Fires when input is classified as agent text and no Agent is attached. |
+| `OnExit` | Fires when the interactive loop terminates, receives last command exit code. |
 
 ---
 
@@ -214,7 +357,16 @@ Namespace / class names: `TermManager`, `TCustomTermManager`, `TTermManager`.
 
 **Functions:**
 
-- `FormatShortHelp`, `FormatFullHelp(Agent: boolean; Term: boolean; Shortcuts: boolean)`, `FormatOllamaHelp`, `FormatAgentConfig(AAgent: TCustomOllamaAgent)`, `GetAgentProperty`, `SetAgentProperty`, `FormatModelsList(AAgent: TCustomOllamaAgent; out AError: string)`, plus the `TModelListCollector` event helper.
+| Function | Description |
+|---|---|
+| `FormatShortHelp` | Formats short help. |
+| `FormatFullHelp` | Formats full help. |
+| `FormatOllamaHelp` | Formats Ollama help. |
+| `FormatAgentConfig` | Formats agent config. |
+| `GetAgentProperty` | Gets agent property. |
+| `SetAgentProperty` | Sets agent property. |
+| `FormatModelsList` | Formats models list. |
+| `TModelListCollector` | Event helper for model list collection. |
 
 ---
 
