@@ -2725,6 +2725,9 @@ begin
               Length(MessagesJson), Length(ToolsJson), BoolToStr(FAgent.FStreaming, 'on', 'off'),
               FAgent.BuildToolsNames, FAgent.OllamaManager.LastRequestStats]));
 
+            if ErrMsg <> string.Empty then
+              FAgent.LogLine('Stream diagnostics: ' + ErrMsg);
+
             if FinalJson <> string.Empty then
               FAgent.LogLine('Raw response: ' + FinalJson)
             else

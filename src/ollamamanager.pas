@@ -2740,8 +2740,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":true}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2791,6 +2791,16 @@ begin
       Exit;
     end;
 
+    // Log incomplete streams to help diagnose interrupted generations
+    if not Helper.Done then
+    begin
+      AErrorMsg := Format('Incomplete stream: done=%s, buffer=%d, final=%d, tool_calls=%d, request_bytes=%d, error="%s"',
+        [BoolToStr(Helper.Done, True), Length(Helper.Buffer), Length(Helper.FullFinal), Length(Helper.AccumulatedToolCalls),
+        Length(JsonBody), Trim(ErrFromNetwork)]);
+      AKind := oekUnknown;
+      Exit;
+    end;
+
     // Store usage counters reported by the server
     FLastPromptEvalCount := Helper.LastPromptEvalCount;
     FLastEvalCount := Helper.LastEvalCount;
@@ -2832,8 +2842,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s,"stream":false}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
