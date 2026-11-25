@@ -2715,14 +2715,27 @@ begin
           except
             Data := nil;
           end;
+
           if (Data = nil) or (Data.JSONType <> jtObject) then
           begin
-            FAgent.LogLine(Format('Invalid JSON from LLM, response_len=%d', [Length(FinalJson)]));
+            // Log detailed response diagnostics to identify empty or malformed output
+            FAgent.LogLine(Format(
+              'Invalid LLM response: kind=%d final_len=%d content_len=%d thinking_len=%d request_bytes=%d tools_schema_bytes=%d streaming=%s tools=[%s] stats=[%s]',
+              [Ord(Kind), Length(FinalJson), Length(FCurrentContent), Length(FCurrentThinking),
+              Length(MessagesJson), Length(ToolsJson), BoolToStr(FAgent.FStreaming, 'on', 'off'),
+              FAgent.BuildToolsNames, FAgent.OllamaManager.LastRequestStats]));
+
             if FinalJson <> string.Empty then
-              FAgent.LogLine('Raw response: ' + FinalJson);
+              FAgent.LogLine('Raw response: ' + FinalJson)
+            else
+              FAgent.LogLine('No final response JSON received from Ollama');
+
+            if (FCurrentContent = string.Empty) and (FCurrentThinking = string.Empty) then
+              FAgent.LogLine('No content or thinking chunks received');
 
             Reason := afrError;
-            ErrMsg := 'Invalid JSON from LLM';
+            ErrMsg := Format('Invalid JSON from LLM (final=%d, content=%d, thinking=%d)',
+              [Length(FinalJson), Length(FCurrentContent), Length(FCurrentThinking)]);
             Exit;
           end;
 
