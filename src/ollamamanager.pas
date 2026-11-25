@@ -397,6 +397,9 @@ resourcestring
   rsInfoFamily = 'Family: %s';
   rsInfoParameters = 'Parameters: %s';
   rsInfoQuantization = 'Quantization: %s';
+  rsInfoCapabilities = 'Capabilities: %s';
+  rsInfoThinkingModesUnknown = 'Thinking modes: not specified';
+  rsInfoThinkingUnsupported = 'Thinking: not supported';
   rsInfoModified = 'Modified: %s';
   rsInfoTotalMemory = 'Total memory: %s';
   rsInfoVram = 'VRAM: %s (%d%% GPU)';
@@ -1914,6 +1917,9 @@ var
   Kind: TOllamaErrorKind;
   ErrMsg: string;
   Family, ParamSize, Quant, Fmt, ModifiedAt, ExpiresAt: string;
+  CapabilitiesText, ThinkingText, ThinkingDefault: string;
+  CapabilitiesData, CapabilityData, ThinkingData, ThinkingValues, ThinkingDefaultData: TJSONData;
+  ThinkingIndex: integer;
   SizeTotal, SizeVram, CtxLen: int64;
   Found: boolean;
 begin
@@ -1968,6 +1974,86 @@ begin
               if Quant <> '' then
                 SL.Add(Format(rsInfoQuantization, [Quant]));
             end;
+            // Display model capabilities
+            CapabilitiesData := TJSONObject(ShowData).Find('capabilities');
+            if (CapabilitiesData <> nil) and (CapabilitiesData.JSONType = jtArray) then
+            begin
+              CapabilitiesText := string.Empty;
+              for ThinkingIndex := 0 to TJSONArray(CapabilitiesData).Count - 1 do
+              begin
+                CapabilityData := TJSONArray(CapabilitiesData).Items[ThinkingIndex];
+                if CapabilitiesText <> string.Empty then
+                  CapabilitiesText := CapabilitiesText + ', ';
+                CapabilitiesText := CapabilitiesText + CapabilityData.AsString;
+              end;
+
+              if CapabilitiesText <> string.Empty then
+                SL.Add(Format(rsInfoCapabilities, [CapabilitiesText]));
+            end;
+
+            // Display supported thinking modes
+            ThinkingData := TJSONObject(ShowData).Find('thinking');
+            ThinkingValues := nil;
+            ThinkingDefaultData := nil;
+
+            if (ThinkingData <> nil) and (ThinkingData.JSONType = jtObject) then
+            begin
+              ThinkingValues := TJSONObject(ThinkingData).Find('values');
+              ThinkingDefaultData := TJSONObject(ThinkingData).Find('default');
+
+              if (ThinkingValues <> nil) and (ThinkingValues.JSONType = jtArray) then
+              begin
+                if (TJSONArray(ThinkingValues).Count = 1) and (TJSONArray(ThinkingValues).Items[0].JSONType =
+                  jtBoolean) and (not TJSONArray(ThinkingValues).Items[0].AsBoolean) then
+                  SL.Add(rsInfoThinkingUnsupported)
+                else
+                begin
+                  ThinkingText := string.Empty;
+                  for ThinkingIndex := 0 to TJSONArray(ThinkingValues).Count - 1 do
+                  begin
+                    if ThinkingText <> string.Empty then
+                      ThinkingText := ThinkingText + ', ';
+
+                    if TJSONArray(ThinkingValues).Items[ThinkingIndex].JSONType = jtBoolean then
+                    begin
+                      if TJSONArray(ThinkingValues).Items[ThinkingIndex].AsBoolean then
+                        ThinkingText := ThinkingText + 'on'
+                      else
+                        ThinkingText := ThinkingText + 'off';
+                    end
+                    else
+                      ThinkingText := ThinkingText + TJSONArray(ThinkingValues).Items[ThinkingIndex].AsString;
+                  end;
+
+                  if ThinkingText <> string.Empty then
+                  begin
+                    SL.Add('Thinking modes: ' + ThinkingText);
+
+                    if ThinkingDefaultData <> nil then
+                    begin
+                      if ThinkingDefaultData.JSONType = jtString then
+                        ThinkingDefault := ThinkingDefaultData.AsString
+                      else if ThinkingDefaultData.JSONType = jtBoolean then
+                      begin
+                        if ThinkingDefaultData.AsBoolean then
+                          ThinkingDefault := 'on'
+                        else
+                          ThinkingDefault := 'off';
+                      end
+                      else
+                        ThinkingDefault := ThinkingDefaultData.AsJSON;
+
+                      SL.Add('Thinking default: ' + ThinkingDefault);
+                    end;
+                  end;
+                end;
+              end
+              else if Pos(', thinking', ', ' + CapabilitiesText) > 0 then
+                SL.Add(rsInfoThinkingModesUnknown);
+            end
+            else if Pos(', thinking', ', ' + CapabilitiesText) > 0 then
+              SL.Add(rsInfoThinkingModesUnknown);
+
             ModifiedAt := TJSONObject(ShowData).Get('modified_at', '');
             if ModifiedAt <> '' then
               SL.Add(Format(rsInfoModified, [ModifiedAt]));

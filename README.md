@@ -134,6 +134,7 @@ Namespace / class names: `OllamaManager`, `TOllamaManager`, `TCustomOllamaManage
 | `PopupMenu` | `TPopupMenu` | Popup menu that receives the model management items; may be nil. |
 | `KeepAlive` | `Integer` | `keep_alive` value sent with start requests; `-1` means no time limit. |
 | `NumCtx` | `Integer` | `num_ctx` value sent with requests, `0` means use Ollama default. |
+| `ThinkMode` | `TOllamaThinkMode` | Thinking mode sent with chat requests, e.g. `default`, `on`, `off`, `low`, `medium`, `high`. |
 | `Active` | `Boolean` | Master switch; when False no connection attempts are made and the menu is empty. |
 | `AutoRefresh` | `Boolean` | When True, the model list is refreshed before each menu popup. |
 | `ConnectionTimeout` | `Integer` | Connection timeout in milliseconds, applied while establishing the connection. |
@@ -200,6 +201,7 @@ Namespace / class names: `OllamaAgent`, `TCustomOllamaAgent`, `TOllamaAgent`.
 | `MaxSteps` | `Integer` | Maximum number of agent iterations, zero means unlimited. |
 | `RequestTimeout` | `Integer` | Per-request timeout in ms, 0 means use `OllamaManager` default. |
 | `Streaming` | `Boolean` | Enable streaming of content and thinking chunks in real time. |
+| `ThinkMode` | `TOllamaThinkMode` | Model thinking mode for agent runs, e.g. `default`, `on`, `off`, `low`, `medium`, `high`. |
 | `EnabledTools` | `TAgentFeatures` | Tool groups enabled for this agent, empty means chat only. |
 | `RootPath` | `string` | Sandbox directory for file tools, empty means process cwd. |
 | `ToolPathAliases` | `TStringList` | Virtual path aliases resolved relative to `RootPath`. |
@@ -387,6 +389,7 @@ The components can be placed directly on a Lazarus form at design time.
    - `TTermManager.Path` — working directory for shell commands and agent file tools,
    - `TOllamaAgent.ModelName` — default model,
    - `TOllamaManager.KeepAlive` / `TOllamaManager.NumCtx`,
+   - `TOllamaAgent.ThinkMode` — thinking mode for model responses, e.g. `high`,
    - `TTermManager` timeouts and `MenuSections`.
 5. Subscribe to events, for example:
    - `TOllamaManager.OnError`, `TOllamaManager.OnConnected`, `TOllamaManager.OnModelsRefreshed`, `TOllamaManager.OnPullProgress`, `TOllamaManager.OnModelStart`, `TOllamaManager.OnModelStop`,
