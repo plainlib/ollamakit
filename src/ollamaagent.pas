@@ -4368,10 +4368,10 @@ begin
   PlatformName := 'Windows';
   {$ELSE}
   {$IFDEF LINUX}
-    PlatformName := 'Linux';
+  PlatformName := 'Linux';
   {$ELSE}
   {$IFDEF DARWIN}
-      PlatformName := 'macOS';
+  PlatformName := 'macOS';
   {$ELSE}
   PlatformName := 'Unix-like';
   {$ENDIF}
@@ -4382,8 +4382,19 @@ begin
   EnvironmentBlock :=
     'Environment facts:' + LineEnding + '- Platform: ' + PlatformName + LineEnding + '- Path delimiter: "' +
     PathDelim + '"' + LineEnding + '- Workspace root: ' + GetEffectiveRootPath + LineEnding +
-    '- The workspace root may change during the session. Always re-check file ' +
-    'existence after any directory change with a fresh tool call, results from ' + 'previous locations may be stale.' + LineEnding;
+    '- The workspace root may change during the session. Re-check file ' +
+    'existence after directory changes; previous results may be stale.' + LineEnding;
+
+  // Add file tool usage rules only when file tools are available
+  if HasFileTools then
+    EnvironmentBlock := EnvironmentBlock + '- Prefer built-in file tools for listing, searching, reading and editing. ' +
+      'Use shell commands only when the required operation cannot be performed ' +
+      'with the available tools or direct shell execution is necessary.' + LineEnding +
+      '- Do not use shell commands instead of list_files, glob, grep, read_file ' +
+      'or edit_file when those tools provide the required functionality.' + LineEnding +
+      '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding +
+      '- Do not redirect listing or search output to files with ">". Use list_files, ' +
+      'glob or grep instead; they return results directly without polluting the workspace.' + LineEnding;
 
   // Add shell information only when exec_command is available
   if HasExecCommand then
@@ -4401,22 +4412,33 @@ begin
 
     EnvironmentBlock := EnvironmentBlock + '- Shell for exec_command: ' + ShellDesc + LineEnding;
 
-    // Platform-specific shell notes
     {$IFDEF WINDOWS}
-    EnvironmentBlock := EnvironmentBlock +
-      '- Use "nul" instead of "/dev/null" to discard output, ";" does not chain commands, use "&&".' +
-      LineEnding;
-    {$ELSE}
-    EnvironmentBlock := EnvironmentBlock + '- Use "/dev/null" to discard output, ";" and "&&" both chain commands.' + LineEnding;
-    {$ENDIF}
-  end;
+    case LowerCase(ExtractFileName(StringReplace(ShellDesc, '/', PathDelim, [rfReplaceAll]))) of
+      'cmd.exe', 'cmd', 'command.com':
+        EnvironmentBlock := EnvironmentBlock +
+          '- Use Windows CMD syntax and native commands such as dir, cd, copy, ' +
+          'move, del, type and findstr. Use "%" for environment variables, ' +
+          '"&&" to chain commands and "nul" to discard output.' + LineEnding +
+          '- Do not use PowerShell or Unix commands and syntax.' + LineEnding;
 
-  // Add file operation rules only when file tools are available
-  if HasFileTools then
-  begin
-    EnvironmentBlock := EnvironmentBlock + '- Do NOT redirect listing or search output to files with ">", use list_files, glob ' +
-      'or grep tools instead. Those tools return results directly and do not pollute the workspace.' +
-      LineEnding + '- File tool paths are relative to the workspace root, never absolute paths.' + LineEnding;
+      'powershell.exe', 'powershell', 'pwsh.exe', 'pwsh':
+        EnvironmentBlock := EnvironmentBlock +
+          '- Use PowerShell cmdlets such as Get-ChildItem, Set-Location, ' +
+          'Get-Content, Copy-Item, Move-Item, Remove-Item and Select-String.' + LineEnding +
+          '- Use "$variable" for variables, ";" to separate commands, ' +
+          'and "Out-Null" or "$null = ..." to discard output.' + LineEnding +
+          '- PowerShell pipelines pass objects, not plain text. Do not assume CMD or Unix syntax.' +
+          LineEnding;
+
+      else
+        EnvironmentBlock := EnvironmentBlock +
+          '- Use Windows command syntax. Do not assume Unix utilities are available.' + LineEnding;
+    end;
+    {$ELSE}
+    EnvironmentBlock := EnvironmentBlock + '- Use Unix shell syntax and commands such as ls, cd, cp, mv, rm, cat, grep and find.' +
+      LineEnding + '- Use "$variable" for variables, ";" and "&&" to chain commands, ' +
+      'and "/dev/null" to discard output.' + LineEnding;
+    {$ENDIF}
   end;
 
   Result := Result + #10#10 + EnvironmentBlock;
@@ -4445,7 +4467,7 @@ begin
     end;
 
     Result := Result + #10 + 'Subdirectories may have their own ' + FAgentsFileName +
-      '. Use read_agents_md with a path to load the local rules before editing files there.';
+      '. Use read_agents_md with a path to load the local ' + 'rules before editing files there.';
   end;
 
   // Append authoritative tool availability information
@@ -4468,7 +4490,7 @@ begin
   if HasFileTools and (Pos('read_file_lines', ToolList) > 0) then
     Result := Result + #10 + 'When read_file returns a truncation notice, use read_file_lines with ' +
       'start_line and end_line to read further parts of the file in chunks. ' +
-      'Do not give up on large files, read them in sections until you have the ' + 'content you need.';
+      'Do not give up on large files; read them in sections until you have the ' + 'content you need.';
 end;
 
 procedure TCustomOllamaAgent.RefreshContextInfo(AQueryOllama: boolean = True);

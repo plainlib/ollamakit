@@ -3114,6 +3114,10 @@ begin
       Exit;
     end;
     FShellExec := V;
+
+    // Keep the agent shell information synchronized
+    if Assigned(FAgent) then
+      FAgent.ExecShellInfo := FShellExec;
   end
   else if N = 'showthinking' then
   begin
