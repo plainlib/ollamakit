@@ -5584,7 +5584,9 @@ function TCustomTermManager.ReadLine: string;
 var
   Handle: THandle;
   Rec, NextRec: INPUT_RECORD;
-  N: DWORD = 0;
+   N: DWORD = 0;
+  PendingEvents: DWORD;
+  NeedRedraw: boolean;
   Line, PromptText: rawbytestring;
   CursorPos, HistIndex, PromptRow, PromptCol: integer;
   WasAtStart: boolean;
@@ -6243,6 +6245,68 @@ var
     Inc(CursorPos, Length(Line) - OldLen);
   end;
 
+  // Returns byte offset of the start of the logical line containing APos
+  function FindLineStart(APos: integer): integer;
+  var
+    I: integer;
+  begin
+    I := APos;
+    while I > 0 do
+    begin
+      if (Line[I] = #10) or (Line[I] = #13) then
+        Exit(I);
+      Dec(I);
+    end;
+    Result := 0;
+  end;
+
+  // Moves the cursor to the beginning or end of the input text
+  procedure PositionInputCursor(AToEnd: boolean);
+  begin
+    if AToEnd then
+      CursorPos := Length(Line)
+    else
+      CursorPos := 0;
+
+    ClearSelection;
+  end;
+
+  // Returns byte offset of the end of the logical line containing APos
+  function FindLineEnd(APos: integer): integer;
+  var
+    I: integer;
+  begin
+    I := APos + 1;
+    while I <= Length(Line) do
+    begin
+      if (Line[I] = #10) or (Line[I] = #13) then
+        Exit(I - 1);
+      Inc(I);
+    end;
+    Result := Length(Line);
+  end;
+
+  // Reset the input buffer and redraw the prompt
+  procedure ResetInput;
+  begin
+    Line := string.Empty;
+    CursorPos := 0;
+    HistIndex := FHistory.Count;
+    ClearSelection;
+
+    PromptText := GetPromptText;
+    CapturePromptPosition;
+    SetColor(tcPromptInput);
+    ConWriteUtf8(PromptText);
+    FLastCharWasNewLine := False;
+    PromptRow := ConWhereY;
+    ScreenInfo := Default(TConsoleScreenBufferInfo);
+    PromptCol := 0;
+    if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
+      PromptCol := ScreenInfo.dwCursorPosition.X;
+    LastRedrawRows := 1;
+  end;
+
   // Redraws prompt and content, tracks visual wrapping and selection highlight
   procedure Redraw;
   var
@@ -6391,68 +6455,6 @@ var
     ShowConsoleCursor;
   end;
 
-  // Returns byte offset of the start of the logical line containing APos
-  function FindLineStart(APos: integer): integer;
-  var
-    I: integer;
-  begin
-    I := APos;
-    while I > 0 do
-    begin
-      if (Line[I] = #10) or (Line[I] = #13) then
-        Exit(I);
-      Dec(I);
-    end;
-    Result := 0;
-  end;
-
-  // Moves the cursor to the beginning or end of the input text
-  procedure PositionInputCursor(AToEnd: boolean);
-  begin
-    if AToEnd then
-      CursorPos := Length(Line)
-    else
-      CursorPos := 0;
-
-    ClearSelection;
-  end;
-
-  // Returns byte offset of the end of the logical line containing APos
-  function FindLineEnd(APos: integer): integer;
-  var
-    I: integer;
-  begin
-    I := APos + 1;
-    while I <= Length(Line) do
-    begin
-      if (Line[I] = #10) or (Line[I] = #13) then
-        Exit(I - 1);
-      Inc(I);
-    end;
-    Result := Length(Line);
-  end;
-
-  // Reset the input buffer and redraw the prompt
-  procedure ResetInput;
-  begin
-    Line := string.Empty;
-    CursorPos := 0;
-    HistIndex := FHistory.Count;
-    ClearSelection;
-
-    PromptText := GetPromptText;
-    CapturePromptPosition;
-    SetColor(tcPromptInput);
-    ConWriteUtf8(PromptText);
-    FLastCharWasNewLine := False;
-    PromptRow := ConWhereY;
-    ScreenInfo := Default(TConsoleScreenBufferInfo);
-    PromptCol := 0;
-    if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
-      PromptCol := ScreenInfo.dwCursorPosition.X;
-    LastRedrawRows := 1;
-  end;
-
   {$IFDEF WINDOWS}
   procedure ForceConsoleRedraw;
   var
@@ -6512,9 +6514,26 @@ begin
   if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), ScreenInfo) then
     PromptCol := ScreenInfo.dwCursorPosition.X;
   LastRedrawRows := 1;
+  NeedRedraw := False;
 
   while FRunning do
   begin
+    // Redraw only when the pending input queue has been processed
+    if NeedRedraw then
+    begin
+      PendingEvents := 0;
+      if not GetNumberOfConsoleInputEvents(Handle, PendingEvents) or
+        (PendingEvents = 0) then
+      begin
+        NeedRedraw := False;
+        try
+          Redraw;
+        except
+          ; // Console may be detached mid-redraw, keep the input loop alive
+        end;
+      end;
+    end;
+
     if not ReadConsoleInput(Handle, Rec, 1, N) then
       Break;
     if Rec.EventType <> KEY_EVENT then
@@ -7098,11 +7117,7 @@ begin
           InsertTypedChar(WideCharToUtf8(C));
     end;
 
-    try
-      Redraw;
-    except
-      ; // Console may be detached mid-redraw, keep the input loop alive
-    end;
+    NeedRedraw := True;
   end;
 
   Result := Line;
