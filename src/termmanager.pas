@@ -394,8 +394,8 @@ type
     function IsMetaCommand(const ACommand: string): boolean; virtual;
     // Returns True for commands that control the chat interface
     function IsChatControlCommand(const ACommand: string): boolean; virtual;
-    // Executes agent shell command through configured shell and returns output
-    procedure HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
+    // Executes agent command or script through the selected shell and returns output
+    procedure HandleAgentExecCommand(Sender: TObject; const ACommand, AShell: string; var AResult: string; var AAllow: boolean);
     // Prompts the user with a question and returns the typed answer
     procedure HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);
     // Processes streamed model output with Markdown syntax highlighting
@@ -825,6 +825,78 @@ begin
       Result := Result + ACommand[I];
 
     Inc(I);
+  end;
+end;
+
+// Creates a temporary batch file and a file for the resulting working directory
+procedure CreateCmdBatchScript(const ACommand: string; out ATempFileName, AScriptFileName, ACwdFileName: string);
+var
+  ScriptData: rawbytestring;
+  ScriptStream: TFileStream;
+begin
+  ATempFileName := SysUtils.GetTempFileName;
+  AScriptFileName := ChangeFileExt(ATempFileName, '.cmd');
+  ACwdFileName := SysUtils.GetTempFileName;
+
+  // Create the temporary files before renaming or using them
+  ScriptStream := TFileStream.Create(ATempFileName, fmCreate);
+  ScriptStream.Free;
+
+  ScriptStream := TFileStream.Create(ACwdFileName, fmCreate);
+  ScriptStream.Free;
+
+  if not RenameFile(ATempFileName, AScriptFileName) then
+    raise Exception.Create('Cannot create temporary batch file');
+
+  // Append the final working directory to a separate file
+  ScriptData := rawbytestring(PrepareCmdBatchScript(ACommand) + LineEnding + '@echo %CD%> "' + ACwdFileName + '"' + LineEnding);
+
+  ScriptStream := TFileStream.Create(AScriptFileName, fmCreate);
+  try
+    if Length(ScriptData) > 0 then
+      ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
+  finally
+    ScriptStream.Free;
+  end;
+end;
+
+// Creates a temporary PowerShell script and a file for the resulting working directory
+procedure CreatePowerShellScript(const ACommand: string; out ATempFileName, AScriptFileName, ACwdFileName: string);
+var
+  ScriptData: rawbytestring;
+  ScriptStream: TFileStream;
+begin
+  ATempFileName := SysUtils.GetTempFileName;
+  AScriptFileName := ChangeFileExt(ATempFileName, '.ps1');
+  ACwdFileName := SysUtils.GetTempFileName;
+
+  // Create the temporary files before renaming or using them
+  ScriptStream := TFileStream.Create(ATempFileName, fmCreate);
+  ScriptStream.Free;
+
+  ScriptStream := TFileStream.Create(ACwdFileName, fmCreate);
+  ScriptStream.Free;
+
+  if not RenameFile(ATempFileName, AScriptFileName) then
+    raise Exception.Create('Cannot create temporary PowerShell script');
+
+  // Configure UTF-8 output and save the final working directory
+  ScriptData := UTF8Encode(UTF8Decode('$ProgressPreference = ''SilentlyContinue''' + LineEnding +
+    '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false' + LineEnding + '[Console]::OutputEncoding = $utf8' +
+    LineEnding + '$OutputEncoding = $utf8' + LineEnding + ACommand + LineEnding + '[IO.File]::WriteAllText(''' +
+    StringReplace(ACwdFileName, '''', '''''', [rfReplaceAll]) + ''', (Get-Location).Path, $utf8)' + LineEnding));
+
+  ScriptStream := TFileStream.Create(AScriptFileName, fmCreate);
+  try
+    // Write UTF-8 BOM for Windows PowerShell 5.1
+    ScriptStream.WriteByte($EF);
+    ScriptStream.WriteByte($BB);
+    ScriptStream.WriteByte($BF);
+
+    if Length(ScriptData) > 0 then
+      ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
+  finally
+    ScriptStream.Free;
   end;
 end;
 
@@ -2112,7 +2184,8 @@ begin
   end;
 end;
 
-procedure TCustomTermManager.HandleAgentExecCommand(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean);
+procedure TCustomTermManager.HandleAgentExecCommand(Sender: TObject; const ACommand, AShell: string;
+  var AResult: string; var AAllow: boolean);
 const
   // Unix utilities that cmd.exe does not have
   UNIX_CMDS: array[0..15] of string = (
@@ -2153,6 +2226,7 @@ var
   Hint, FoundCmd, LowCmd: string;
   Family: TShellFamily;
   InQuote: boolean;
+  OldShell, SelectedShell: string;
 begin
   // Block shell execution when system access is disabled
   if Assigned(FAgent) and not FAgent.AllowAccessToSystem then
@@ -2162,95 +2236,144 @@ begin
     Exit;
   end;
 
-  // When host provided own handler, let it run and skip default execution
+  // When host provided own handler, let it run
   if Assigned(FPrevAgentOnExecCommand) then
   begin
-    FPrevAgentOnExecCommand(Sender, ACommand, AResult, AAllow);
+    FPrevAgentOnExecCommand(Sender, ACommand, AShell, AResult, AAllow);
     Exit;
   end;
-  AAllow := True;
-  ExitCode := 0;
-  AResult := ExecuteCommandCapture(ACommand, ExitCode, FAgentCommandTimeout);
 
-  Hint := '';
-  Family := DetectShellFamily(FShellExec);
+  SelectedShell := LowerCase(Trim(AShell));
 
-  // Shell-specific command family mismatches
-  case Family of
-    sfCmd:
+  // Resolve the requested shell without changing the configured default
+  if (SelectedShell = string.Empty) or (SelectedShell = 'native') then
+    SelectedShell := FShellExec
+  else
+  begin
+    {$IFDEF WINDOWS}
+    if SelectedShell = 'cmd' then
+      SelectedShell := 'cmd.exe'
+    else if SelectedShell = 'powershell' then
+      SelectedShell := 'powershell.exe'
+    else if SelectedShell = 'pwsh' then
+      SelectedShell := 'pwsh.exe'
+    else
     begin
-      for I := Low(UNIX_CMDS) to High(UNIX_CMDS) do
-        if IsCommandToken(ACommand, UNIX_CMDS[I]) then
-        begin
-          FoundCmd := UNIX_CMDS[I];
-          Hint := 'Note: this shell is cmd.exe, not Unix. "' + FoundCmd + '" is not available. ' +
-            'Use dir instead of ls, type instead of cat, findstr instead of grep, and remove | head / | tail.';
-          Break;
-        end;
-      // Semicolons are not command separators in cmd.exe
-      if Hint = '' then
+      AAllow := False;
+      AResult := 'Unsupported shell: ' + AShell;
+      Exit;
+    end;
+    {$ELSE}
+    if SelectedShell = 'sh' then
+      SelectedShell := '/bin/sh'
+    else if SelectedShell = 'bash' then
+      SelectedShell := '/bin/bash'
+    else if SelectedShell = 'zsh' then
+      SelectedShell := '/bin/zsh'
+    else if SelectedShell = 'fish' then
+      SelectedShell := '/usr/bin/fish'
+    else
+    begin
+      AAllow := False;
+      AResult := 'Unsupported shell: ' + AShell;
+      Exit;
+    end;
+    {$ENDIF}
+  end;
+
+  OldShell := FShellExec;
+  AAllow := True;
+  try
+    FShellExec := SelectedShell;
+    ExitCode := 0;
+    AResult := ExecuteCommandCapture(ACommand, ExitCode, FAgentCommandTimeout);
+
+    Hint := string.Empty;
+    Family := DetectShellFamily(FShellExec);
+
+    // Shell-specific command family mismatches
+    case Family of
+      sfCmd:
       begin
-        InQuote := False;
-        for I := 1 to Length(ACommand) do
-        begin
-          if ACommand[I] = '"' then
-            InQuote := not InQuote
-          else if (ACommand[I] = ';') and not InQuote then
+        for I := Low(UNIX_CMDS) to High(UNIX_CMDS) do
+          if IsCommandToken(ACommand, UNIX_CMDS[I]) then
           begin
-            Hint := 'Note: cmd.exe does not use ";" to chain commands, it is treated as a literal. ' +
-              'Use "&&" to chain, or run one command per call.';
+            FoundCmd := UNIX_CMDS[I];
+            Hint := 'Note: this shell is cmd.exe, not Unix. "' + FoundCmd + '" is not available. ' +
+              'Use dir instead of ls, type instead of cat, findstr instead of grep, and remove | head / | tail.';
             Break;
           end;
-        end;
-      end;
-      // findstr treats $ and \. literally, not as regex anchors
-      if (Hint = '') and (Pos('findstr', LowerCase(ACommand)) > 0) and ((Pos('$', ACommand) > 0) or (Pos('\.', ACommand) > 0)) then
-        Hint := 'Note: findstr uses limited Windows regex, "$" and "\." are literal characters. ' +
-          'Use the grep tool for text search, it is more reliable.';
-      // Unix find syntax, cmd.exe find only searches text inside files
-      if (Hint = '') and (Pos(' find ', ' ' + LowerCase(ACommand) + ' ') > 0) and
-        ((Pos(' -type ', ' ' + LowerCase(ACommand) + ' ') > 0) or (Pos(' -name ', ' ' + LowerCase(ACommand) + ' ') > 0) or
-        (Pos(' -maxdepth ', ' ' + LowerCase(ACommand) + ' ') > 0) or (Pos(' -not ', ' ' + LowerCase(ACommand) + ' ') > 0)) then
-        Hint := 'Note: "find" in cmd.exe searches text inside files, not filenames, ' +
-          'and does not accept Unix options like -type, -name, -maxdepth. ' +
-          'Use find_files tool with a glob pattern for filename search, or grep tool for text search.';
-      // dir /s produces huge output on large trees, prefer file tools
-      if (Hint = '') and (Pos('dir ', ' ' + LowerCase(ACommand) + ' ') > 0) and
-        (Pos(' /s', ' ' + LowerCase(ACommand) + ' ') > 0) then
-        Hint := 'Note: "dir /s" recurses into all subdirectories, it can take a long time ' +
-          'and produce huge output on large projects. Use find_files with a glob pattern ' +
-          'or list_files on a specific subdirectory instead.';
-    end;
-    sfUnix:
-    begin
-      for I := Low(WIN_CMDS) to High(WIN_CMDS) do
-        if IsCommandToken(ACommand, WIN_CMDS[I]) then
+        // Semicolons are not command separators in cmd.exe
+        if Hint = string.Empty then
         begin
-          FoundCmd := WIN_CMDS[I];
-          Hint := 'Note: this shell is ' + ExtractFileName(FShellExec) + ', not cmd.exe. "' + FoundCmd +
-            '" is not available on Unix. Use ls instead of dir, cat instead of type, grep instead of findstr.';
-          Break;
+          InQuote := False;
+          for I := 1 to Length(ACommand) do
+          begin
+            if ACommand[I] = '"' then
+              InQuote := not InQuote
+            else if (ACommand[I] = ';') and not InQuote then
+            begin
+              Hint := 'Note: cmd.exe does not use ";" to chain commands, it is treated as a literal. ' +
+                'Use "&&" to chain, or run one command per call.';
+              Break;
+            end;
+          end;
         end;
+        // findstr treats $ and \. literally, not as regex anchors
+        if (Hint = string.Empty) and (Pos('findstr', LowerCase(ACommand)) > 0) and
+          ((Pos('$', ACommand) > 0) or (Pos('\\.', ACommand) > 0)) then
+          Hint := 'Note: findstr uses limited Windows regex, "$" and "\." are literal characters. ' +
+            'Use the grep tool for text search, it is more reliable.';
+        // Unix find syntax, cmd.exe find only searches text inside files
+        if (Hint = string.Empty) and (Pos(' find ', ' ' + LowerCase(ACommand) + ' ') > 0) and
+          ((Pos(' -type ', ' ' + LowerCase(ACommand) + ' ') > 0) or (Pos(' -name ', ' ' + LowerCase(ACommand) + ' ') > 0) or
+          (Pos(' -maxdepth ', ' ' + LowerCase(ACommand) + ' ') > 0) or (Pos(' -not ', ' ' + LowerCase(ACommand) + ' ') > 0)) then
+          Hint := 'Note: "find" in cmd.exe searches text inside files, not filenames, ' +
+            'and does not accept Unix options like -type, -name, -maxdepth. ' +
+            'Use find_files tool with a glob pattern for filename search, or grep tool for text search.';
+        // dir /s produces huge output on large trees, prefer file tools
+        if (Hint = string.Empty) and (Pos('dir ', ' ' + LowerCase(ACommand) + ' ') > 0) and
+          (Pos(' /s', ' ' + LowerCase(ACommand) + ' ') > 0) then
+          Hint := 'Note: "dir /s" recurses into all subdirectories, it can take a long time ' +
+            'and produce huge output on large projects. Use find_files with a glob pattern ' +
+            'or list_files on a specific subdirectory instead.';
+      end;
+      sfUnix:
+      begin
+        for I := Low(WIN_CMDS) to High(WIN_CMDS) do
+          if IsCommandToken(ACommand, WIN_CMDS[I]) then
+          begin
+            FoundCmd := WIN_CMDS[I];
+            Hint := 'Note: this shell is ' + ExtractFileName(FShellExec) + ', not cmd.exe. "' + FoundCmd +
+              '" is not available on Unix. Use ls instead of dir, cat instead of type, grep instead of findstr.';
+            Break;
+          end;
+      end;
+      else
+        ; // PowerShell aliases overlap both worlds, no hint to avoid false positives
     end;
-    else
-      ; // PowerShell aliases overlap both worlds, no hint to avoid false positives
+
+    // Universal rule: redirecting listing/search output to files pollutes the workspace
+    if (Hint = string.Empty) and (Pos(' > ', ' ' + ACommand + ' ') > 0) then
+    begin
+      LowCmd := LowerCase(TrimLeft(ACommand));
+      if IsListingOrSearchCommand(LowCmd) then
+        Hint := 'Note: do not redirect listing or search output to a file, use list_files, find_files ' +
+          'or grep tools instead. Those return results directly and do not pollute the workspace.';
+    end;
+
+    // Make empty output distinguishable from a silent success
+    if Trim(AResult) = string.Empty then
+      AResult := '(command produced no output, exit code ' + IntToStr(ExitCode) + ')';
+
+    if Hint <> string.Empty then
+      AResult := AResult + #10 + Hint;
+
+    // Include the exit code so the model can evaluate failures
+    AResult := AResult + LineEnding + 'Exit code: ' + IntToStr(ExitCode);
+  finally
+    FShellExec := OldShell;
   end;
-
-  // Universal rule: redirecting listing/search output to files pollutes the workspace
-  if (Hint = '') and (Pos(' > ', ' ' + ACommand + ' ') > 0) then
-  begin
-    LowCmd := LowerCase(TrimLeft(ACommand));
-    if IsListingOrSearchCommand(LowCmd) then
-      Hint := 'Note: do not redirect listing or search output to a file, use list_files, find_files ' +
-        'or grep tools instead. Those return results directly and do not pollute the workspace.';
-  end;
-
-  // Make empty output distinguishable from a silent success
-  if Trim(AResult) = '' then
-    AResult := '(command produced no output, exit code ' + IntToStr(ExitCode) + ')';
-
-  if Hint <> '' then
-    AResult := AResult + #10 + Hint;
 end;
 
 procedure TCustomTermManager.HandleAgentAskUser(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean);
@@ -4553,8 +4676,6 @@ var
   ScriptFileName: string;
   CwdFileName: string;
   CwdPath: string;
-  ScriptData: RawByteString;
-  ScriptStream: TFileStream;
   TempFileName: string;
   {$ENDIF}
 begin
@@ -4644,32 +4765,7 @@ begin
 
         if HasMultipleLines then
         begin
-          // Create temporary files for the batch script and working directory
-          TempFileName := SysUtils.GetTempFileName;
-          ScriptFileName := ChangeFileExt(TempFileName, '.cmd');
-          CwdFileName := SysUtils.GetTempFileName;
-
-          // Create the temporary files before renaming or using them
-          ScriptStream := TFileStream.Create(TempFileName, fmCreate);
-          ScriptStream.Free;
-
-          ScriptStream := TFileStream.Create(CwdFileName, fmCreate);
-          ScriptStream.Free;
-
-          if not RenameFile(TempFileName, ScriptFileName) then
-            raise Exception.Create('Cannot create temporary batch file');
-
-          // Append the final working directory to a separate file
-          ScriptData := rawbytestring(PrepareCmdBatchScript(ACommand) + LineEnding + '@echo %CD%> "' + CwdFileName + '"' + LineEnding);
-
-          ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
-          try
-            if Length(ScriptData) > 0 then
-              ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
-          finally
-            ScriptStream.Free;
-          end;
-
+          CreateCmdBatchScript(ACommand, TempFileName, ScriptFileName, CwdFileName);
           Process.Parameters.Add('"' + ScriptFileName + '"');
         end
         else
@@ -4680,39 +4776,7 @@ begin
       begin
         if HasMultipleLines then
         begin
-          // Create temporary files for the PowerShell script and working directory
-          TempFileName := SysUtils.GetTempFileName;
-          ScriptFileName := ChangeFileExt(TempFileName, '.ps1');
-          CwdFileName := SysUtils.GetTempFileName;
-
-          ScriptStream := TFileStream.Create(TempFileName, fmCreate);
-          ScriptStream.Free;
-
-          ScriptStream := TFileStream.Create(CwdFileName, fmCreate);
-          ScriptStream.Free;
-
-          if not RenameFile(TempFileName, ScriptFileName) then
-            raise Exception.Create('Cannot create temporary PowerShell script');
-
-          // Configure UTF-8 output and save the final working directory
-          ScriptData := UTF8Encode(UTF8Decode('$ProgressPreference = ''SilentlyContinue''' +
-            LineEnding + '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false' + LineEnding +
-            '[Console]::OutputEncoding = $utf8' + LineEnding + '$OutputEncoding = $utf8' +
-            LineEnding + ACommand + LineEnding + '[IO.File]::WriteAllText(''' +
-            StringReplace(CwdFileName, '''', '''''', [rfReplaceAll]) + ''', (Get-Location).Path, $utf8)' + LineEnding));
-
-          ScriptStream := TFileStream.Create(ScriptFileName, fmCreate);
-          try
-            // Write UTF-8 BOM for Windows PowerShell 5.1
-            ScriptStream.WriteByte($EF);
-            ScriptStream.WriteByte($BB);
-            ScriptStream.WriteByte($BF);
-
-            if Length(ScriptData) > 0 then
-              ScriptStream.WriteBuffer(ScriptData[1], Length(ScriptData));
-          finally
-            ScriptStream.Free;
-          end;
+          CreatePowerShellScript(ACommand, TempFileName, ScriptFileName, CwdFileName);
 
           Process.Parameters.Add('-NoProfile');
           Process.Parameters.Add('-OutputFormat');
@@ -4916,6 +4980,13 @@ var
   EffectiveTimeout: integer;
   HitLimit: boolean;
   ShellFamily: TShellFamily;
+{$IFDEF WINDOWS}
+  HasMultipleLines: boolean;
+  ScriptFileName: string;
+  TempFileName: string;
+  CwdFileName: string;
+  CwdPath: string;
+{$ENDIF}
 
 // Appends bytes to Captured and enforces MaxCaptureBytes limit
   procedure AppendAndCheck(const AData: rawbytestring);
@@ -4964,6 +5035,14 @@ begin
     EffectiveTimeout := ATimeoutMs;
   Captured := '';
   HitLimit := False;
+
+  {$IFDEF WINDOWS}
+  HasMultipleLines := (Pos(#10, ACommand) > 0) or (Pos(#13, ACommand) > 0);
+  ScriptFileName := string.Empty;
+  TempFileName := string.Empty;
+  CwdFileName := string.Empty;
+  {$ENDIF}
+
   Process := TProcess.Create(nil);
   try
     Process.Executable := FShellExec;
@@ -4974,19 +5053,39 @@ begin
       sfCmd:
       begin
         Process.Parameters.Add('/c');
-        Process.Parameters.Add(ACommand);
+
+        if HasMultipleLines then
+        begin
+          CreateCmdBatchScript(ACommand, TempFileName, ScriptFileName, CwdFileName);
+          Process.Parameters.Add('"' + ScriptFileName + '"');
+        end
+        else
+          Process.Parameters.Add(ACommand);
       end;
 
       sfPowerShell:
       begin
-        Process.Parameters.Add('-NoProfile');
-        Process.Parameters.Add('-ExecutionPolicy');
-        Process.Parameters.Add('Bypass');
-        Process.Parameters.Add('-EncodedCommand');
-        Process.Parameters.Add(EncodePowerShellCommand(
-          '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false; ' +
-          '[Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; ' +
-          ACommand));
+        if HasMultipleLines then
+        begin
+          CreatePowerShellScript(ACommand, TempFileName, ScriptFileName, CwdFileName);
+
+          Process.Parameters.Add('-NoProfile');
+          Process.Parameters.Add('-ExecutionPolicy');
+          Process.Parameters.Add('Bypass');
+          Process.Parameters.Add('-File');
+          Process.Parameters.Add(ScriptFileName);
+        end
+        else
+        begin
+          Process.Parameters.Add('-NoProfile');
+          Process.Parameters.Add('-ExecutionPolicy');
+          Process.Parameters.Add('Bypass');
+          Process.Parameters.Add('-EncodedCommand');
+          Process.Parameters.Add(EncodePowerShellCommand(
+            '$utf8 = New-Object System.Text.UTF8Encoding -ArgumentList $false; ' +
+            '[Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; ' +
+            ACommand));
+        end;
       end;
 
       sfUnix:
@@ -5036,6 +5135,16 @@ begin
     while (not HitLimit) and (Process.Stderr.NumBytesAvailable > 0) do
       ReadAvailable(Process.Stderr, Process.Stderr.NumBytesAvailable);
 
+    {$IFDEF WINDOWS}
+    // Restore the working directory after a multi-line batch script
+    if HasMultipleLines and (CwdFileName <> string.Empty) and FileExists(CwdFileName) then
+    begin
+      CwdPath := Trim(ReadSmallTextFile(CwdFileName));
+      if DirectoryExists(CwdPath) then
+        SetPath(CwdPath);
+    end;
+    {$ENDIF}
+
     AExitCode := Process.ExitStatus;
 
     Tmp := Captured;
@@ -5053,6 +5162,15 @@ begin
     Result := string(Tmp);
   finally
     Process.Free;
+    {$IFDEF WINDOWS}
+    // Remove temporary files after execution
+    if (ScriptFileName <> string.Empty) and FileExists(ScriptFileName) then
+      SysUtils.DeleteFile(ScriptFileName);
+    if (TempFileName <> string.Empty) and FileExists(TempFileName) then
+      SysUtils.DeleteFile(TempFileName);
+    if (CwdFileName <> string.Empty) and FileExists(CwdFileName) then
+      SysUtils.DeleteFile(CwdFileName);
+    {$ENDIF}
   end;
 end;
 

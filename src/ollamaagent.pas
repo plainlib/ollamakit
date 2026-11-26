@@ -68,7 +68,8 @@ type
   TAgentThinkingEvent = procedure(Sender: TObject; const AText: string) of object;
   TAgentToolCallEvent = procedure(Sender: TObject; const AName, AArgsJson: string) of object;
   TAgentToolResultEvent = procedure(Sender: TObject; const AName, AResult: string) of object;
-  TAgentExecCommandEvent = procedure(Sender: TObject; const ACommand: string; var AResult: string; var AAllow: boolean) of object;
+  TAgentExecCommandEvent = procedure(Sender: TObject; const ACommand, AShell: string; var AResult: string;
+    var AAllow: boolean) of object;
   TAgentFinishEvent = procedure(Sender: TObject; AReason: TAgentFinishReason; const AAnswer, AErrorMsg: string) of object;
   TAgentToolExecuteEvent = procedure(Sender: TObject; const AArgsJson: string; var AResult: string) of object;
   TAgentAskUserEvent = procedure(Sender: TObject; const AQuestion: string; var AAnswer: string; var AAllow: boolean) of object;
@@ -485,7 +486,7 @@ type
     property OnToolCall;
     // Fired with the tool result before it is sent back to the model
     property OnToolResult;
-    // Fired for exec_command tool, host executes and returns the output
+    // Fired for exec_command tool, host executes the command using the selected shell
     property OnExecCommand;
     // Fired for ask_user tool, host shows the question and returns the answer
     property OnAskUser;
@@ -1946,7 +1947,7 @@ type
 
   TExecCommandCall = class(TAgentCallBase)
   public
-    Command: string;
+    Command, Shell: string;
     Allow: boolean;
     Result: string;
     procedure Invoke; override;
@@ -2111,10 +2112,10 @@ end;
 procedure TExecCommandCall.Invoke;
 begin
   Allow := True;
-  Result := '';
+  Result := string.Empty;
   if Assigned(Agent.FOnExecCommand) then
   try
-    Agent.FOnExecCommand(Agent, Command, Result, Allow);
+    Agent.FOnExecCommand(Agent, Command, Shell, Result, Allow);
   except
     ; // User handler raised, treat as no-op
   end;
@@ -5077,12 +5078,22 @@ begin
     end;
 
     if afExecCommand in FFeatures then
+    begin
+      {$IFDEF WINDOWS}
       AddTool(Arr, 'exec_command',
-        'Execute a shell command in the current workspace and return combined stdout and stderr. ' +
-        'The command runs in the host shell (see the environment description for the exact shell ' +
-        'and its rules). Redirect with > and >>. Prefer portable commands where possible. ' +
-        'See the environment description for OS-specific notes, path syntax and forbidden utilities.',
-        '{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}');
+        'Execute a shell command or multi-line script in the current workspace and return combined stdout and stderr. ' +
+        'Use cmd for Windows Command Prompt, powershell for Windows PowerShell, or pwsh for PowerShell 7. ' +
+        'Use native or omit shell to run with the host configured shell. The default shell is cmd.exe. ' +
+        'Choose the shell that matches the command syntax. Scripts may use variables, loops, conditions and error handling.',
+        '{"type":"object","properties":{"command":{"type":"string","description":"Command or multi-line script to execute"},"shell":{"type":"string","enum":["native","cmd","powershell","pwsh"],"description":"Shell to execute; native or omitted uses the configured shell"}},"required":["command"]}');
+      {$ELSE}
+      AddTool(Arr, 'exec_command',
+        'Execute a shell command or multi-line script in the current workspace and return combined stdout and stderr. ' +
+        'Use sh, bash, zsh or fish to select a Linux shell. Use native or omit shell to run with the host configured shell. ' +
+        'Choose the shell that matches the command syntax. Scripts may use variables, loops, conditions and error handling.',
+        '{"type":"object","properties":{"command":{"type":"string","description":"Command or multi-line script to execute"},"shell":{"type":"string","enum":["native","sh","bash","zsh","fish"],"description":"Shell to execute; native or omitted uses the configured shell"}},"required":["command"]}');
+      {$ENDIF}
+    end;
 
     if afGit in FFeatures then
     begin
@@ -8312,7 +8323,7 @@ var
   I, P: integer;
   Args: TJSONObject;
   Call: TExecCommandCall;
-  Command, Res, CleanName: string;
+  Command, Shell, Res, CleanName: string;
   Allow: boolean;
 begin
   // Some models append <tool_call> or whitespace to the function name, strip it
@@ -8366,7 +8377,9 @@ begin
     else if CleanName = 'edit' then
       CleanName := 'edit_file'
     else if CleanName = 'delete' then
-      CleanName := 'delete_file';
+      CleanName := 'delete_file'
+    else if CleanName = 'exec_script' then
+      CleanName := 'exec_command';
 
     if afFileTools in FFeatures then
     begin
@@ -8419,21 +8432,40 @@ begin
       Result := '{"error": "no OnExecCommand handler"}';
       if not Assigned(FOnExecCommand) then
         Exit;
-      Command := '';
+
+      Command := string.Empty;
+      Shell := 'native';
       if Args <> nil then
-        Command := Args.Get('command', '');
+      begin
+        Command := Args.Get('command', string.Empty);
+
+        // Support calls from older conversations using exec_script
+        if (Command = string.Empty) and (CleanName = 'exec_command') then
+          Command := Args.Get('script', string.Empty);
+
+        Shell := Args.Get('shell', 'native');
+      end;
+
+      if Trim(Command) = string.Empty then
+      begin
+        Result := '{"error": "command is empty"}';
+        Exit;
+      end;
+
       Call := TExecCommandCall.Create;
       try
         Call.Agent := Self;
         Call.Command := Command;
+        Call.Shell := Shell;
         Call.Allow := True;
-        Call.Result := '';
+        Call.Result := string.Empty;
         TThread.Synchronize(nil, @Call.Invoke);
         Allow := Call.Allow;
         Res := Call.Result;
       finally
         Call.Free;
       end;
+
       if Allow then
         Result := Res
       else
