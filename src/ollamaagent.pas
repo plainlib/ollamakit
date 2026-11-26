@@ -15,7 +15,7 @@ unit OllamaAgent;
 interface
 
 uses
-  Classes, SysUtils, Controls, FileUtil, LazFileUtils, fpjson, jsonparser, StringHelper, OllamaManager, Network;
+  Classes, SysUtils, Controls, FileUtil, LazFileUtils, Math, RegExpr, Masks, fpjson, jsonparser, StringHelper, OllamaManager, Network;
 
 type
   // Feature toggles controlled by the Features set property
@@ -494,9 +494,6 @@ type
   end;
 
 implementation
-
-uses
-  Math, RegExpr, Masks;
 
 type
   // Encoding selector for ReadTextFileSafe

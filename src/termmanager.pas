@@ -11,8 +11,22 @@ unit TermManager;
 interface
 
 uses
-  Classes, SysUtils, Controls, DateUtils, Process, fpjson, jsonparser, TypInfo, StringHelper,
-  OllamaManager, OllamaAgent, AgentConfig{$IFDEF WINDOWS}, Windows{$ENDIF};
+  {$IFDEF WINDOWS}
+  Windows,
+  {$ENDIF}
+  Classes,
+  SysUtils,
+  Controls,
+  DateUtils,
+  Process,
+  TypInfo,
+  fpjson,
+  jsonparser,
+  OllamaManager,
+  OllamaAgent,
+  AgentConfig,
+  StringHelper,
+  CheckUpdates;
 
 type
   // Classification of a single input line
@@ -37,6 +51,7 @@ type
   TTermOutputEvent = procedure(Sender: TObject; const AText: string; AIsStderr: boolean) of object;
   TTermAgentEvent = procedure(Sender: TObject; const AText: string) of object;
   TTermExitEvent = procedure(Sender: TObject; AExitCode: integer) of object;
+  TTermVersionEvent = procedure(Sender: TObject) of object;
 
 type
   // Foreground and background pair for a single badge style
@@ -168,6 +183,7 @@ type
   TCustomTermManager = class(TComponent)
   private
     FPath: string;
+    FAppName: string;
     FPrompt: string;
     FStartupPrompt: string;
     FWelcome: TCaption;
@@ -223,6 +239,7 @@ type
     FOnOutput: TTermOutputEvent;
     FOnAgentExecute: TTermAgentEvent;
     FOnExit: TTermExitEvent;
+    FOnCheckVersion: TTermVersionEvent;
     // Ollama operation tracking for synchronous console commands
     FOllamaOpDone: boolean;
     FOllamaOpKind: TOllamaErrorKind;
@@ -404,6 +421,7 @@ type
     procedure RestoreActiveChat;
 
     property Path: string read FPath write SetPath;
+    property AppName: string read FAppName write FAppName;
     property Prompt: string read FPrompt write FPrompt;
     property StartupPrompt: string read FStartupPrompt write FStartupPrompt;
     property Welcome: TCaption read FWelcome write FWelcome;
@@ -436,12 +454,17 @@ type
     property OnRoute: TTermRouteEvent read FOnRoute write FOnRoute;
     property OnOutput: TTermOutputEvent read FOnOutput write FOnOutput;
     property OnAgentExecute: TTermAgentEvent read FOnAgentExecute write FOnAgentExecute;
+    property OnCheckVersion: TTermVersionEvent read FOnCheckVersion write FOnCheckVersion;
     property OnExit: TTermExitEvent read FOnExit write FOnExit;
     property Agent: TCustomOllamaAgent read FAgent write SetAgent;
   end;
 
   TTermManager = class(TCustomTermManager)
   published
+    // Agent component that handles agent-classified input, leave empty to disable
+    property Agent;
+    // Application name displayed in the terminal title
+    property AppName;
     // Working directory for shell commands and agent file tools, empty uses process cwd
     property Path;
     // Prompt template, supports {path}, {model}, {chat}, {chatindex}, context and usage placeholders
@@ -502,8 +525,8 @@ type
     property OnAgentExecute;
     // Fires when the interactive loop terminates, receives last command exit code
     property OnExit;
-    // Agent component that handles agent-classified input, leave empty to disable
-    property Agent;
+    // Event triggered when the version check is requested
+    property OnCheckVersion;
   end;
 
 implementation
@@ -1090,6 +1113,7 @@ begin
   inherited Create(AOwner);
   // Empty Path means "use process current directory" at runtime
   FPath := '';
+  FAppName := 'PlainConsole';
   FPrompt := '{path}> ';
   FWelcome := '';
   FThinkingLabel := '[Thinking]';
@@ -1145,6 +1169,7 @@ begin
   FBuiltinCommands.Add('models');
   FBuiltinCommands.Add('term');
   FBuiltinCommands.Add('ollama');
+  FBuiltinCommands.Add('version');
   FOllamaOpDone := True;
   FOllamaOpKind := oekNone;
   FOllamaOpError := '';
@@ -1191,7 +1216,7 @@ begin
   if csDesigning in ComponentState then
     Exit;
 
-  Title := 'PlainConsole - ' + Trim(GetPromptText);
+  Title := FAppName + ' - ' + Trim(GetPromptText);
 
   // Remove the trailing prompt marker from the window title
   if (Title <> string.Empty) and (Title[Length(Title)] = '>') then
@@ -2910,6 +2935,13 @@ begin
     HandleModelsCommand(Arg)
   else if Cmd = 'ollama' then
     HandleOllamaCommand(Arg)
+  else if Cmd = 'version' then
+  begin
+    if Assigned(FOnCheckVersion) then
+      FOnCheckVersion(Self)
+    else
+      DoOutput(FAppName + LineEnding, False);
+  end
   else
     DoOutput('Unknown builtin: ' + Cmd + LineEnding, True);
 end;
