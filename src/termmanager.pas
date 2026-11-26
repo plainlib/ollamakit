@@ -508,7 +508,7 @@ const
     'tmux|screen|mc|ranger|nnn|lf|yazi|python|python.exe|python3|python3.exe|ipython|ipython.exe|' +
     'node|node.exe|deno|bun|irb|pry|ghci|lua|lua.exe|psql|psql.exe|mysql|mysql.exe|sqlite3|mongosh|redis-cli|' +
     'sqlcmd|sqlcmd.exe|gdb|gdb.exe|lldb|fdb|debug|diskpart|diskpart.exe|wsl|wsl.exe|powershell|powershell.exe|pwsh|pwsh.exe|' +
-    'cmd|cmd.exe|sudo|su|passwd|doas|login|gpg|openssl|ollama|ollama.exe|';
+    'cmd|cmd.exe|sudo|su|passwd|doas|login|gpg|openssl|ollama|ollama.exe|choice|pause|';
 
   // Buffer type for piping output with zero-initialization
 type
@@ -4525,7 +4525,8 @@ begin
   CommandName := LowerCase(ExtractFileName(StringReplace(CommandName, '\', '/', [rfReplaceAll])));
 
   // Multi-line scripts always capture output through the terminal
-  IsInteractive := not HasMultipleLines and (Pos('|' + CommandName + '|', INTERACTIVE_COMMANDS) > 0);
+  IsInteractive := not HasMultipleLines and ((Pos('|' + CommandName + '|', INTERACTIVE_COMMANDS) > 0) or
+    ((CommandName = 'set') and (Pos('/p', LowerCase(CommandText)) > 0)));
 
   RawData := '';
   {$IFDEF WINDOWS}
