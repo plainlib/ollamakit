@@ -58,6 +58,8 @@ type
   // Success indicates whether the operation completed successfully.
   TModelOperationEvent = procedure(Sender: TObject; const ModelName: string; External: boolean; Success: boolean;
     const ErrorMsg: string) of object;
+  // Fired around a popup menu rebuild; the app may close/reopen the menu
+  TOllamaMenuBuildEvent = procedure(Sender: TObject; APopupMenu: TPopupMenu) of object;
 
   { Background operation kinds }
   TOllamaBgOp = (boPull, boStart, boStop, boRefresh);
@@ -133,6 +135,8 @@ type
     FOnConnected: TConnectedEvent;
     FOnModelStart: TModelOperationEvent;
     FOnModelStop: TModelOperationEvent;
+    FOnMenuUpdating: TOllamaMenuBuildEvent;
+    FOnMenuUpdated: TOllamaMenuBuildEvent;
 
     // Internal state
     FInstalledModels: TStringList;
@@ -323,6 +327,8 @@ type
     property OnConnected: TConnectedEvent read FOnConnected write FOnConnected;
     property OnModelStart: TModelOperationEvent read FOnModelStart write FOnModelStart;
     property OnModelStop: TModelOperationEvent read FOnModelStop write FOnModelStop;
+    property OnMenuUpdating: TOllamaMenuBuildEvent read FOnMenuUpdating write FOnMenuUpdating;
+    property OnMenuUpdated: TOllamaMenuBuildEvent read FOnMenuUpdated write FOnMenuUpdated;
   end;
 
   { TOllamaManager }
@@ -369,6 +375,12 @@ type
     property OnModelStart;
     // Occurs when a model stop operation completes.
     property OnModelStop;
+    // Fired before the popup menu contents are rebuilt; the app may save
+    // the popup point and close the menu to avoid a jump on GTK2.
+    property OnMenuUpdating;
+    // Fired after the popup menu contents have been rebuilt; the app may
+    // reopen the menu at the saved point.
+    property OnMenuUpdated;
   end;
 
 implementation
@@ -1484,6 +1496,13 @@ begin
   if csDesigning in ComponentState then
     Exit;
 
+  if Assigned(FOnMenuUpdating) then
+  try
+    FOnMenuUpdating(Self, FPopupMenu);
+  except
+    ; // Ignore user handler exceptions
+  end;
+
   ClearPopupMenu;
 
   InsertPos := 0;
@@ -1751,6 +1770,13 @@ begin
   ModelItem.Caption := '-';
   ModelItem.Tag := TAG_SEPARATOR;
   FPopupMenu.Items.Insert(InsertPos, ModelItem);
+
+  if Assigned(FOnMenuUpdated) then
+  try
+    FOnMenuUpdated(Self, FPopupMenu);
+  except
+    ; // Ignore user handler exceptions
+  end;
 end;
 
 procedure TCustomOllamaManager.ProgressTimerTick(Sender: TObject);
