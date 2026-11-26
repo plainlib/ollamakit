@@ -2562,7 +2562,7 @@ end;
 
 function TCustomTermManager.ClassifyLine(const ALine: string; out APayload: string): TTermInputKind;
 var
-  S, FirstLine, First, GroupCommand, CommandToken: string;
+  S, FirstLine, First, GroupCommand, CommandToken, Second: string;
   P, I, GroupPos: integer;
   HasMultipleLines, InQuotes: boolean;
 begin
@@ -2632,6 +2632,29 @@ begin
     Delete(First, 1, 1);
 
   CommandToken := First;
+
+  // Route unknown set/get properties to the shell
+  if (First = 'set') or (First = 'get') then
+  begin
+    P := 1;
+
+    while (P <= Length(FirstLine)) and not (FirstLine[P] in [#9, ' ']) do
+      Inc(P);
+
+    while (P <= Length(FirstLine)) and (FirstLine[P] in [#9, ' ']) do
+      Inc(P);
+
+    I := P;
+
+    while (P <= Length(FirstLine)) and not (FirstLine[P] in [#9, ' ']) do
+      Inc(P);
+
+    Second := LowerCase(Copy(FirstLine, I, P - I));
+
+    if (Second <> string.Empty) and (Second <> 'chat') and (Second <> 'chats') and (Second <> 'chatname') and
+      (Second <> 'chatprompt') and (Copy(Second, 1, 5) <> 'term.') and not IsAgentProperty(Second) then
+      Exit(tikCommand);
+  end;
 
   // Application builtins must take precedence over shell commands
   if FBuiltinCommands.IndexOf(ExtractFileName(StringReplace(First, '\', '/', [rfReplaceAll]))) >= 0 then

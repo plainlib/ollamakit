@@ -25,6 +25,9 @@ function FormatOllamaHelp: string;
 // Returns multi-line list of current agent settings
 function FormatAgentConfig(AAgent: TCustomOllamaAgent): string;
 
+// Checks whether a property name or alias is supported
+function IsAgentProperty(const AName: string): boolean;
+
 // Returns value of property, False with AError on unknown name or nil agent
 function GetAgentProperty(AAgent: TCustomOllamaAgent; const AName: string; out AValue, AError: string): boolean;
 
@@ -772,6 +775,13 @@ begin
   finally
     T.Free;
   end;
+end;
+
+function IsAgentProperty(const AName: string): boolean;
+var
+  Canonical: string;
+begin
+  Result := FindProperty(AName, Canonical);
 end;
 
 function GetAgentProperty(AAgent: TCustomOllamaAgent; const AName: string; out AValue, AError: string): boolean;
