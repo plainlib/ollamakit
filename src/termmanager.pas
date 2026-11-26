@@ -2114,6 +2114,14 @@ var
   Family: TShellFamily;
   InQuote: boolean;
 begin
+  // Block shell execution when system access is disabled
+  if Assigned(FAgent) and not FAgent.AllowAccessToSystem then
+  begin
+    AAllow := False;
+    AResult := 'Command execution is disabled when system access is blocked';
+    Exit;
+  end;
+
   // When host provided own handler, let it run and skip default execution
   if Assigned(FPrevAgentOnExecCommand) then
   begin

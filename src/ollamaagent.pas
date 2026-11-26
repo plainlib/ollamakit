@@ -8310,6 +8310,12 @@ begin
 
     if (CleanName = 'exec_command') and (afExecCommand in FFeatures) then
     begin
+      if not FAllowAccessToSystem then
+      begin
+        Result := '{"error": "exec_command is disabled when system access is blocked"}';
+        Exit;
+      end;
+
       Result := '{"error": "no OnExecCommand handler"}';
       if not Assigned(FOnExecCommand) then
         Exit;
@@ -8337,14 +8343,23 @@ begin
 
     if afGit in FFeatures then
     begin
-      if CleanName = 'git_status' then
-        Exit(DoGitStatus(Args))
-      else if CleanName = 'git_diff' then
-        Exit(DoGitDiff(Args))
-      else if CleanName = 'git_log' then
-        Exit(DoGitLog(Args))
-      else if CleanName = 'git_commit' then
-        Exit(DoGitCommit(Args));
+      if (CleanName = 'git_status') or (CleanName = 'git_diff') or (CleanName = 'git_log') or (CleanName = 'git_commit') then
+      begin
+        if not FAllowAccessToSystem then
+        begin
+          Result := '{"error": "git tools are disabled when system access is blocked"}';
+          Exit;
+        end;
+
+        if CleanName = 'git_status' then
+          Exit(DoGitStatus(Args))
+        else if CleanName = 'git_diff' then
+          Exit(DoGitDiff(Args))
+        else if CleanName = 'git_log' then
+          Exit(DoGitLog(Args))
+        else if CleanName = 'git_commit' then
+          Exit(DoGitCommit(Args));
+      end;
     end;
 
     if (CleanName = 'ask_user') and (afInteractive in FFeatures) then
