@@ -1181,7 +1181,11 @@ begin
   if csDesigning in ComponentState then
     Exit;
 
-  Title := 'PlainConsole - ' + GetPromptText;
+  Title := 'PlainConsole - ' + Trim(GetPromptText);
+
+  // Remove the trailing prompt marker from the window title
+  if (Title <> string.Empty) and (Title[Length(Title)] = '>') then
+    Delete(Title, Length(Title), 1);
 
   {$IFDEF WINDOWS}
   SetConsoleTitleW(PWideChar(UTF8Decode(Title)));
