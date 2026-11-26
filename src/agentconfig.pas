@@ -501,6 +501,7 @@ begin
       Row('term.showagentstats', 'on|off, show final agent run statistics');
       Row('term.agentstatsformat', 'completion statistics template, supports placeholders');
       Row('term.commandtimeout', 'ms, user command timeout, 0 = none');
+      Row('term.escdelay', 'ms, double Esc delay to cancel, 0 = immediate cancel');
       Row('term.maxcapturebytes', 'captured output limit per command');
       Row('term.agentcommandtimeout', 'agent command timeout ms, 0 = unlimited');
 

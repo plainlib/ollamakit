@@ -187,6 +187,9 @@ type
     FHistoryMax: integer;
     FShellExec: string;
     FCommandTimeout: integer;
+    FEscDelay: integer;
+    FEscPending: boolean;
+    FEscTick: QWord;
     FMaxCaptureBytes: integer; // Maximum captured bytes from agent exec_command, truncated with notice
     FAgentCommandTimeout: integer; // Timeout in milliseconds for agent exec_command, zero means no limit
     FUsePrefixes: boolean;
@@ -340,6 +343,8 @@ type
     procedure HandleBuiltin(const ALine: string); virtual;
     // Runs external command, streams output, returns exit code
     function ExecuteCommand(const ACommand: string): integer; virtual;
+    // Checks whether cancellation keys were pressed
+    function CheckAndConsumeCancel: boolean;
     // Reads one line from user with editing and history
     function ReadLine: string; virtual;
     // Appends a line to history respecting HistoryMax
@@ -419,6 +424,7 @@ type
     property HistoryMax: integer read FHistoryMax write FHistoryMax default 200;
     property ShellExec: string read FShellExec write FShellExec;
     property CommandTimeout: integer read FCommandTimeout write FCommandTimeout default 0;
+    property EscDelay: integer read FEscDelay write FEscDelay default 500;
     property MaxCaptureBytes: integer read FMaxCaptureBytes write FMaxCaptureBytes default 65536;
     property AgentCommandTimeout: integer read FAgentCommandTimeout write FAgentCommandTimeout default 30000;
     property UsePrefixes: boolean read FUsePrefixes write FUsePrefixes default True;
@@ -476,6 +482,8 @@ type
     property ShellExec;
     // Timeout in milliseconds for user-typed external commands, zero means no limit
     property CommandTimeout;
+    // Delay in milliseconds for the second Esc press to cancel
+    property EscDelay;
     // Cap on bytes captured from agent exec_command, excess is truncated with a notice
     property MaxCaptureBytes;
     // Timeout in milliseconds for agent exec_command, zero means no limit, default 30 seconds
@@ -516,7 +524,6 @@ type
 
 // Forward declarations for helpers used before their definition
 procedure ClearScreen; forward;
-function CheckAndConsumeCancel: boolean; forward;
 {$IFDEF WINDOWS}
 procedure ClearCancelKeyState; forward;
 procedure WriteUtf8ToHandle(AHandle: THandle; const ABytes: RawByteString); forward;
@@ -1148,6 +1155,9 @@ begin
   FHistoryMax := 200;
   FShellExec := 'cmd.exe';
   FCommandTimeout := 0;
+  FEscDelay := 500;
+  FEscPending := False;
+  FEscTick := 0;
   FMaxCaptureBytes := 65536;
   FAgentCommandTimeout := 30000;
   FUsePrefixes := True;
@@ -1926,6 +1936,7 @@ begin
     end;
     afrCancelled:
     begin
+      WriteLine('', False);
       SetColor(tcWarnBadge);
       WriteText('[Cancelled by user]', True);
       SetColor(tcDefault);
@@ -3314,6 +3325,16 @@ begin
     end;
     FCommandTimeout := IntVal;
   end
+  else if N = 'escdelay' then
+  begin
+    if not TryStrToInt(V, IntVal) or (IntVal < 0) then
+    begin
+      DoOutput('error: term.escdelay must be a non-negative integer' + LineEnding, True);
+      Exit;
+    end;
+    FEscDelay := IntVal;
+    FEscPending := False;
+  end
   else if N = 'maxcapturebytes' then
   begin
     if not TryStrToInt(V, IntVal) or (IntVal <= 0) then
@@ -3410,6 +3431,8 @@ begin
     Val := FAgentStatsFormat
   else if N = 'commandtimeout' then
     Val := IntToStr(FCommandTimeout)
+  else if N = 'escdelay' then
+    Val := IntToStr(FEscDelay)
   else if N = 'maxcapturebytes' then
     Val := IntToStr(FMaxCaptureBytes)
   else if N = 'agentcommandtimeout' then
@@ -3454,6 +3477,7 @@ begin
     Row('term.showagentstats', BoolToStr(FShowAgentStats, 'on', 'off'));
     Row('term.agentstatsformat', FAgentStatsFormat);
     Row('term.commandtimeout', IntToStr(FCommandTimeout));
+    Row('term.escdelay', IntToStr(FEscDelay));
     Row('term.maxcapturebytes', IntToStr(FMaxCaptureBytes));
     Row('term.agentcommandtimeout', IntToStr(FAgentCommandTimeout));
 
@@ -4712,7 +4736,10 @@ begin
     Process.CurrentDirectory := GetEffectivePath;
     {$IFDEF WINDOWS}
     if not IsInteractive then
+    begin
+      FEscPending := False;
       ClearCancelKeyState;
+    end;
     {$ENDIF}
     Process.Execute;
     StartTime := Now;
@@ -5185,6 +5212,7 @@ begin
             FAgent.OnContextUsage := @HandleAgentContextUsage;
             try
               FFirstChunkSeen := False;
+              FEscPending := False;
               ClearCancelKeyState;
               FAgent.RunAsync(Payload);
               // Pump events and watch for Esc so user can cancel
@@ -5581,29 +5609,6 @@ begin
   end;
 end;
 
-// Consumes Esc or Ctrl+C without removing pending keyboard input
-function CheckAndConsumeCancel: boolean;
-var
-  EscPressed, CtrlPressed, CPressed: boolean;
-begin
-  Result := False;
-
-  // Ignore cancellation keys while another window is active
-  if GetForegroundWindow <> GetConsoleWindow then
-  begin
-    ClearCancelKeyState;
-    Exit;
-  end;
-
-  // Detect Esc and Ctrl+C without touching the console input queue
-  EscPressed := (GetAsyncKeyState(VK_ESCAPE) and $0001) <> 0;
-  CtrlPressed := (GetAsyncKeyState(VK_LCONTROL) and $8000 <> 0) or
-    (GetAsyncKeyState(VK_RCONTROL) and $8000 <> 0);
-  CPressed := (GetAsyncKeyState(Ord('C')) and $0001) <> 0;
-
-  Result := EscPressed or (CtrlPressed and CPressed);
-end;
-
 // Hides console cursor, used to suppress flicker during redraw
 procedure HideConsoleCursor;
 begin
@@ -5614,6 +5619,62 @@ end;
 procedure ShowConsoleCursor;
 begin
   ConWriteUtf8(#27'[?25h');
+end;
+
+// Consumes Esc or Ctrl+C without removing pending keyboard input
+function TCustomTermManager.CheckAndConsumeCancel: boolean;
+var
+  EscPressed, CtrlPressed, CPressed: boolean;
+  CurrentTick: QWord;
+begin
+  Result := False;
+
+  // Ignore cancellation keys while another window is active
+  if GetForegroundWindow <> GetConsoleWindow then
+  begin
+    ClearCancelKeyState;
+    FEscPending := False;
+    Exit;
+  end;
+
+  // Detect Esc and Ctrl+C without touching the console input queue
+  EscPressed := (GetAsyncKeyState(VK_ESCAPE) and $0001) <> 0;
+  CtrlPressed := (GetAsyncKeyState(VK_LCONTROL) and $8000 <> 0) or
+    (GetAsyncKeyState(VK_RCONTROL) and $8000 <> 0);
+  CPressed := (GetAsyncKeyState(Ord('C')) and $0001) <> 0;
+
+  if CtrlPressed and CPressed then
+  begin
+    FEscPending := False;
+    Exit(True);
+  end;
+
+  if not EscPressed then
+    Exit;
+
+  if FEscDelay <= 0 then
+  begin
+    FEscPending := False;
+    Exit(True);
+  end;
+
+  CurrentTick := GetTickCount64;
+
+  if FEscPending and (CurrentTick - FEscTick <= QWord(FEscDelay)) then
+  begin
+    FEscPending := False;
+    Exit(True);
+  end;
+
+  FEscPending := True;
+  FEscTick := CurrentTick;
+
+  // Warn that a second Esc press is required to cancel
+  DoOutput(LineEnding, False);
+  SetColor(tcWarnBadge);
+  DoOutput('Press Esc again to cancel the operation', False);
+  SetColor(tcDefault);
+  DoOutput(LineEnding, False);
 end;
 
 function TCustomTermManager.ReadLine: string;
@@ -7199,7 +7260,7 @@ begin
   Write(#27'[2J'#27'[H');
 end;
 
-function CheckAndConsumeCancel: boolean;
+function TCustomTermManager.CheckAndConsumeCancel: boolean;
 begin
   Result := False;
 end;
