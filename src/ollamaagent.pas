@@ -4427,7 +4427,9 @@ begin
           '- Use Windows CMD syntax and native commands such as dir, cd, copy, ' +
           'move, del, type and findstr. Use "%" for environment variables, ' +
           '"&&" to chain commands and "nul" to discard output.' + LineEnding +
-          '- Do not use PowerShell or Unix commands and syntax.' + LineEnding;
+          '- Do not use PowerShell or Unix commands and syntax.' + LineEnding +
+          '- Do not use Unix commands such as head, tail, grep, sed, awk, cat or ls.' + LineEnding +
+          '- Use findstr instead of grep, type instead of cat, and dir instead of ls.' + LineEnding;
 
       'powershell.exe', 'powershell', 'pwsh.exe', 'pwsh':
         EnvironmentBlock := EnvironmentBlock +
