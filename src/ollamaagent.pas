@@ -15,7 +15,7 @@ unit OllamaAgent;
 interface
 
 uses
-  Classes, SysUtils, Controls, FileUtil, fpjson, jsonparser, StringHelper, OllamaManager, Network;
+  Classes, SysUtils, Controls, FileUtil, LazFileUtils, fpjson, jsonparser, StringHelper, OllamaManager, Network;
 
 type
   // Feature toggles controlled by the Features set property
@@ -4685,29 +4685,130 @@ end;
 function TCustomOllamaAgent.SafePath(const ARelPath: string): string;
 var
   Root, Full, Normalized: string;
+
+  function ResolveLinks(const APath: string): string;
+  var
+    WorkPath, PathRoot, Remaining, CurrentPath: string;
+    Candidate, Part, LinkTargetPath, Suffix: string;
+    LinkTarget: rawbytestring;
+    PartEnd, Pass: integer;
+    FoundLink: boolean;
+  begin
+    Result := string.Empty;
+    WorkPath := ExpandFileName(APath);
+    LinkTarget := '';
+
+    // Resolve links one at a time and restart to detect nested links
+    for Pass := 1 to 64 do
+    begin
+      PathRoot := ExtractFileDrive(WorkPath);
+
+      if PathRoot = string.Empty then
+        PathRoot := PathDelim
+      else
+        PathRoot := IncludeTrailingPathDelimiter(PathRoot);
+
+      Remaining := Copy(WorkPath, Length(PathRoot) + 1, MaxInt);
+      CurrentPath := PathRoot;
+      FoundLink := False;
+
+      while Remaining <> string.Empty do
+      begin
+        PartEnd := Pos(PathDelim, Remaining);
+
+        if PartEnd > 0 then
+        begin
+          Part := Copy(Remaining, 1, PartEnd - 1);
+          Delete(Remaining, 1, PartEnd);
+        end
+        else
+        begin
+          Part := Remaining;
+          Remaining := string.Empty;
+        end;
+
+        if Part = string.Empty then
+          Continue;
+
+        Candidate := IncludeTrailingPathDelimiter(CurrentPath) + Part;
+
+        // Resolve symbolic links and Windows junctions
+        if FileIsSymlink(Candidate) then
+        begin
+          if not FileGetSymLinkTarget(Candidate, LinkTarget) then
+            Exit;
+
+          if IsPathAbsolute(LinkTarget) then
+            LinkTargetPath := ExpandFileName(LinkTarget)
+          else
+            LinkTargetPath := ExpandFileName(ExtractFilePath(Candidate) + LinkTarget);
+
+          Suffix := Remaining;
+
+          if Suffix <> string.Empty then
+            WorkPath := ExpandFileName(IncludeTrailingPathDelimiter(LinkTargetPath) + Suffix)
+          else
+            WorkPath := LinkTargetPath;
+
+          FoundLink := True;
+          Break;
+        end;
+
+        CurrentPath := Candidate;
+      end;
+
+      if not FoundLink then
+      begin
+        Result := WorkPath;
+        Exit;
+      end;
+    end;
+
+    // Reject paths with excessive or circular link chains
+    Result := string.Empty;
+  end;
+
 begin
-  Result := '';
+  Result := string.Empty;
   Root := IncludeTrailingPathDelimiter(GetEffectiveRootPath);
+
   // Normalize virtual paths and forward slashes
   Normalized := StringReplace(NormalizeToolPath(ARelPath), '/', PathDelim, [rfReplaceAll]);
+
   // Collapse duplicate separators for local paths, preserve UNC prefix
   if (Length(Normalized) >= 2) and ((Normalized[1] <> PathDelim) or (Normalized[2] <> PathDelim)) then
     while Pos(PathDelim + PathDelim, Normalized) > 0 do
       Normalized := StringReplace(Normalized, PathDelim + PathDelim, PathDelim, [rfReplaceAll]);
-  if Normalized = '' then
+
+  if Normalized = string.Empty then
     Exit(Root);
+
   // Absolute paths are resolved as-is, not prefixed with Root
   if IsPathAbsolute(Normalized) then
     Full := ExpandFileName(Normalized)
   else
     Full := ExpandFileName(Root + Normalized);
-  // Sandbox mode, path must stay inside RootPath, compare with trailing
-  // delimiter so '.' resolves to root itself
-  if (not FAllowAccessToSystem) and (Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(Full))) <> 1) then
-    Exit;
+
+  // Resolve symbolic links when system access is restricted
+  if not FAllowAccessToSystem then
+  begin
+    Root := ResolveLinks(Root);
+    Full := ResolveLinks(Full);
+
+    if (Root = string.Empty) or (Full = string.Empty) then
+      Exit;
+
+    Root := IncludeTrailingPathDelimiter(Root);
+
+    // Verify the physical path stays inside the workspace
+    if Pos(LowerCase(Root), LowerCase(IncludeTrailingPathDelimiter(Full))) <> 1 then
+      Exit;
+  end;
+
   // Sensitive file protection applies in both modes
   if FBlockSensitiveFiles and IsSensitiveFile(Full) then
     Exit;
+
   Result := Full;
 end;
 
