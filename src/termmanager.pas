@@ -1178,7 +1178,11 @@ begin
   FOllamaPullLastStep := -1;
   FHistory := TStringList.Create;
   FHistoryMax := 200;
+  {$IFDEF WINDOWS}
   FShellExec := 'cmd.exe';
+  {$ELSE}
+  FShellExec := '/bin/bash';
+  {$ENDIF}
   FCommandTimeout := 0;
   FEscDelay := 500;
   FEscPending := False;
@@ -2274,7 +2278,9 @@ end;
 
 procedure TCustomTermManager.WriteText(const AText: string; AIsStderr: boolean);
 var
+  {$IFDEF WINDOWS}
   Utf8: rawbytestring;
+  {$ENDIF}
   Sanitized: string;
 begin
   if AText = '' then
@@ -2293,8 +2299,8 @@ begin
   end;
 
   AppendChatOutput(Sanitized);
-  Utf8 := UTF8Encode(Sanitized);
   {$IFDEF WINDOWS}
+  Utf8 := UTF8Encode(Sanitized);
   try
     if AIsStderr then
       WriteUtf8ToHandle(GetStdHandle(STD_ERROR_HANDLE), Utf8)
@@ -2515,18 +2521,15 @@ end;
 
 function TCustomTermManager.IsExternalCommand(const AName: string): boolean;
 const
-  {$IFDEF WINDOWS}
   CMD_BUILTINS =
     '|assoc|break|call|cd|chcp|chdir|cls|color|copy|date|del|dir|doskey|' +
     'echo|endlocal|erase|exit|for|ftype|goto|if|md|mkdir|mklink|move|' +
-    'path|pause|popd|prompt|pushd|rd|rem|ren|rename|rmdir|set|setlocal|' +
-    'shift|start|time|title|type|ver|verify|vol|';
+    'path|pause|popd|prompt|pushd|rd|rem|ren|rename|rmdir|set|setlocal|' + 'shift|start|time|title|type|ver|verify|vol|';
 
   POWERSHELL_BUILTINS =
     '|begin|break|catch|class|continue|do|else|elseif|end|exit|filter|' +
     'finally|for|foreach|function|if|in|param|process|return|switch|' + 'throw|trap|try|until|while|' +
-    'get-childitem|gci|dir|ls|get-content|gc|set-content|sc|' +
-    'get-location|gl|pwd|set-location|sl|cd|push-location|pushd|' +
+    'get-childitem|gci|dir|ls|get-content|gc|set-content|sc|' + 'get-location|gl|pwd|set-location|sl|cd|push-location|pushd|' +
     'pop-location|popd|write-output|echo|write-host|write-error|' + 'write-warning|write-verbose|write-debug|select-object|select|' +
     'where-object|where|foreach-object|%|new-item|ni|remove-item|ri|' +
     'copy-item|copy|move-item|move|test-path|resolve-path|get-command|' +
@@ -2535,7 +2538,8 @@ const
     'measure-object|sort-object|group-object|format-table|ft|format-list|fl|' +
     'clear-host|cls|help|man|history|h|set-variable|sv|get-variable|gv|' +
     'remove-variable|rv|set-alias|sal|get-alias|gal|remove-alias|';
-  {$ELSE}
+
+  {$IFNDEF WINDOWS}
   UNIX_BUILTINS =
     '|alias|bg|bind|break|builtin|caller|cd|command|compgen|complete|' +
     'continue|declare|dirs|disown|echo|enable|eval|exec|exit|export|' +
@@ -2790,7 +2794,7 @@ begin
 
   // Detect drive switches before extracting the executable name
   if (DetectShellFamily(FShellExec) in [sfCmd, sfPowerShell]) and (Length(First) >= 2) and (First[2] = ':') and
-    (First[1] in ['a'..'z']) and ((Length(First) = 2) or ((Length(First) >= 3) and (First[3] in [PathDelim, '/']))) and
+    (First[1] in ['a'..'z']) and ((Length(First) = 2) or ((Length(First) >= 3) and (First[3] = PathDelim))) and
     not IsExternalCommand(CommandToken) then
   begin
     if HasMultipleLines then
@@ -2803,7 +2807,7 @@ begin
   First := ExtractFileName(StringReplace(First, '\', '/', [rfReplaceAll]));
 
   // Handle glued cd variants like cd.., cd\, cd/ the same way cmd.exe does
-  if (Length(First) > 2) and (Copy(First, 1, 2) = 'cd') and (First[3] in ['.', PathDelim, '/']) then
+  if (Length(First) > 2) and (Copy(First, 1, 2) = 'cd') and ((First[3] = '.') or (First[3] = PathDelim)) then
   begin
     if HasMultipleLines then
       Exit(tikCommand);
@@ -2841,7 +2845,8 @@ begin
 
   if (Cmd = 'exit') or (Cmd = 'quit') then
     FRunning := False
-  else if (Length(Cmd) >= 2) and (Cmd[2] = ':') and (Cmd[1] in ['a'..'z']) and ((Length(Cmd) = 2) or (Cmd[3] in [PathDelim, '/'])) then
+  else if (Length(Cmd) >= 2) and (Cmd[2] = ':') and (Cmd[1] in ['a'..'z']) and ((Length(Cmd) = 2) or
+    ((Length(Cmd) >= 3) and (Cmd[3] = PathDelim))) then
   begin
     // Drive switch "d:", "d:\", "d:\path" — go to the drive or subfolder
     if Length(Cmd) = 2 then
@@ -4563,7 +4568,7 @@ begin
 
   // Drive switch "d:", "d:\", "d:\path" must run in-process
   if (ShellFamily in [sfCmd, sfPowerShell]) and (Length(ACommand) >= 2) and (ACommand[2] = ':') and
-    (ACommand[1] in ['a'..'z', 'A'..'Z']) and ((Length(ACommand) = 2) or (ACommand[3] in [PathDelim, '/'])) and
+    (ACommand[1] in ['a'..'z', 'A'..'Z']) and ((Length(ACommand) = 2) or ((Length(ACommand) >= 3) and (ACommand[3] = PathDelim))) and
     (Pos(' ', ACommand) = 0) and (Pos(#9, ACommand) = 0) and not FileExists(ACommand) then
   begin
     if Length(ACommand) = 2 then
@@ -5245,7 +5250,9 @@ begin
             try
               FFirstChunkSeen := False;
               FEscPending := False;
+              {$IFDEF WINDOWS}
               ClearCancelKeyState;
+              {$ENDIF}
               FAgent.RunAsync(Payload);
               // Pump events and watch for Esc so user can cancel
               StartTick := GetTickCount64;
@@ -5325,102 +5332,6 @@ begin
     FAgent.Cancel;
 
   FRunning := False;
-end;
-
-{$IFDEF WINDOWS}
-
-// Maps palette color to Windows foreground attribute bits
-function ColorToAttr(AColor: TConsoleColor): word;
-const
-  MAP: array[TConsoleColor] of word = (
-    // Standard colors, 0 to 7
-    0,                                                     // ccBlack
-    FOREGROUND_RED,                                        // ccRed
-    FOREGROUND_GREEN,                                      // ccGreen
-    FOREGROUND_RED or FOREGROUND_GREEN,                    // ccYellow
-    FOREGROUND_BLUE,                                       // ccBlue
-    FOREGROUND_RED or FOREGROUND_BLUE,                     // ccMagenta
-    FOREGROUND_GREEN or FOREGROUND_BLUE,                   // ccCyan
-    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE, // ccLightGray
-    // Bright colors, 8 to 15
-    FOREGROUND_INTENSITY,                                  // ccDarkGray
-    FOREGROUND_RED or FOREGROUND_INTENSITY,                // ccLightRed
-    FOREGROUND_GREEN or FOREGROUND_INTENSITY,              // ccLightGreen
-    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_INTENSITY, // ccLightYellow
-    FOREGROUND_BLUE or FOREGROUND_INTENSITY,               // ccLightBlue
-    FOREGROUND_RED or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightMagenta
-    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightCyan
-    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY // ccWhite
-    );
-begin
-  Result := MAP[AColor];
-end;
-
-// Applies console text attribute directly, ignored for redirected handles
-procedure SetConsoleColor(AAttr: word);
-var
-  Handle: THandle;
-begin
-  Handle := GetStdHandle(STD_OUTPUT_HANDLE);
-  SetConsoleTextAttribute(Handle, AAttr);
-end;
-
-procedure TCustomTermManager.SetColor(AColor: TTermColor);
-var
-  Attr: word;
-  Info: TConsoleScreenBufferInfo;
-
-// Combines background and foreground of a pair into a single attribute
-  function PairAttr(const APair: TConsoleColorPair): word;
-  begin
-    Result := (ColorToAttr(APair.Background) shl 4) or ColorToAttr(APair.Foreground);
-  end;
-
-begin
-  // Store color changes as control markers for chat history replay
-  AppendChatOutput(#2 + Chr(Ord(AColor)));
-  Info := Default(TConsoleScreenBufferInfo);
-
-  if not FColorOutput then
-    Exit;
-
-  // Preserve the original console background before applying prompt colors
-  if (AColor = tcPromptInput) and not FDefaultConsoleAttrCaptured then
-    if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
-    begin
-      FDefaultConsoleAttr := Info.wAttributes;
-      FDefaultConsoleAttrCaptured := True;
-    end;
-
-  case AColor of
-    tcDim: Attr := ColorToAttr(FColors.ThinkingText);
-    tcWelcome: Attr := PairAttr(FColors.WelcomeBadge);
-    tcThinkingBadge: Attr := PairAttr(FColors.ThinkingBadge);
-    tcToolBadge: Attr := PairAttr(FColors.ToolBadge);
-    tcErrorBadge: Attr := PairAttr(FColors.ErrorBadge);
-    tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
-    tcAgentDone: Attr := PairAttr(FColors.AgentDoneBadge);
-    tcPromptInput: Attr := PairAttr(FColors.PromptInput);
-    tcLog: Attr := PairAttr(FColors.Log);
-    tcMarkdownMarker: Attr := ColorToAttr(FColors.Markdown.Marker);
-    tcMarkdownBold: Attr := ColorToAttr(FColors.Markdown.Bold);
-    tcMarkdownItalic: Attr := ColorToAttr(FColors.Markdown.Italic);
-    tcMarkdownStrike: Attr := ColorToAttr(FColors.Markdown.Strikethrough);
-    tcMarkdownCode: Attr := ColorToAttr(FColors.Markdown.InlineCode);
-    tcMarkdownHighlight: Attr := ColorToAttr(FColors.Markdown.Highlight);
-    tcMarkdownHeading: Attr := ColorToAttr(FColors.Markdown.Heading);
-    tcMarkdownQuote: Attr := ColorToAttr(FColors.Markdown.Quote);
-    tcMarkdownList: Attr := ColorToAttr(FColors.Markdown.ListMarker);
-    tcMarkdownFencedCode: Attr := ColorToAttr(FColors.Markdown.FencedCode);
-    tcDefault:
-      if FDefaultConsoleAttrCaptured then
-        Attr := (FDefaultConsoleAttr and $F0) or ColorToAttr(FColors.DefaultText)
-      else
-        Attr := ColorToAttr(FColors.DefaultText);
-    else
-      Attr := ColorToAttr(FColors.DefaultText);
-  end;
-  SetConsoleColor(Attr);
 end;
 
 procedure TCustomTermManager.ReplayChatOutput(const AText: string);
@@ -5529,6 +5440,102 @@ begin
   {$ENDIF}
 
   SetColor(tcDefault);
+end;
+
+{$IFDEF WINDOWS}
+
+// Maps palette color to Windows foreground attribute bits
+function ColorToAttr(AColor: TConsoleColor): word;
+const
+  MAP: array[TConsoleColor] of word = (
+    // Standard colors, 0 to 7
+    0,                                                     // ccBlack
+    FOREGROUND_RED,                                        // ccRed
+    FOREGROUND_GREEN,                                      // ccGreen
+    FOREGROUND_RED or FOREGROUND_GREEN,                    // ccYellow
+    FOREGROUND_BLUE,                                       // ccBlue
+    FOREGROUND_RED or FOREGROUND_BLUE,                     // ccMagenta
+    FOREGROUND_GREEN or FOREGROUND_BLUE,                   // ccCyan
+    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE, // ccLightGray
+    // Bright colors, 8 to 15
+    FOREGROUND_INTENSITY,                                  // ccDarkGray
+    FOREGROUND_RED or FOREGROUND_INTENSITY,                // ccLightRed
+    FOREGROUND_GREEN or FOREGROUND_INTENSITY,              // ccLightGreen
+    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_INTENSITY, // ccLightYellow
+    FOREGROUND_BLUE or FOREGROUND_INTENSITY,               // ccLightBlue
+    FOREGROUND_RED or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightMagenta
+    FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY, // ccLightCyan
+    FOREGROUND_RED or FOREGROUND_GREEN or FOREGROUND_BLUE or FOREGROUND_INTENSITY // ccWhite
+    );
+begin
+  Result := MAP[AColor];
+end;
+
+// Applies console text attribute directly, ignored for redirected handles
+procedure SetConsoleColor(AAttr: word);
+var
+  Handle: THandle;
+begin
+  Handle := GetStdHandle(STD_OUTPUT_HANDLE);
+  SetConsoleTextAttribute(Handle, AAttr);
+end;
+
+procedure TCustomTermManager.SetColor(AColor: TTermColor);
+var
+  Attr: word;
+  Info: TConsoleScreenBufferInfo;
+
+// Combines background and foreground of a pair into a single attribute
+  function PairAttr(const APair: TConsoleColorPair): word;
+  begin
+    Result := (ColorToAttr(APair.Background) shl 4) or ColorToAttr(APair.Foreground);
+  end;
+
+begin
+  // Store color changes as control markers for chat history replay
+  AppendChatOutput(#2 + Chr(Ord(AColor)));
+  Info := Default(TConsoleScreenBufferInfo);
+
+  if not FColorOutput then
+    Exit;
+
+  // Preserve the original console background before applying prompt colors
+  if (AColor = tcPromptInput) and not FDefaultConsoleAttrCaptured then
+    if GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), Info) then
+    begin
+      FDefaultConsoleAttr := Info.wAttributes;
+      FDefaultConsoleAttrCaptured := True;
+    end;
+
+  case AColor of
+    tcDim: Attr := ColorToAttr(FColors.ThinkingText);
+    tcWelcome: Attr := PairAttr(FColors.WelcomeBadge);
+    tcThinkingBadge: Attr := PairAttr(FColors.ThinkingBadge);
+    tcToolBadge: Attr := PairAttr(FColors.ToolBadge);
+    tcErrorBadge: Attr := PairAttr(FColors.ErrorBadge);
+    tcWarnBadge: Attr := PairAttr(FColors.WarnBadge);
+    tcAgentDone: Attr := PairAttr(FColors.AgentDoneBadge);
+    tcPromptInput: Attr := PairAttr(FColors.PromptInput);
+    tcLog: Attr := PairAttr(FColors.Log);
+    tcMarkdownMarker: Attr := ColorToAttr(FColors.Markdown.Marker);
+    tcMarkdownBold: Attr := ColorToAttr(FColors.Markdown.Bold);
+    tcMarkdownItalic: Attr := ColorToAttr(FColors.Markdown.Italic);
+    tcMarkdownStrike: Attr := ColorToAttr(FColors.Markdown.Strikethrough);
+    tcMarkdownCode: Attr := ColorToAttr(FColors.Markdown.InlineCode);
+    tcMarkdownHighlight: Attr := ColorToAttr(FColors.Markdown.Highlight);
+    tcMarkdownHeading: Attr := ColorToAttr(FColors.Markdown.Heading);
+    tcMarkdownQuote: Attr := ColorToAttr(FColors.Markdown.Quote);
+    tcMarkdownList: Attr := ColorToAttr(FColors.Markdown.ListMarker);
+    tcMarkdownFencedCode: Attr := ColorToAttr(FColors.Markdown.FencedCode);
+    tcDefault:
+      if FDefaultConsoleAttrCaptured then
+        Attr := (FDefaultConsoleAttr and $F0) or ColorToAttr(FColors.DefaultText)
+      else
+        Attr := ColorToAttr(FColors.DefaultText);
+    else
+      Attr := ColorToAttr(FColors.DefaultText);
+  end;
+  SetConsoleColor(Attr);
 end;
 
 // Clears pending cancellation key states before starting a monitored operation

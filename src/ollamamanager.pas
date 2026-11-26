@@ -1574,8 +1574,8 @@ begin
           ModelItem.Tag := TAG_MODEL;
           ModelItem.Hint := ModelName;
 
-          if IsRunning or IsStarting then
-            ModelItem.Default := True;
+          ModelItem.Checked := IsRunning or IsStarting;
+          ModelItem.Default := ModelItem.Checked;
 
           if IsStarting then
           begin
@@ -2873,8 +2873,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":true}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":true}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -2984,8 +2984,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":false}', [ModelName,
-      MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":false}',
+      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin

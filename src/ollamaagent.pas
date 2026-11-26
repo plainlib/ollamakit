@@ -852,7 +852,7 @@ begin
   if (Length(APath) >= 2) and (APath[2] = ':') then
     Exit(True);
   {$ENDIF}
-  Result := (Length(APath) >= 1) and (APath[1] in [PathDelim, '/']);
+  Result := (Length(APath) >= 1) and ((APath[1] = PathDelim) or (APath[1] = '/'));
 end;
 
 // Returns position of ASubstr in AText starting at AStart, or 0 when not found
