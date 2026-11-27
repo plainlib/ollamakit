@@ -144,6 +144,14 @@ Namespace / class names: `OllamaManager`, `TOllamaManager`, `TCustomOllamaManage
 | `MenuSections` | `TOllamaMenuSections` | Sections of the popup menu shown to the user; clear a flag to hide it. |
 | `MonitorModelState` | `Boolean` | Enables periodic monitoring of running model state. |
 | `MonitorInterval` | `Integer` | Polling interval in milliseconds. |
+| `InstalledModels` | `TStringList` | List of models installed on the Ollama server. |
+| `RunningModels` | `TStringList` | List of models currently running. |
+| `IsConnected` | `Boolean` | Whether the manager currently has an established connection. |
+| `IsConnecting` | `Boolean` | Whether a connection or refresh attempt is currently in progress. |
+| `LastPromptEvalCount` | `Integer` | Last prompt evaluation count reported by the server. |
+| `LastEvalCount` | `Integer` | Last evaluation count reported by the server. |
+| `LastUsageTotal` | `Integer` | Last total usage reported by the server. |
+| `LastRequestStats` | `string` | Last raw request statistics returned by the server. |
 
 **Methods:**
 
@@ -175,13 +183,15 @@ Namespace / class names: `OllamaManager`, `TOllamaManager`, `TCustomOllamaManage
 
 | Event | Description |
 |---|---|
-| `OnModelsRefreshed` | Fired after the installed model list has been refreshed. |
+| `OnModelsRefreshed` | Fired when the model list has been refreshed, receives the previous and the new model lists. |
 | `OnError` | Fired for any API or connection error; never raises. |
 | `OnPullProgress` | Fired when pull progress changes (currently only start and finish). |
 | `OnConnecting` | Fired before a background connection or refresh attempt begins. |
 | `OnConnected` | Fired after the model list has been successfully refreshed. |
 | `OnModelStart` | Occurs when a model start operation completes; `Success` indicates whether the operation completed successfully. |
 | `OnModelStop` | Occurs when a model stop operation completes; `Success` indicates whether the operation completed successfully. |
+| `OnMenuUpdating` | Fired before the popup menu contents are rebuilt; the app may save the popup point and close the menu to avoid a jump on GTK2. |
+| `OnMenuUpdated` | Fired after the popup menu contents have been rebuilt; the app may reopen the menu at the saved point. |
 
 ---
 
@@ -208,10 +218,24 @@ Namespace / class names: `OllamaAgent`, `TCustomOllamaAgent`, `TOllamaAgent`.
 | `Tools` | `TAgentTools` | Collection of user-defined tools. |
 | `WebOptions` | `TAgentWebOptions` | Web tools configuration, expand to adjust search URL, timeout, whitelist. |
 | `KeepHistory` | `Boolean` | When True, messages persist between `RunAsync` calls. |
+| `History` | `string` | Conversation history of the active run. |
+| `ActiveChat` | `TAgentChat` | Active chat object. |
+| `ChatCount` | `Integer` | Number of stored chats. |
+| `Chats` | `TAgentChat` | Stored chats by index. |
+| `ContextUsed` | `Integer` | Context usage in tokens from the last step. |
+| `ContextTotal` | `Integer` | Configured context window size in tokens, 0 when unknown. |
+| `ContextPercent` | `Integer` | Context usage percentage. |
+| `ContextUsedKb` | `Integer` | Context usage in KB. |
+| `ContextTotalKb` | `Integer` | Context total in KB. |
 | `LoadAgentsMd` | `Boolean` | Load workspace root `AGENTS.md` into the system prompt. |
 | `AgentsFileName` | `string` | Instruction file name, looked up in the root and in subdirectories. |
 | `AllowAccessToSystem` | `Boolean` | When False, file tools are sandboxed to `RootPath`, absolute paths are rejected. |
 | `BlockSensitiveFiles` | `Boolean` | Deny access to well-known secret files like `.ssh/`, `.env`, `*.key`, `id_rsa`. |
+| `Done` | `Boolean` | True while a run is in progress; reflects the current run state. |
+| `FinalAnswer` | `string` | Final answer text returned by the last completed run. |
+| `RunStats` | `TAgentRunStats` | Statistics of the last agent run: total time and tool, thinking and answer counters with durations. |
+| `ContextPrelude` | `string` | Optional context prepended to the next user message, cleared after use. |
+| `ExecShellInfo` | `string` | Shell executable that runs exec_command, empty falls back to the platform default. |
 | `Log` | `Boolean` | When True, the agent logs every step and event to stderr. |
 | `LogToolResult` | `Boolean` | Emit tool result previews through the log channel, truncated to 500 chars. |
 | `OnLog` | `TAgentLogEvent` | Receives every log line, host may color or redirect it. |
@@ -241,7 +265,7 @@ Namespace / class names: `OllamaAgent`, `TCustomOllamaAgent`, `TOllamaAgent`.
 | `ClearChats` | Deletes all chats without creating a new one. |
 | `SaveChatsToFile` | Saves all chats to a JSON file. |
 | `LoadChatsFromFile` | Loads all chats from a JSON file. |
-| `SaveChatToFile` | Saves the specified chat to a separate JSON file. |
+| `SaveChatToFile` | Saves the specified chat or the active chat to a separate JSON file. |
 | `LoadChatFromFile` | Loads a chat from a separate JSON file and activates it. |
 | `BuildSystemPrompt` | Builds the system prompt using the current runtime capabilities. |
 | `RefreshContextInfo` | Resolves model context window size and updates context counters. |
@@ -255,6 +279,7 @@ Namespace / class names: `OllamaAgent`, `TCustomOllamaAgent`, `TOllamaAgent`.
 | `LogLine` | Writes a diagnostic line to stderr when Log is enabled. |
 | `DoLog` | Emits a log line through OnLog or stderr, no Log flag check. |
 | `EmitToolResult` | Emits a truncated tool result preview when LogToolResult is enabled. |
+| `LoadChatsFromFiles` | Loads separate chat files and selects the chat for the startup directory. |
 
 **Events:**
 
@@ -262,14 +287,15 @@ Namespace / class names: `OllamaAgent`, `TCustomOllamaAgent`, `TOllamaAgent`.
 |---|---|
 | `OnLog` | Receives every log line, host may color or redirect it. |
 | `OnContextUsage` | Fired with current context usage counters. |
-| `OnRoute` | Fired before chat step and each tool call, host may reject. |
+| `OnRoute` | Fired before a chat step or each tool call, host may reject; receives the operation kind (`aoChat`, `aoToolCall`). |
 | `OnChunk` | Fired for every streamed text chunk from the model. |
 | `OnThinking` | Fired for every thinking chunk from the model. |
 | `OnToolCall` | Fired when the LLM requests a tool, after host approval. |
 | `OnToolResult` | Fired with the tool result before it is sent back to the model. |
 | `OnExecCommand` | Fired for exec_command tool, host executes and returns the output. |
 | `OnAskUser` | Fired for ask_user tool, host shows the question and returns the answer. |
-| `OnFinish` | Fired once when the run terminates for any reason. |
+| `OnFinish` | Fired once when the run terminates for any reason, receives the finish reason (`afrSuccess`, `afrMaxSteps`, `afrCancelled`, `afrError`, `afrModelNotSet`). |
+| `OnExecute` | Fired when the LLM calls a user-defined tool, the host fills the result. |
 
 ---
 
@@ -283,6 +309,7 @@ Namespace / class names: `TermManager`, `TCustomTermManager`, `TTermManager`.
 
 | Property | Type | Description |
 |---|---|---|
+| `AppName` | `string` | Application name displayed in the terminal title. |
 | `Path` | `string` | Working directory for shell commands and agent file tools, empty uses process cwd. |
 | `Prompt` | `string` | Prompt template, supports `{path}`, `{model}`, `{chat}`, `{chatindex}`, context and usage placeholders. |
 | `StartupPrompt` | `string` | Multi-line banner printed once before the first prompt. |
@@ -303,6 +330,7 @@ Namespace / class names: `TermManager`, `TCustomTermManager`, `TTermManager`.
 | `HistoryMax` | `Integer` | Maximum number of input lines kept in history, oldest are dropped first. |
 | `ShellExec` | `string` | Shell executable used to run external commands and agent exec_command, defaults to cmd.exe. |
 | `CommandTimeout` | `Integer` | Timeout in milliseconds for user-typed external commands, zero means no limit. |
+| `EscDelay` | `Integer` | Delay in milliseconds for the second Esc press to cancel. |
 | `MaxCaptureBytes` | `Integer` | Cap on bytes captured from agent exec_command, excess is truncated with a notice. |
 | `AgentCommandTimeout` | `Integer` | Timeout in milliseconds for agent exec_command, zero means no limit, default 30 seconds. |
 | `UsePrefixes` | `Boolean` | Enable `!` and `?` prefixes to force command or agent routing respectively. |
@@ -312,7 +340,10 @@ Namespace / class names: `TermManager`, `TCustomTermManager`, `TTermManager`.
 | `OnOutput` | `TTermOutputEvent` | Fires for every chunk of command output, useful for logging or filtering. |
 | `OnAgentExecute` | `TTermAgentEvent` | Fires when input is classified as agent text and no Agent is attached. |
 | `OnExit` | `TTermExitEvent` | Fires when the interactive loop terminates, receives last command exit code. |
+| `OnCheckVersion` | `TTermVersionEvent` | Fires when the version check is requested. |
 | `Agent` | `TCustomOllamaAgent` | Agent component that handles agent-classified input, leave empty to disable. |
+| `LastExitCode` | `Integer` | Exit code of the last executed command. |
+| `Running` | `Boolean` | True while the interactive loop is running. |
 
 **Methods:**
 
@@ -347,6 +378,7 @@ Namespace / class names: `TermManager`, `TCustomTermManager`, `TTermManager`.
 | Event | Description |
 |---|---|
 | `OnRoute` | Fires before routing each input, host can approve, reject or reclassify it. |
+| `OnCheckVersion` | `TTermVersionEvent` | Fires when the version check is requested. |
 | `OnOutput` | Fires for every chunk of command output, useful for logging or filtering. |
 | `OnAgentExecute` | Fires when input is classified as agent text and no Agent is attached. |
 | `OnExit` | Fires when the interactive loop terminates, receives last command exit code. |
@@ -374,29 +406,42 @@ Namespace / class names: `TermManager`, `TCustomTermManager`, `TTermManager`.
 
 ## Using the Components in the Designer
 
-The components can be placed directly on a Lazarus form at design time.
+The components can be placed directly on a Lazarus form at design time, or on a data module of a console application.
 
-1. Install the `ollamakit` package and its dependencies (`LCLBase`, `IDEIntf`, `helpers`, `toolkit`, `laz_synapse`).
-2. Open the Tool Palette and drop the following components onto a form:
+1. Create a new console application and add a data module to it (for example via `File → New → Console Application` and `File → New → Data Module`).
+2. Install the `ollamakit` package and its dependencies (`LCLBase`, `IDEIntf`, `helpers`, `toolkit`, `laz_synapse`).
+3. Open the Tool Palette and drop the following components onto the data module:
    - `TTermManager` (`TermManager`),
    - `TOllamaAgent` (`OllamaAgent`),
    - `TOllamaManager` (`OllamaManager`).
-3. Wire the object hierarchy through properties:
+4. Wire the object hierarchy through properties:
    - `TTermManager.Agent` → an instance of `TOllamaAgent` (the terminal drives the agent),
    - `TOllamaAgent.OllamaManager` → an instance of `TOllamaManager` (the agent performs HTTP calls through it),
    - `TOllamaManager.BaseURL` → the Ollama server base URL (default `http://localhost:11434`).
-4. Optionally configure:
+5. Optionally configure:
    - `TTermManager.Path` — working directory for shell commands and agent file tools,
    - `TOllamaAgent.ModelName` — default model,
    - `TOllamaManager.KeepAlive` / `TOllamaManager.NumCtx`,
    - `TOllamaAgent.ThinkMode` — thinking mode for model responses, e.g. `high`,
    - `TTermManager` timeouts and `MenuSections`.
-5. Subscribe to events, for example:
-   - `TOllamaManager.OnError`, `TOllamaManager.OnConnected`, `TOllamaManager.OnModelsRefreshed`, `TOllamaManager.OnPullProgress`, `TOllamaManager.OnModelStart`, `TOllamaManager.OnModelStop`,
+6. Subscribe to events, for example:
+   - `TOllamaManager.OnError`, `TOllamaManager.OnConnected`, `TOllamaManager.OnModelsRefreshed`, `TOllamaManager.OnPullProgress`, `TOllamaManager.OnModelStart`, `TOllamaManager.OnModelStop`, `TOllamaManager.OnMenuUpdating`, `TOllamaManager.OnMenuUpdated`,
    - `TOllamaAgent.OnChunk`, `TOllamaAgent.OnThinking`, `TOllamaAgent.OnToolCall`, `TOllamaAgent.OnToolResult`, `TOllamaAgent.OnFinish`, `TOllamaAgent.OnExecCommand`, `TOllamaAgent.OnAskUser`, `TOllamaAgent.OnLog`, `TOllamaAgent.OnContextUsage`, `TOllamaAgent.OnRoute`,
-   - `TTermManager.OnOutput`, `TTermManager.OnAgentExecute`, `TTermManager.OnExit`, `TTermManager.OnRoute`.
+   - `TTermManager.OnOutput`, `TTermManager.OnAgentExecute`, `TTermManager.OnExit`, `TTermManager.OnCheckVersion`, `TTermManager.OnRoute`.
 
 Because the package registers its components and property editors at design time (`OllamaKitRegister`), the components and multiline editors for `Welcome`, `SystemPrompt`, `Description` and `ParametersJson` are available immediately after installation.
+
+To run the interactive terminal from a console application, start the loop from the main thread, for example:
+
+```pascal
+var
+  TermManager: TTermManager;
+
+// after wiring the agent and the Ollama manager
+TermManager.Run;
+```
+
+`TTermManager.Run` blocks until the interactive loop exits. For console applications, create the component instances on the main thread before starting the loop; no additional setup is required beyond the standard console project configuration.
 
 ---
 
