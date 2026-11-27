@@ -15,7 +15,8 @@ unit OllamaAgent;
 interface
 
 uses
-  Classes, SysUtils, Controls, FileUtil, LazFileUtils, Math, RegExpr, Masks, fpjson, jsonparser, StringHelper, OllamaManager, Network;
+  Classes, SysUtils, Controls, FileUtil, StrUtils, LazFileUtils, Math, RegExpr, Masks, fpjson, jsonparser,
+  StringHelper, OllamaManager, Network;
 
 type
   // Feature toggles controlled by the Features set property
@@ -239,6 +240,7 @@ type
     FOnAskUser: TAgentAskUserEvent;
     FOnFinish: TAgentFinishEvent;
     FContextPrelude: string; // Optional context prepended to the next user message, cleared after use
+    FIncludeLocalDateTime: boolean;
     FCapabilitiesCache: TStringList; // Cached capabilities per model name, "1" means tools supported
     FExecShellInfo: string; // Shell executable that runs exec_command, empty falls back to platform default
     FLoadAgentsMd: boolean; // Load workspace root AGENTS.md into the system prompt
@@ -392,6 +394,8 @@ type
     property FinalAnswer: string read FFinalAnswer;
     property RunStats: TAgentRunStats read FRunStats;
     property ContextPrelude: string read FContextPrelude write FContextPrelude;
+    // Include the host's local date and time in each user request
+    property IncludeLocalDateTime: boolean read FIncludeLocalDateTime write FIncludeLocalDateTime default True;
     property ExecShellInfo: string read FExecShellInfo write FExecShellInfo;
     property LoadAgentsMd: boolean read FLoadAgentsMd write FLoadAgentsMd default True;
     property AgentsFileName: string read FAgentsFileName write FAgentsFileName;
@@ -460,8 +464,10 @@ type
     property Tools;
     // Web tools configuration, expand to adjust search URL, timeout, whitelist
     property WebOptions;
-    // When True, messages persist between RunAsync calls
+    // When Messages persist between RunAsync calls
     property KeepHistory;
+    // Include the host's local date and time in each user request
+    property IncludeLocalDateTime;
     // Load workspace root AGENTS.md into the system prompt
     property LoadAgentsMd;
     // Instruction file name, looked up in the root and in subdirectories
@@ -2371,6 +2377,7 @@ var
   ToolResultBytes, ToolResultCut: integer;
   ResolvedCtx: int64;
   SystemPromptText: string;
+  RunContextPrelude: string;
   CutPoint: integer;
   OldMsgsStr, MsgStr, Summary: string;
   NewArr: TJSONArray;
@@ -2439,6 +2446,13 @@ begin
       // workspace and enabled tools even when the user prompt is empty
       SystemPromptText := FAgent.BuildSystemPrompt(SendTools);
       FAgent.LogLine(Format('System prompt len=%d preview="%s"', [Length(SystemPromptText), Copy(SystemPromptText, 1, 400)]));
+
+      // Prepare local date and time and host-supplied context for this run
+      RunContextPrelude := FAgent.FContextPrelude;
+      if FAgent.IncludeLocalDateTime then
+        RunContextPrelude := 'Current local date and time: ' + FormatDateTime('yyyy"-"mm"-"dd"T"hh":"nn":"ss', Now) +
+          IfThen(RunContextPrelude <> string.Empty, #10#10 + RunContextPrelude);
+
       MsgObj := TJSONObject.Create;
       MsgObj.Add('role', 'system');
       MsgObj.Add('content', SystemPromptText);
@@ -2469,9 +2483,9 @@ begin
 
       MsgObj := TJSONObject.Create;
       MsgObj.Add('role', 'user');
-      // Prepend host-supplied context such as recent shell commands
-      if FAgent.FContextPrelude <> '' then
-        MsgObj.Add('content', FAgent.FContextPrelude + #10#10 + FUserText)
+      // Prepend local date, time and host-supplied context
+      if RunContextPrelude <> string.Empty then
+        MsgObj.Add('content', RunContextPrelude + #10#10 + FUserText)
       else
         MsgObj.Add('content', FUserText);
       MsgObj.Add('_current_run', True);
@@ -3112,8 +3126,8 @@ begin
 
         MsgObj := TJSONObject.Create;
         MsgObj.Add('role', 'user');
-        if FAgent.FContextPrelude <> string.Empty then
-          MsgObj.Add('content', FAgent.FContextPrelude + #10#10 + FUserText)
+        if RunContextPrelude <> string.Empty then
+          MsgObj.Add('content', RunContextPrelude + #10#10 + FUserText)
         else
           MsgObj.Add('content', FUserText);
         MessagesArr.Add(MsgObj);
@@ -3343,6 +3357,7 @@ begin
   FThinkMode := otmDefault;
   FRootPath := '';
   FKeepHistory := False;
+  FIncludeLocalDateTime := True;
   FHistory := '';
   FChats := TList.Create;
   FActiveChat := nil;
