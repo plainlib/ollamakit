@@ -1499,6 +1499,10 @@ begin
     ; // Ignore user handler exceptions
   end;
 
+  // Do not rebuild the menu while it is displayed
+  if Assigned(FPopupMenu) and (ActivePopupMenu = FPopupMenu) then
+    Exit;
+
   ClearPopupMenu;
 
   InsertPos := 0;
