@@ -11,8 +11,8 @@ unit OllamaManager;
 interface
 
 uses
-  Classes, SysUtils, Forms, Controls, Menus, Clipbrd, DateUtils, Dialogs, ExtCtrls, fpjson, jsonparser,
-  Network, StringHelper, httpsend, blcksock;
+  Classes, SysUtils, Forms, Controls, Menus, Clipbrd, DateUtils, Dialogs, ExtCtrls, fpjson, jsonparser, httpsend, blcksock,
+  Network, StringHelper, DialogUtils;
 
 type
   { Model thinking modes supported by the Ollama API }
@@ -188,7 +188,7 @@ type
     function ParseModels(const JsonStr: string; ADetails: TStringList): TStringList;
     function ValidateModelsJson(const JsonStr: string): boolean;
     function IsCloudModel(const ModelName: string): boolean;
-    function BuildModelInfo(const ModelName: string): string;
+    function BuildModelInfo(const ModelName: string): TStringList;
 
     // Returns GetLastUsageTotal for read-only property
     function GetLastUsageTotal: integer;
@@ -401,6 +401,7 @@ resourcestring
   rsPullPrompt = 'Model name (e.g. llama3.2):';
   rsServerCaption = 'Ollama server';
   rsServerPrompt = 'Server URL (e.g. http://localhost:11434):';
+  rsInfoModelName = 'Model name';
   rsInfoMetadataError = 'Error fetching metadata: %s';
   rsInfoRunningHeader = '--- Running ---';
   rsInfoStatusLoaded = 'loaded';
@@ -464,11 +465,6 @@ begin
     Result := oekHttpServer
   else
     Result := oekUnknown;
-end;
-
-procedure Register;
-begin
-  RegisterComponents('Ollama', [TOllamaManager]);
 end;
 
 { TPullProgressCall }
@@ -1928,7 +1924,7 @@ begin
   Result := ModelName.EndsWith('-cloud') or ModelName.EndsWith(':cloud');
 end;
 
-function TCustomOllamaManager.BuildModelInfo(const ModelName: string): string;
+function TCustomOllamaManager.BuildModelInfo(const ModelName: string): TStringList;
 var
   SL: TStringList;
   ShowJson, PsJson: string;
@@ -1948,13 +1944,28 @@ var
   ThinkingIndex: integer;
   SizeTotal, SizeVram, CtxLen: int64;
   Found: boolean;
+
+// Add a formatted information line as a name-value pair
+  procedure AddInfoLine(const ALine: string);
+  var
+    P: integer;
+  begin
+    P := Pos(':', ALine);
+    if P > 0 then
+      SL.Add(Trim(Copy(ALine, 1, P - 1)) + '=' + Trim(Copy(ALine, P + 1, MaxInt)))
+    else if Trim(ALine) <> string.Empty then
+      SL.Add(Trim(ALine) + '=');
+  end;
+
 begin
+  Result := nil;
   SL := TStringList.Create;
   try
-    SL.Add(ModelName);
+    SL.NameValueSeparator := '=';
+    SL.Add(rsInfoModelName + '=' + ModelName);
+
     if IsCloudModel(ModelName) then
-      SL.Add(rsInfoCloudModel);
-    SL.Add('');
+      AddInfoLine(rsInfoCloudModel);
 
     // Display model size from the cached /api/tags response
     Idx := FInstalledDetails.IndexOfName(ModelName);
@@ -1967,7 +1978,7 @@ begin
         begin
           ModelSize := TJSONObject(ModelData).Get('size', int64(0));
           if ModelSize > 0 then
-            SL.Add(Format(rsInfoModelSize, [BytesToHuman(ModelSize)]));
+            AddInfoLine(Format(rsInfoModelSize, [BytesToHuman(ModelSize)]));
         end;
       finally
         ModelData.Free;
@@ -1991,15 +2002,16 @@ begin
               Family := Details.Get('family', '');
               ParamSize := Details.Get('parameter_size', '');
               Quant := Details.Get('quantization_level', '');
-              if Fmt <> '' then
-                SL.Add(Format(rsInfoFormat, [Fmt]));
-              if Family <> '' then
-                SL.Add(Format(rsInfoFamily, [Family]));
-              if ParamSize <> '' then
-                SL.Add(Format(rsInfoParameters, [ParamSize]));
-              if Quant <> '' then
-                SL.Add(Format(rsInfoQuantization, [Quant]));
+              if Fmt <> string.Empty then
+                AddInfoLine(Format(rsInfoFormat, [Fmt]));
+              if Family <> string.Empty then
+                AddInfoLine(Format(rsInfoFamily, [Family]));
+              if ParamSize <> string.Empty then
+                AddInfoLine(Format(rsInfoParameters, [ParamSize]));
+              if Quant <> string.Empty then
+                AddInfoLine(Format(rsInfoQuantization, [Quant]));
             end;
+
             // Display model capabilities
             CapabilitiesData := TJSONObject(ShowData).Find('capabilities');
             if (CapabilitiesData <> nil) and (CapabilitiesData.JSONType = jtArray) then
@@ -2014,7 +2026,7 @@ begin
               end;
 
               if CapabilitiesText <> string.Empty then
-                SL.Add(Format(rsInfoCapabilities, [CapabilitiesText]));
+                AddInfoLine(Format(rsInfoCapabilities, [CapabilitiesText]));
             end;
 
             // Display supported thinking modes
@@ -2031,7 +2043,7 @@ begin
               begin
                 if (TJSONArray(ThinkingValues).Count = 1) and (TJSONArray(ThinkingValues).Items[0].JSONType =
                   jtBoolean) and (not TJSONArray(ThinkingValues).Items[0].AsBoolean) then
-                  SL.Add(rsInfoThinkingUnsupported)
+                  AddInfoLine(rsInfoThinkingUnsupported)
                 else
                 begin
                   ThinkingText := string.Empty;
@@ -2053,7 +2065,7 @@ begin
 
                   if ThinkingText <> string.Empty then
                   begin
-                    SL.Add('Thinking modes: ' + ThinkingText);
+                    AddInfoLine('Thinking modes: ' + ThinkingText);
 
                     if ThinkingDefaultData <> nil then
                     begin
@@ -2069,34 +2081,33 @@ begin
                       else
                         ThinkingDefault := ThinkingDefaultData.AsJSON;
 
-                      SL.Add('Thinking default: ' + ThinkingDefault);
+                      AddInfoLine('Thinking default: ' + ThinkingDefault);
                     end;
                   end;
                 end;
               end
               else if Pos(', thinking', ', ' + CapabilitiesText) > 0 then
-                SL.Add(rsInfoThinkingModesUnknown);
+                AddInfoLine(rsInfoThinkingModesUnknown);
             end
             else if Pos(', thinking', ', ' + CapabilitiesText) > 0 then
-              SL.Add(rsInfoThinkingModesUnknown);
+              AddInfoLine(rsInfoThinkingModesUnknown);
 
             ModifiedAt := TJSONObject(ShowData).Get('modified_at', '');
-            if ModifiedAt <> '' then
-              SL.Add(Format(rsInfoModified, [ModifiedAt]));
+            if ModifiedAt <> string.Empty then
+              AddInfoLine(Format(rsInfoModified, [ModifiedAt]));
           end;
         except
           on E: Exception do
-            SL.Add(Format(rsInfoMetadataError, [E.Message]));
+            AddInfoLine(Format(rsInfoMetadataError, [E.Message]));
         end;
       finally
         ShowData.Free;
       end;
     end
     else
-      SL.Add(Format(rsInfoMetadataError, [ErrMsg]));
+      AddInfoLine(Format(rsInfoMetadataError, [ErrMsg]));
 
-    SL.Add('');
-    SL.Add(rsInfoRunningHeader);
+    AddInfoLine(rsInfoRunningHeader);
 
     // Look up running details cached by the background refresh
     Found := False;
@@ -2115,20 +2126,20 @@ begin
             SizeVram := PsObj.Get('size_vram', int64(0));
             CtxLen := PsObj.Get('context_length', int64(0));
             ExpiresAt := PsObj.Get('expires_at', '');
-            SL.Add(Format(rsInfoStatus, [rsInfoStatusLoaded]));
+            AddInfoLine(Format(rsInfoStatus, [rsInfoStatusLoaded]));
             if SizeTotal > 0 then
-              SL.Add(Format(rsInfoTotalMemory, [BytesToHuman(SizeTotal)]));
+              AddInfoLine(Format(rsInfoTotalMemory, [BytesToHuman(SizeTotal)]));
             if SizeVram > 0 then
             begin
               if SizeTotal > 0 then
                 VRAMPct := Round(SizeVram * 100 / SizeTotal)
               else
                 VRAMPct := 0;
-              SL.Add(Format(rsInfoVram, [BytesToHuman(SizeVram), VRAMPct]));
+              AddInfoLine(Format(rsInfoVram, [BytesToHuman(SizeVram), VRAMPct]));
             end;
             if CtxLen > 0 then
-              SL.Add(Format(rsInfoContextLength, [CtxLen]));
-            if ExpiresAt <> '' then
+              AddInfoLine(Format(rsInfoContextLength, [CtxLen]));
+            if ExpiresAt <> string.Empty then
             begin
               // Limit fractional seconds to milliseconds for FPC compatibility
               DisplayExpiresAt := ExpiresAt;
@@ -2149,9 +2160,9 @@ begin
               end;
 
               if Copy(ExpiresAt, 1, 4) = '2319' then
-                SL.Add(Format(rsInfoUnloadsAt, [rsKeepAliveForever]))
+                AddInfoLine(Format(rsInfoUnloadsAt, [rsKeepAliveForever]))
               else
-                SL.Add(Format(rsInfoUnloadsAt, [DateTimeToStr(ISO8601ToDate(DisplayExpiresAt, False))]));
+                AddInfoLine(Format(rsInfoUnloadsAt, [DateTimeToStr(ISO8601ToDate(DisplayExpiresAt, False))]));
             end;
             Found := True;
           end;
@@ -2164,9 +2175,10 @@ begin
     end;
 
     if not Found then
-      SL.Add(Format(rsInfoStatus, [rsInfoStatusNotLoaded]));
+      AddInfoLine(Format(rsInfoStatus, [rsInfoStatusNotLoaded]));
 
-    Result := SL.Text;
+    Result := SL;
+    SL := nil;
   finally
     SL.Free;
   end;
@@ -2392,7 +2404,7 @@ var
   ModelName: string;
 begin
   ModelName := '';
-  if InputQueryLite(rsPullCaption, rsPullPrompt, ModelName) then
+  if TDialogUtils.InputQueryLite(rsPullCaption, rsPullPrompt, ModelName) then
   begin
     ModelName := Trim(ModelName);
     if ModelName <> '' then
@@ -2405,7 +2417,7 @@ var
   ServerURL: string;
 begin
   ServerURL := FBaseURL;
-  if InputQueryLite(rsServerCaption, rsServerPrompt, ServerURL) then
+  if TDialogUtils.InputQueryLite(rsServerCaption, rsServerPrompt, ServerURL) then
   begin
     ServerURL := Trim(ServerURL);
     if ServerURL <> '' then
@@ -2451,22 +2463,29 @@ end;
 procedure TCustomOllamaManager.MenuInfoClick(Sender: TObject);
 var
   Item: TMenuItem;
-  ModelName, Info: string;
+  ModelName: string;
+  Values, ResultValues: TStringList;
 begin
   Item := TMenuItem(Sender);
   ModelName := Item.Hint;
-  Info := '';
+
+  Values := nil;
   try
-    Info := BuildModelInfo(ModelName);
-  except
-    on E: Exception do
-    begin
-      DoError(oekUnknown, ModelName, E.Message);
-      Exit;
+    try
+      Values := BuildModelInfo(ModelName);
+    except
+      on E: Exception do
+      begin
+        DoError(oekUnknown, ModelName, E.Message);
+        Exit;
+      end;
     end;
+
+    ResultValues := TDialogUtils.StringListQueryLite(ModelName, Values, True);
+    ResultValues.Free;
+  finally
+    Values.Free;
   end;
-  if Info <> '' then
-    ShowMessage(Info);
 end;
 
 procedure TCustomOllamaManager.MenuReconnectClick(Sender: TObject);
@@ -2899,8 +2918,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s%s,"stream":true}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":true}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":true}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
 
   Tm.Connection := FConnectionTimeout;
   Tm.Request := FRequestTimeout;
@@ -3010,8 +3029,8 @@ begin
     JsonBody := Format('{"model":"%s","messages":%s,"tools":%s,"keep_alive":%d%s%s,"stream":false}',
       [ModelName, MessagesJson, ToolsJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)])
   else
-    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":false}',
-      [ModelName, MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
+    JsonBody := Format('{"model":"%s","messages":%s,"keep_alive":%d%s%s,"stream":false}', [ModelName,
+      MessagesJson, FKeepAlive, BuildOptionsJson, BuildThinkJson(AThinkMode)]);
   Result := ApiPost('/api/chat', JsonBody, AKind, AErrorMsg);
   if AKind <> oekNone then
   begin
